@@ -22,6 +22,7 @@ try {
     }
 
     Write-Host "[check] self-tests"
+    python .\eval_cli.py self-test
     python .\validate_run_records.py --self-test
     python .\quality_gate.py --self-test
     python .\compatibility.py --self-test

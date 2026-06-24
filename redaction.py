@@ -23,6 +23,31 @@ def redact_text(value: Any, *, max_chars: int | None = None) -> str | None:
     return text
 
 
+def redact_raw_fragments(value: Any, raw_values: list[Any] | None = None, *, max_chars: int | None = None) -> str | None:
+    text = redact_text(value, max_chars=None)
+    if text is None:
+        return None
+    for raw in raw_values or []:
+        raw_text = str(raw or "")
+        fragments: set[str] = set()
+        if len(raw_text) >= 16:
+            fragments.add(raw_text)
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if len(line) >= 16:
+                fragments.add(line)
+        if len(raw_text) > 64:
+            for start in range(0, len(raw_text), 32):
+                fragment = raw_text[start : start + 64].strip()
+                if len(fragment) >= 32:
+                    fragments.add(fragment)
+        for fragment in sorted(fragments, key=len, reverse=True):
+            text = text.replace(fragment, "[REDACTED_RAW]")
+    if max_chars is not None and len(text) > max_chars:
+        return text[:max_chars] + "...[truncated]"
+    return text
+
+
 def redact_value(value: Any, *, max_chars: int | None = None) -> Any:
     if isinstance(value, str):
         return redact_text(value, max_chars=max_chars)

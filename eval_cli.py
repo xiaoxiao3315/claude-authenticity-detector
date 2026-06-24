@@ -47,7 +47,7 @@ from quality_gate import run_quality_gate
 from run_records import extract_raw_event_types, stable_json_hash, text_hash
 from trace_evaluation import run_trace_evaluation
 from validate_run_records import validate_records
-from redaction import redact_text
+from redaction import redact_raw_fragments, redact_text
 
 
 ROOT = Path(__file__).resolve().parent
@@ -741,26 +741,61 @@ def final_score_from_judge(
     judge_payload: dict[str, Any] | None,
     judge_error: str | None,
     rule_score: dict[str, Any] | None,
+    raw_redaction_values: list[Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     if not tested.metrics.ok:
         return {"score": 0.0, "format_ok": False, "details": redact_text(tested.metrics.error, max_chars=500)}, None
     if judge_payload is not None:
         score = normalize_score(judge_payload.get("score_0_10"))
         if score is not None:
+            reason = redact_raw_fragments(judge_payload.get("reason") or "", raw_redaction_values, max_chars=500) or ""
+            decision_value = str(judge_payload.get("decision") or "REVIEW").strip().upper()
+            decision = decision_value if decision_value in {"GO", "REVIEW", "NO-GO"} else "REVIEW"
+            format_ok = bool(judge_payload.get("format_ok", True))
             return (
                 {
                     "score": score,
-                    "format_ok": bool(judge_payload.get("format_ok", True)),
-                    "details": str(judge_payload.get("reason") or ""),
-                    "decision": str(judge_payload.get("decision") or "REVIEW"),
+                    "format_ok": format_ok,
+                    "details": reason,
+                    "decision": decision,
                 },
-                judge_payload,
+                {
+                    "score_0_10": score,
+                    "format_ok": format_ok,
+                    "decision": decision,
+                    "reason": reason,
+                },
             )
     if rule_score is not None:
         return rule_score, {"error": redact_text(judge_error or "judge unavailable; used rule score", max_chars=500)}
     fallback = 0.0 if judge_error else 5.0
     redacted_error = redact_text(judge_error or "no judge score", max_chars=500)
     return {"score": fallback, "format_ok": None, "details": redacted_error}, {"error": redacted_error}
+
+
+def _self_test_judge_payload_sanitization() -> None:
+    secret_prompt = "SECRET_PROMPT_ALPHA_BETA_1234567890"
+    secret_answer = "SECRET_RESPONSE_TEXT_GAMMA_DELTA_1234567890"
+    final_score, judge_score = final_score_from_judge(
+        tested=Completion(text=secret_answer, metrics=CallMetrics(ok=True)),
+        judge=None,
+        judge_payload={
+            "score_0_10": 8,
+            "format_ok": True,
+            "decision": secret_prompt,
+            "reason": f"Prompt was {secret_prompt}; answer was {secret_answer}",
+            "extra_raw": secret_answer,
+        },
+        judge_error=None,
+        rule_score=None,
+        raw_redaction_values=[secret_prompt, secret_answer],
+    )
+    blob = json.dumps({"final_score": final_score, "judge_score": judge_score}, ensure_ascii=False)
+    assert secret_prompt not in blob
+    assert secret_answer not in blob
+    assert "extra_raw" not in blob
+    assert '"decision": "REVIEW"' in blob
+    assert "[REDACTED_RAW]" in blob
 
 
 def run_record(
@@ -1048,6 +1083,7 @@ def run_job(args: argparse.Namespace) -> int:
                 judge_payload=judge_payload,
                 judge_error=judge_parse_error,
                 rule_score=rule_score,
+                raw_redaction_values=[task.get("prompt"), tested.text],
             )
             if judge_score is not None and "error" not in judge_score:
                 judge_score = {
@@ -1727,6 +1763,9 @@ def main() -> int:
         pass
     parser = argparse.ArgumentParser(description="Two-model headless eval CLI")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    self_test_parser = sub.add_parser("self-test", help="run eval_cli internal self-tests")
+    self_test_parser.set_defaults(func=lambda _args: (_self_test_judge_payload_sanitization(), print("eval_cli self-test ok"), 0)[2])
 
     run_parser = sub.add_parser("run", help="run a configured two-model job")
     run_parser.add_argument("--job", default=DEFAULT_JOB, help="job name or path")
