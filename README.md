@@ -76,6 +76,17 @@ python .\eval_cli.py campaign --job smoke_10 --repeat 3 --live
 python .\eval_cli.py campaign --job smoke_100 --repeat 1 --live
 ```
 
+For control campaigns, keep the same local provider keys and override only the
+tested model identity at the CLI layer:
+
+```powershell
+python .\eval_cli.py campaign --job smoke_10 --repeat 1 --live --tested-model claude-sonnet-4-6 --tested-provider-id tested_airouting_sonnet46 --campaign-id CMP-LIVE-SONNET46-SMOKE10
+python .\eval_cli.py campaign --job smoke_10 --repeat 1 --live --tested-model invalid-negative-control-model --tested-provider-id negative_invalid_model --campaign-id CMP-LIVE-NEGATIVE-INVALID --retries 0
+```
+
+These overrides are runtime-only; they do not write back to
+`configs/providers.local.json`.
+
 Campaign files are runtime artifacts under `campaigns/CMP-.../`:
 
 ```text

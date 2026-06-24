@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -187,6 +187,45 @@ def load_two_model_config(path: Path) -> dict[str, ModelConfig]:
         "tested_model": load_model_config(data["tested_model"], "tested_model"),
         "judge_model": load_model_config(data["judge_model"], "judge_model"),
     }
+
+
+def _optional_arg(args: argparse.Namespace, name: str) -> str | None:
+    value = getattr(args, name, None)
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def apply_model_overrides(models: dict[str, ModelConfig], args: argparse.Namespace) -> dict[str, ModelConfig]:
+    out = dict(models)
+    for prefix, label in (("tested", "tested_model"), ("judge", "judge_model")):
+        current = out[label]
+        provider_id = _optional_arg(args, f"{prefix}_provider_id")
+        base_url = _optional_arg(args, f"{prefix}_base_url")
+        model_name = _optional_arg(args, f"{prefix}_model")
+        api_key_env = _optional_arg(args, f"{prefix}_api_key_env")
+        protocol = _optional_arg(args, f"{prefix}_protocol")
+        auth_type = _optional_arg(args, f"{prefix}_auth_type")
+        display_name = _optional_arg(args, f"{prefix}_display_name")
+
+        if protocol and protocol not in ALLOWED_PROTOCOLS:
+            raise ValueError(f"--{prefix}-protocol must be one of: {', '.join(sorted(ALLOWED_PROTOCOLS))}")
+        if auth_type and auth_type not in ALLOWED_AUTH_TYPES:
+            raise ValueError(f"--{prefix}-auth-type must be one of: {', '.join(sorted(ALLOWED_AUTH_TYPES))}")
+
+        if any([provider_id, base_url, model_name, api_key_env, protocol, auth_type, display_name]):
+            out[label] = replace(
+                current,
+                provider_id=provider_id or current.provider_id,
+                base_url=(base_url.rstrip("/") if base_url else current.base_url),
+                model=model_name or current.model,
+                api_key_env=api_key_env or current.api_key_env,
+                protocol=protocol or current.protocol,
+                auth_type=auth_type or current.auth_type,
+                provider_display_name=display_name or provider_id or current.provider_display_name,
+            )
+    return out
 
 
 def sanitized_models(models: dict[str, ModelConfig]) -> dict[str, Any]:
@@ -847,7 +886,7 @@ def run_job(args: argparse.Namespace) -> int:
     job_path = resolve_job(args.job)
     job = read_json(job_path)
     models_path = resolve_path(args.providers or job.get("providers_file") or DEFAULT_PROVIDERS)
-    models = load_two_model_config(models_path)
+    models = apply_model_overrides(load_two_model_config(models_path), args)
     tasks, benchmark_config = select_tasks(job)
     if not tasks:
         raise ValueError("job selected zero tasks")
@@ -1146,7 +1185,7 @@ def run_campaign(args: argparse.Namespace) -> int:
     job_path = resolve_job(args.job)
     job = read_json(job_path)
     models_path = resolve_path(args.providers or job.get("providers_file") or DEFAULT_PROVIDERS)
-    models = load_two_model_config(models_path)
+    models = apply_model_overrides(load_two_model_config(models_path), args)
     _, benchmark_config = select_tasks(job)
     benchmark_mode = str(job.get("benchmark_mode") or "custom")
     benchmark_meta = benchmark_metadata(job, benchmark_config, benchmark_mode)
@@ -1525,6 +1564,17 @@ def probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def add_model_override_args(parser: argparse.ArgumentParser) -> None:
+    for prefix, label in (("tested", "tested model"), ("judge", "judge model")):
+        parser.add_argument(f"--{prefix}-provider-id", help=f"override {label} provider id for this run")
+        parser.add_argument(f"--{prefix}-base-url", help=f"override {label} base URL for this run")
+        parser.add_argument(f"--{prefix}-model", help=f"override {label} model name for this run")
+        parser.add_argument(f"--{prefix}-api-key-env", help=f"override {label} API key environment variable for this run")
+        parser.add_argument(f"--{prefix}-protocol", choices=sorted(ALLOWED_PROTOCOLS), help=f"override {label} protocol")
+        parser.add_argument(f"--{prefix}-auth-type", choices=sorted(ALLOWED_AUTH_TYPES), help=f"override {label} auth type")
+        parser.add_argument(f"--{prefix}-display-name", help=f"override {label} display name for this run")
+
+
 def main() -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -1545,6 +1595,7 @@ def main() -> int:
     run_parser.add_argument("--judge-max-tokens", type=int)
     run_parser.add_argument("--retries", type=int, help="retry transient live provider failures this many times")
     run_parser.add_argument("--retry-backoff", type=float, help="initial retry backoff seconds for live provider failures")
+    add_model_override_args(run_parser)
     run_parser.set_defaults(func=run_job)
 
     inspect_parser = sub.add_parser("inspect", help="inspect a job state")
@@ -1573,6 +1624,7 @@ def main() -> int:
     campaign_parser.add_argument("--judge-max-tokens", type=int)
     campaign_parser.add_argument("--retries", type=int, help="retry transient live provider failures this many times")
     campaign_parser.add_argument("--retry-backoff", type=float, help="initial retry backoff seconds for live provider failures")
+    add_model_override_args(campaign_parser)
     campaign_parser.set_defaults(func=run_campaign)
 
     campaign_list_parser = sub.add_parser("campaign-list", help="list campaigns")
