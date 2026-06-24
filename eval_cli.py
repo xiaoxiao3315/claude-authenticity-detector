@@ -197,6 +197,25 @@ def _optional_arg(args: argparse.Namespace, name: str) -> str | None:
     return value or None
 
 
+MODEL_OVERRIDE_FIELDS = (
+    "provider_id",
+    "base_url",
+    "model",
+    "api_key_env",
+    "protocol",
+    "auth_type",
+    "display_name",
+)
+
+
+def model_override_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        f"{prefix}_{field}": getattr(args, f"{prefix}_{field}", None)
+        for prefix in ("tested", "judge")
+        for field in MODEL_OVERRIDE_FIELDS
+    }
+
+
 def apply_model_overrides(models: dict[str, ModelConfig], args: argparse.Namespace) -> dict[str, ModelConfig]:
     out = dict(models)
     for prefix, label in (("tested", "tested_model"), ("judge", "judge_model")):
@@ -1232,6 +1251,7 @@ def run_campaign(args: argparse.Namespace) -> int:
         campaign_doc["status"] = "running"
         campaign_doc["completed_at"] = None
         campaign_doc["resumed_at"] = now_iso()
+        campaign_doc["resumed_code_git_commit"] = git_commit()
     else:
         campaign_doc = {
             "schema_version": "campaign_v1",
@@ -1295,6 +1315,7 @@ def run_campaign(args: argparse.Namespace) -> int:
             judge_max_tokens=args.judge_max_tokens,
             retries=getattr(args, "retries", None),
             retry_backoff=getattr(args, "retry_backoff", None),
+            **model_override_kwargs(args),
         )
         try:
             run_job(child_args)
