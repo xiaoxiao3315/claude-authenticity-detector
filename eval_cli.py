@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import zipfile
@@ -28,6 +30,17 @@ from benchmarking import (
     load_benchmark_modes,
     select_benchmark_tasks,
 )
+from campaigns import (
+    campaign_dir,
+    campaign_list_payload,
+    export_campaign,
+    load_campaign,
+    load_run_index,
+    load_summary,
+    safe_campaign_id,
+    summarize_campaign,
+    write_json as write_campaign_json,
+)
 from local_env import load_local_env
 from quality_gate import run_quality_gate
 from run_records import stable_json_hash, text_hash
@@ -37,6 +50,7 @@ from validate_run_records import validate_records
 ROOT = Path(__file__).resolve().parent
 DEFAULT_JOB = "smoke_10"
 DEFAULT_PROVIDERS = Path("configs/providers.local.json")
+DEFAULT_CAMPAIGNS_DIR = Path("campaigns")
 ALLOWED_PROTOCOLS = {"openai_chat", "anthropic_messages"}
 ALLOWED_AUTH_TYPES = {"bearer", "x-api-key"}
 
@@ -186,6 +200,66 @@ def sanitized_models(models: dict[str, ModelConfig]) -> dict[str, Any]:
             "auth_type": model.auth_type,
         }
     return out
+
+
+def key_fingerprint(env_name: str) -> str | None:
+    value = os.environ.get(env_name)
+    if not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def campaign_model_identity(model: ModelConfig) -> dict[str, Any]:
+    return {
+        "provider_id": model.provider_id,
+        "base_url_host": base_url_host(model.base_url),
+        "model": model.model,
+        "api_key_env": model.api_key_env,
+        "key_fingerprint": key_fingerprint(model.api_key_env),
+        "protocol": model.protocol,
+        "auth_type": model.auth_type,
+        "provider_channel": model.provider_channel,
+        "provider_display_name": model.provider_display_name or model.provider_id,
+    }
+
+
+def git_commit() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return None
+    return result.stdout.strip() or None
+
+
+def policy_metadata(path: Path) -> dict[str, Any]:
+    data = read_json(path) if path.exists() else {}
+    policies = data.get("policies") if isinstance(data.get("policies"), list) else []
+    first = policies[0] if policies and isinstance(policies[0], dict) else {}
+    return {
+        "policy_version": data.get("policy_version") or "unknown",
+        "policy_id": first.get("policy_id") or "unknown",
+    }
+
+
+def benchmark_metadata(job: dict[str, Any], benchmark_config: dict[str, Any], benchmark_mode: str) -> dict[str, Any]:
+    benchmark_version = str(benchmark_config.get("version") or job.get("benchmark_version") or "custom")
+    return {
+        "benchmark_config_version": benchmark_version,
+        "benchmark_version": f"{benchmark_version}:{benchmark_mode}",
+        "benchmark_mode": benchmark_mode,
+        "score_formula_version": str(benchmark_config.get("score_formula_version") or SCORE_FORMULA_VERSION),
+    }
+
+
+def campaign_id_for(model: ModelConfig) -> str:
+    model_part = re.sub(r"[^A-Za-z0-9]+", "-", model.model).strip("-").upper() or "MODEL"
+    return f"CMP-{model_part}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
 
 def load_tasks(path: Path) -> list[dict[str, Any]]:
@@ -895,6 +969,186 @@ def export_job(args: argparse.Namespace) -> int:
     return 0
 
 
+def campaign_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    campaigns_dir = resolve_path(getattr(args, "campaigns_dir", None) or DEFAULT_CAMPAIGNS_DIR)
+    runs_dir = resolve_path(getattr(args, "runs_dir", None) or "runs")
+    return campaigns_dir, runs_dir
+
+
+def run_campaign(args: argparse.Namespace) -> int:
+    if int(args.repeat) < 1:
+        raise ValueError("--repeat must be >= 1")
+    job_path = resolve_job(args.job)
+    job = read_json(job_path)
+    models_path = resolve_path(args.providers or job.get("providers_file") or DEFAULT_PROVIDERS)
+    models = load_two_model_config(models_path)
+    _, benchmark_config = select_tasks(job)
+    benchmark_mode = str(job.get("benchmark_mode") or "custom")
+    benchmark_meta = benchmark_metadata(job, benchmark_config, benchmark_mode)
+    policy_path = resolve_path(job.get("quality_gate_policy") or "quality_gate.policy.json")
+    policy_meta = policy_metadata(policy_path)
+    campaigns_dir, runs_dir = campaign_paths(args)
+    campaign_id = safe_campaign_id(args.campaign_id or campaign_id_for(models["tested_model"]))
+    out_dir = campaign_dir(campaigns_dir, campaign_id)
+    out_dir.mkdir(parents=True, exist_ok=False)
+    live = bool(args.live)
+    if not live and bool(job.get("live_provider")):
+        live = True
+    tested_identity = campaign_model_identity(models["tested_model"])
+    judge_identity = campaign_model_identity(models["judge_model"])
+    config_hash = stable_json_hash(
+        {
+            "job": {**job, "job_path": str(job_path)},
+            "providers": {
+                "tested_model": tested_identity,
+                "judge_model": judge_identity,
+            },
+            "benchmark": benchmark_meta,
+            "quality_gate": policy_meta,
+            "live_provider": live,
+        }
+    )
+    campaign_doc = {
+        "schema_version": "campaign_v1",
+        "campaign_id": campaign_id,
+        "job": str(args.job),
+        "job_path": str(job_path),
+        "repeat": int(args.repeat),
+        "status": "running",
+        "created_at": now_iso(),
+        "completed_at": None,
+        "live_provider": live,
+        "tested_model": tested_identity,
+        "judge_model": judge_identity,
+        "benchmark_config_version": benchmark_meta["benchmark_config_version"],
+        "benchmark_version": benchmark_meta["benchmark_version"],
+        "benchmark_mode": benchmark_meta["benchmark_mode"],
+        "score_formula_version": benchmark_meta["score_formula_version"],
+        "quality_gate_version": policy_meta["policy_version"],
+        "quality_gate_policy_id": policy_meta["policy_id"],
+        "code_git_commit": git_commit(),
+        "config_hash": config_hash,
+        "artifacts": {},
+    }
+    write_campaign_json(out_dir / "campaign.json", campaign_doc)
+    run_index = {"campaign_id": campaign_id, "runs": []}
+    write_campaign_json(out_dir / "run_ids.json", run_index)
+
+    exit_code = 0
+    for round_index in range(1, int(args.repeat) + 1):
+        run_id = f"{campaign_id}-R{round_index:02d}"
+        run_ref = {
+            "round": round_index,
+            "run_id": run_id,
+            "status": "running",
+            "started_at": now_iso(),
+            "completed_at": None,
+        }
+        run_index["runs"].append(run_ref)
+        write_campaign_json(out_dir / "run_ids.json", run_index)
+        summarize_campaign(out_dir, runs_dir)
+        child_args = argparse.Namespace(
+            job=args.job,
+            providers=args.providers,
+            runs_dir=runs_dir,
+            run_id=run_id,
+            live=live,
+            timeout=args.timeout,
+            tested_max_tokens=args.tested_max_tokens,
+            judge_max_tokens=args.judge_max_tokens,
+        )
+        try:
+            run_job(child_args)
+            state = read_json(runs_dir / run_id / "state.json")
+            run_ref["status"] = state.get("status") or "completed"
+            run_ref["started_at"] = state.get("started_at") or run_ref["started_at"]
+            run_ref["completed_at"] = state.get("completed_at") or now_iso()
+            run_ref["final_decision"] = state.get("final_decision")
+        except Exception as exc:
+            run_ref["status"] = "failed"
+            run_ref["completed_at"] = now_iso()
+            run_ref["error"] = str(exc)
+            exit_code = 1
+        write_campaign_json(out_dir / "run_ids.json", run_index)
+        summarize_campaign(out_dir, runs_dir)
+        if exit_code:
+            break
+
+    campaign_doc["completed_at"] = now_iso()
+    if exit_code:
+        campaign_doc["status"] = "failed"
+    elif all(run.get("status") == "completed" for run in run_index["runs"]):
+        campaign_doc["status"] = "completed"
+    else:
+        campaign_doc["status"] = "partial"
+    write_campaign_json(out_dir / "campaign.json", campaign_doc)
+    summary = summarize_campaign(out_dir, runs_dir)
+    print(
+        json.dumps(
+            {
+                "campaign_id": campaign_id,
+                "status": campaign_doc["status"],
+                "campaign_dir": str(out_dir),
+                "summary": {
+                    "total_runs": summary["metrics"]["total_runs"],
+                    "total_cases": summary["metrics"]["total_cases"],
+                    "overall_decision": summary["decisions"]["overall_decision"],
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return exit_code
+
+
+def campaign_list(args: argparse.Namespace) -> int:
+    campaigns_dir, runs_dir = campaign_paths(args)
+    print(json.dumps(campaign_list_payload(campaigns_dir, runs_dir), ensure_ascii=False, indent=2))
+    return 0
+
+
+def campaign_status(args: argparse.Namespace) -> int:
+    campaigns_dir, runs_dir = campaign_paths(args)
+    out_dir = campaign_dir(campaigns_dir, args.campaign_id)
+    campaign_doc = load_campaign(out_dir)
+    summary = load_summary(out_dir) or summarize_campaign(out_dir, runs_dir)
+    payload = {
+        "campaign_id": campaign_doc.get("campaign_id"),
+        "status": campaign_doc.get("status"),
+        "created_at": campaign_doc.get("created_at"),
+        "completed_at": campaign_doc.get("completed_at"),
+        "live_provider": campaign_doc.get("live_provider"),
+        "repeat": campaign_doc.get("repeat"),
+        "metrics": summary.get("metrics"),
+        "decisions": summary.get("decisions"),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def campaign_inspect(args: argparse.Namespace) -> int:
+    campaigns_dir, runs_dir = campaign_paths(args)
+    out_dir = campaign_dir(campaigns_dir, args.campaign_id)
+    summary = load_summary(out_dir) or summarize_campaign(out_dir, runs_dir)
+    payload = {
+        "campaign": load_campaign(out_dir),
+        "run_ids": load_run_index(out_dir),
+        "summary": summary,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def campaign_export(args: argparse.Namespace) -> int:
+    campaigns_dir, runs_dir = campaign_paths(args)
+    out_dir = campaign_dir(campaigns_dir, args.campaign_id)
+    summarize_campaign(out_dir, runs_dir)
+    zip_path = export_campaign(out_dir, runs_dir)
+    print(json.dumps({"campaign_id": args.campaign_id, "artifact": str(zip_path)}, ensure_ascii=False, indent=2))
+    return 0
+
+
 def model_ids_from_payload(data: Any) -> list[str]:
     raw: Any
     if isinstance(data, dict):
@@ -1101,6 +1355,42 @@ def main() -> int:
     export_parser.add_argument("--job-id")
     export_parser.add_argument("--runs-dir", type=Path)
     export_parser.set_defaults(func=export_job)
+
+    campaign_parser = sub.add_parser("campaign", help="run a repeated campaign")
+    campaign_parser.add_argument("--job", default=DEFAULT_JOB, help="job name or path")
+    campaign_parser.add_argument("--providers", type=Path, help="providers config path")
+    campaign_parser.add_argument("--runs-dir", type=Path, help="runs directory")
+    campaign_parser.add_argument("--campaigns-dir", type=Path, help="campaigns directory")
+    campaign_parser.add_argument("--campaign-id", help="explicit campaign id")
+    campaign_parser.add_argument("--repeat", type=int, required=True)
+    campaign_parser.add_argument("--live", action="store_true", help="call configured live providers")
+    campaign_parser.add_argument("--timeout", type=float, help="per-request timeout seconds")
+    campaign_parser.add_argument("--tested-max-tokens", type=int)
+    campaign_parser.add_argument("--judge-max-tokens", type=int)
+    campaign_parser.set_defaults(func=run_campaign)
+
+    campaign_list_parser = sub.add_parser("campaign-list", help="list campaigns")
+    campaign_list_parser.add_argument("--campaigns-dir", type=Path)
+    campaign_list_parser.add_argument("--runs-dir", type=Path)
+    campaign_list_parser.set_defaults(func=campaign_list)
+
+    campaign_status_parser = sub.add_parser("campaign-status", help="inspect campaign status")
+    campaign_status_parser.add_argument("--campaign-id", required=True)
+    campaign_status_parser.add_argument("--campaigns-dir", type=Path)
+    campaign_status_parser.add_argument("--runs-dir", type=Path)
+    campaign_status_parser.set_defaults(func=campaign_status)
+
+    campaign_inspect_parser = sub.add_parser("campaign-inspect", help="inspect a campaign summary")
+    campaign_inspect_parser.add_argument("--campaign-id", required=True)
+    campaign_inspect_parser.add_argument("--campaigns-dir", type=Path)
+    campaign_inspect_parser.add_argument("--runs-dir", type=Path)
+    campaign_inspect_parser.set_defaults(func=campaign_inspect)
+
+    campaign_export_parser = sub.add_parser("campaign-export", help="export a campaign acceptance pack")
+    campaign_export_parser.add_argument("--campaign-id", required=True)
+    campaign_export_parser.add_argument("--campaigns-dir", type=Path)
+    campaign_export_parser.add_argument("--runs-dir", type=Path)
+    campaign_export_parser.set_defaults(func=campaign_export)
 
     probe_parser = sub.add_parser("probe", help="probe model/protocol/auth combinations")
     probe_parser.add_argument("--providers", type=Path, help="providers config path")

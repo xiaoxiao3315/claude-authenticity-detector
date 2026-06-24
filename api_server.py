@@ -8,11 +8,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from campaigns import (
+    campaign_dir as resolve_campaign_dir,
+    campaign_leaderboard,
+    campaign_list_payload,
+    load_run_index,
+    load_summary,
+    summarize_campaign,
+)
 from local_env import load_local_env
 
 
 ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / "runs"
+CAMPAIGNS_DIR = ROOT / "campaigns"
 WEB_DIR = ROOT / "web"
 PROVIDERS_LOCAL = ROOT / "configs" / "providers.local.json"
 LOCAL_SECRETS = ROOT / "local_secrets.env"
@@ -453,8 +462,14 @@ def save_config(payload: dict) -> dict:
     return sanitized_config()
 
 
+def query_bool(qs: dict[str, list[str]], name: str, default: bool = False) -> bool:
+    if name not in qs:
+        return default
+    return str((qs.get(name) or [str(default)])[0]).lower() in {"1", "true", "yes", "on"}
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EvalAutomationAPI/0.2.1"
+    server_version = "EvalAutomationAPI/0.2.2"
 
     def send_json(self, value, status: int = 200) -> None:
         body = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
@@ -480,8 +495,36 @@ class Handler(BaseHTTPRequestHandler):
                     limit = min(max(int(raw_limit), 1), 200)
                 except ValueError:
                     limit = 50
-                include_dry_run = str((qs.get("include_dry_run") or ["false"])[0]).lower() in {"1", "true", "yes", "on"}
-                self.send_json(leaderboard(limit=limit, include_dry_run=include_dry_run))
+                live_filter = None
+                if "live_provider" in qs:
+                    live_filter = query_bool(qs, "live_provider")
+                min_samples_raw = (qs.get("min_samples") or ["1"])[0]
+                try:
+                    min_samples = max(int(min_samples_raw), 1)
+                except ValueError:
+                    min_samples = 1
+                self.send_json(
+                    campaign_leaderboard(
+                        CAMPAIGNS_DIR,
+                        RUNS_DIR,
+                        include_dry_run=query_bool(qs, "include_dry_run"),
+                        benchmark_version=(qs.get("benchmark_version") or [""])[0],
+                        judge_model=(qs.get("judge_model") or [""])[0],
+                        quality_gate_version=(qs.get("quality_gate_version") or [""])[0],
+                        live_provider=live_filter,
+                        date_from=(qs.get("date_from") or [""])[0],
+                        date_to=(qs.get("date_to") or [""])[0],
+                        min_samples=min_samples,
+                        limit=limit,
+                    )
+                )
+            elif path == "/api/campaigns":
+                self.send_json(campaign_list_payload(CAMPAIGNS_DIR, RUNS_DIR))
+            elif path == "/api/campaigns/latest":
+                campaigns = campaign_list_payload(CAMPAIGNS_DIR, RUNS_DIR).get("campaigns") or []
+                self.send_json(campaigns[0] if campaigns else {})
+            elif path.startswith("/api/campaigns/"):
+                self.handle_campaign_get(path)
             elif path == "/api/jobs":
                 self.send_json({"jobs": list_jobs()})
             elif path == "/api/jobs/latest":
@@ -510,6 +553,33 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(save_config(payload))
         except Exception as exc:
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+
+    def handle_campaign_get(self, path: str) -> None:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 3:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "campaign id is required")
+            return
+        campaign_id = parts[2]
+        camp_dir = resolve_campaign_dir(CAMPAIGNS_DIR, campaign_id)
+        if not camp_dir.exists() or not camp_dir.is_dir():
+            raise FileNotFoundError(campaign_id)
+        tail = parts[3:] if len(parts) > 3 else ["summary"]
+        endpoint = tail[0]
+        if endpoint == "summary":
+            self.send_json(load_summary(camp_dir) or summarize_campaign(camp_dir, RUNS_DIR))
+        elif endpoint == "runs":
+            self.send_json(load_run_index(camp_dir))
+        elif endpoint == "artifacts":
+            if len(tail) > 1:
+                self.serve_campaign_artifact(camp_dir, tail[1])
+            else:
+                artifacts = []
+                root = camp_dir / "artifacts"
+                if root.exists():
+                    artifacts = [{"name": item.name, "bytes": item.stat().st_size} for item in root.iterdir() if item.is_file()]
+                self.send_json({"artifacts": artifacts})
+        else:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "unknown campaign endpoint")
 
     def handle_job_get(self, path: str) -> None:
         parts = [part for part in path.split("/") if part]
@@ -540,6 +610,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"artifacts": artifacts})
         else:
             self.send_error_json(HTTPStatus.NOT_FOUND, "unknown job endpoint")
+
+    def serve_campaign_artifact(self, camp_dir: Path, name: str) -> None:
+        if "/" in name or "\\" in name or ".." in name:
+            raise ValueError("invalid artifact name")
+        path = camp_dir / "artifacts" / name
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(name)
+        body = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("content-type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        self.send_header("content-disposition", f'attachment; filename="{path.name}"')
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def serve_artifact(self, run_dir: Path, name: str) -> None:
         if "/" in name or "\\" in name or ".." in name:

@@ -51,7 +51,7 @@
         <div class="panel-head">
           <div>
             <h3>模型排行</h3>
-            <span class="muted">按 provider、模型和 benchmark 模式聚合历史真实任务</span>
+            <span class="muted">按 campaign 聚合多轮真实任务，避免单次网络错误误导结论</span>
           </div>
           <span id="leaderboardStatus" class="muted">-</span>
         </div>
@@ -60,18 +60,40 @@
             <thead>
               <tr>
                 <th>排名</th>
-                <th>模型</th>
-                <th>结论</th>
-                <th>Benchmark 分</th>
-                <th>质量分</th>
-                <th>成功率</th>
-                <th>P95</th>
-                <th>历史次数</th>
-                <th>最新任务</th>
+                <th>被测模型</th>
+                <th>验收模型</th>
+                <th>轮数</th>
+                <th>总题数</th>
+                <th>模型成功率</th>
+                <th>网关成功率</th>
+                <th>平均质量</th>
+                <th>协议</th>
+                <th>模型名</th>
+                <th>P50 / P95</th>
+                <th>模型可信度</th>
+                <th>网关稳定性</th>
+                <th>综合结论</th>
+                <th>最后测试</th>
               </tr>
             </thead>
             <tbody id="leaderboardBody"></tbody>
           </table>
+        </div>
+      </section>
+
+      <section class="panel campaign-detail-panel">
+        <div class="panel-head">
+          <div>
+            <h3>Campaign 详情</h3>
+            <span class="muted">点击排行中的 campaign 查看多轮趋势、错误和证据</span>
+          </div>
+          <div class="actions">
+            <span id="campaignDetailStatus" class="muted">未选择</span>
+            <a id="campaignDownloadPack" class="tool-button link-disabled" href="#">下载 Campaign 包</a>
+          </div>
+        </div>
+        <div id="campaignDetail" class="campaign-detail">
+          <div class="empty-note">暂无 campaign 详情</div>
         </div>
       </section>
 

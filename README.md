@@ -47,6 +47,58 @@ GET /api/jobs/<job_id>/results
 GET /api/jobs/<job_id>/artifacts
 ```
 
+## v0.2.2 Campaign Aggregation
+
+Campaigns group repeated runs under the same tested model, judge model,
+benchmark version, quality-gate version, score formula, and live/dry-run mode.
+The leaderboard ranks campaign summaries by default instead of treating one
+run as a model-level conclusion.
+
+```powershell
+python .\eval_cli.py campaign --job smoke_10 --repeat 3
+python .\eval_cli.py campaign-list
+python .\eval_cli.py campaign-status --campaign-id CMP-...
+python .\eval_cli.py campaign-inspect --campaign-id CMP-...
+python .\eval_cli.py campaign-export --campaign-id CMP-...
+```
+
+Use `--live` only after the dry-run path is verified:
+
+```powershell
+python .\eval_cli.py campaign --job smoke_10 --repeat 3 --live
+```
+
+Campaign files are runtime artifacts under `campaigns/CMP-.../`:
+
+```text
+campaign.json   fixed test condition, redacted model identity, versions, git commit, config hash
+run_ids.json    child run IDs and per-round status
+summary.json    aggregate metrics, separated decisions, trend and evidence data
+artifacts/      campaign acceptance pack after campaign-export
+```
+
+The model confidence decision and gateway reliability decision are separate.
+Transport failures lower gateway reliability, but are not treated as proof of
+poor model identity. API keys are never written; campaign metadata stores only
+redacted config and a SHA-256 key fingerprint prefix.
+
+Campaign API routes:
+
+```text
+GET /api/leaderboard
+GET /api/leaderboard?include_dry_run=true
+GET /api/campaigns
+GET /api/campaigns/latest
+GET /api/campaigns/<campaign_id>/summary
+GET /api/campaigns/<campaign_id>/runs
+GET /api/campaigns/<campaign_id>/artifacts
+GET /api/campaigns/<campaign_id>/artifacts/acceptance_pack.zip
+```
+
+`/api/leaderboard` defaults to completed live campaigns only. It excludes
+dry-run campaigns unless `include_dry_run=true` is passed, and only ranks
+campaigns within one compatible comparison group.
+
 ## Install
 
 ```powershell
@@ -105,4 +157,6 @@ python .\compatibility.py --self-test
 python .\quality_gate.py --self-test
 python .\trace_evaluation.py --self-test
 python .\audit_export.py --self-test
+python .\eval_cli.py campaign --job smoke_10 --repeat 3
+python .\eval_cli.py campaign-export --campaign-id CMP-...
 ```

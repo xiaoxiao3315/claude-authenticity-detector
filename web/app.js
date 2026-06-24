@@ -1,5 +1,6 @@
 const state = {
   currentJobId: null,
+  currentCampaignId: null,
   leaderboard: { entries: [] },
 };
 
@@ -194,47 +195,166 @@ function renderLeaderboard(data) {
   if (!status || !body) return;
   const rows = (data && data.entries) || [];
   state.leaderboard.entries = rows;
-  status.textContent = rows.length ? `${rows.length} 个模型 / ${data.raw_run_count || 0} 次真实任务` : "暂无真实排行数据";
+  status.textContent = rows.length ? `${rows.length} 个 campaign / 兼容组 ${data.selected_comparison_key_id || "-"}` : "暂无真实 campaign 排行";
   body.innerHTML = "";
   if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="9" class="empty-table">暂无 benchmark 分数</td></tr>';
+    body.innerHTML = '<tr><td colspan="15" class="empty-table">暂无 completed live campaign；dry-run 可通过 API 参数 include_dry_run=true 查看</td></tr>';
     return;
   }
   for (const row of rows) {
     const tr = document.createElement("tr");
     tr.className = "leaderboard-row";
     tr.tabIndex = 0;
-    tr.dataset.runId = row.latest_run_id || row.run_id || "";
-    const decision = row.gate_decision || "-";
+    tr.dataset.campaignId = row.campaign_id || "";
     tr.innerHTML = `
       <td><span class="rank-badge">#${escapeHtml(row.rank || "-")}</span></td>
       <td>
-        <strong>${escapeHtml(row.model || "-")}</strong>
-        <span class="cell-note">${escapeHtml(row.provider_display_name || row.provider_id || "-")} / ${escapeHtml(row.mode || "-")} / ${row.live_provider ? "真实" : "干跑"}</span>
+        <strong>${escapeHtml(row.tested_model || "-")}</strong>
+        <span class="cell-note">${escapeHtml(row.tested_provider_id || "-")} / ${row.live_provider ? "真实" : "干跑"}</span>
       </td>
-      <td><span class="${decisionClass(decision)}">${escapeHtml(decisionText(decision))}</span></td>
-      <td>
-        <strong>${escapeHtml(fmtNumber(row.score, 1))}</strong>
-        <span class="cell-note">最新 ${escapeHtml(fmtNumber(row.latest_score, 1))}</span>
-      </td>
-      <td>${escapeHtml(fmtNumber(row.quality_score, 1))}</td>
-      <td>${escapeHtml(fmtPercent(row.success_rate))}</td>
-      <td>${escapeHtml(fmtMs(row.p95_first_content_token_ms))}</td>
-      <td>${escapeHtml(row.history_count || 1)}</td>
-      <td><code>${escapeHtml(row.latest_run_id || row.run_id || "-")}</code><span class="cell-note">${escapeHtml(fmtDate(row.generated_at || row.completed_at))}</span></td>
+      <td>${escapeHtml(row.judge_model || "-")}</td>
+      <td>${escapeHtml(row.completed_runs ?? 0)} / ${escapeHtml(row.total_runs ?? 0)}</td>
+      <td>${escapeHtml(row.total_cases ?? 0)}</td>
+      <td>${escapeHtml(fmtPercent(row.model_response_success_rate))}</td>
+      <td>${escapeHtml(fmtPercent(row.transport_success_rate))}</td>
+      <td>${escapeHtml(fmtNumber(row.average_quality_score, 2))}</td>
+      <td>${escapeHtml(fmtPercent(row.protocol_compatibility_score))}</td>
+      <td>${escapeHtml(fmtPercent(row.model_name_consistency_rate))}</td>
+      <td>${escapeHtml(fmtMs(row.p50_latency_ms))} / ${escapeHtml(fmtMs(row.p95_latency_ms))}</td>
+      <td><span class="${decisionClass(row.model_confidence_decision)}">${escapeHtml(decisionText(row.model_confidence_decision))}</span></td>
+      <td><span class="${decisionClass(row.gateway_reliability_decision)}">${escapeHtml(decisionText(row.gateway_reliability_decision))}</span></td>
+      <td><span class="${decisionClass(row.overall_decision)}">${escapeHtml(decisionText(row.overall_decision))}</span></td>
+      <td><code>${escapeHtml(row.campaign_id || "-")}</code><span class="cell-note">${escapeHtml(fmtDate(row.latest_tested_at))}</span></td>
     `;
-    const openRun = () => {
-      if (tr.dataset.runId) loadJob(tr.dataset.runId);
+    const openCampaign = () => {
+      if (tr.dataset.campaignId) loadCampaign(tr.dataset.campaignId);
     };
-    tr.addEventListener("click", openRun);
+    tr.addEventListener("click", openCampaign);
     tr.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
-        openRun();
+        openCampaign();
       }
     });
     body.appendChild(tr);
   }
+}
+
+async function loadCampaign(campaignId) {
+  state.currentCampaignId = campaignId;
+  const [summary, runs, artifacts] = await Promise.all([
+    api(`/api/campaigns/${encodeURIComponent(campaignId)}/summary`),
+    api(`/api/campaigns/${encodeURIComponent(campaignId)}/runs`),
+    api(`/api/campaigns/${encodeURIComponent(campaignId)}/artifacts`),
+  ]);
+  renderCampaignDetail(summary, runs.runs || [], artifacts.artifacts || []);
+}
+
+function metricTile(label, value, hint = "") {
+  return `
+    <div class="mini-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      ${hint ? `<em>${escapeHtml(hint)}</em>` : ""}
+    </div>
+  `;
+}
+
+function renderCampaignDetail(summary, runs, artifacts) {
+  const target = $("campaignDetail");
+  if (!target) return;
+  const status = $("campaignDetailStatus");
+  const pack = artifacts.find((item) => item.name === "acceptance_pack.zip");
+  const link = $("campaignDownloadPack");
+  if (status) status.textContent = summary.campaign_id || "-";
+  if (link) {
+    if (pack && summary.campaign_id) {
+      link.href = `/api/campaigns/${encodeURIComponent(summary.campaign_id)}/artifacts/acceptance_pack.zip`;
+      link.classList.remove("link-disabled");
+    } else {
+      link.href = "#";
+      link.classList.add("link-disabled");
+    }
+  }
+  const metrics = summary.metrics || {};
+  const decisions = summary.decisions || {};
+  const trend = summary.trend || [];
+  const samples = summary.samples || [];
+  const failures = summary.failure_counts || {};
+  const maxBenchmark = Math.max(1, ...trend.map((item) => Number(item.benchmark_score || 0)));
+  const maxFailure = Math.max(1, ...Object.values(failures).map((value) => Number(value || 0)));
+  target.innerHTML = `
+    <div class="campaign-summary-grid">
+      ${metricTile("总轮数", `${metrics.completed_runs ?? 0} / ${metrics.total_runs ?? 0}`)}
+      ${metricTile("总题数", metrics.total_cases ?? 0)}
+      ${metricTile("模型成功率", fmtPercent(metrics.model_response_success_rate))}
+      ${metricTile("网关成功率", fmtPercent(metrics.transport_success_rate))}
+      ${metricTile("平均质量", fmtNumber(metrics.average_quality_score, 2), `中位 ${fmtNumber(metrics.median_quality_score, 2)}`)}
+      ${metricTile("P50 / P95", `${fmtMs(metrics.p50_latency_ms)} / ${fmtMs(metrics.p95_latency_ms)}`)}
+    </div>
+    <div class="decision-strip">
+      <span class="${decisionClass(decisions.model_confidence_decision)}">模型可信度：${escapeHtml(decisionText(decisions.model_confidence_decision))}</span>
+      <span class="${decisionClass(decisions.gateway_reliability_decision)}">网关稳定性：${escapeHtml(decisionText(decisions.gateway_reliability_decision))}</span>
+      <span class="${decisionClass(decisions.overall_decision)}">综合结论：${escapeHtml(decisionText(decisions.overall_decision))}</span>
+    </div>
+    <div class="detail-columns">
+      <section>
+        <h4>各轮质量趋势</h4>
+        <div class="trend-list">
+          ${trend.map((item) => {
+            const width = Math.max(2, Math.min(100, Number(item.benchmark_score || 0) / maxBenchmark * 100));
+            return `<div class="trend-row"><code>R${escapeHtml(item.round)}</code><span><i style="width:${width}%"></i></span><strong>${escapeHtml(fmtNumber(item.benchmark_score, 1))}</strong></div>`;
+          }).join("") || '<div class="empty-note">暂无趋势数据</div>'}
+        </div>
+      </section>
+      <section>
+        <h4>失败原因分布</h4>
+        <div class="failure-list">
+          ${Object.entries(failures).map(([name, value]) => {
+            const width = Math.max(2, Math.min(100, Number(value || 0) / maxFailure * 100));
+            return `<div class="trend-row"><code>${escapeHtml(name)}</code><span><i class="failure-bar" style="width:${width}%"></i></span><strong>${escapeHtml(value)}</strong></div>`;
+          }).join("") || '<div class="empty-note">暂无失败原因</div>'}
+        </div>
+      </section>
+    </div>
+    <div class="table-wrap detail-table">
+      <table>
+        <thead><tr><th>轮次</th><th>Run</th><th>状态</th><th>Benchmark</th><th>质量</th><th>网关成功率</th><th>P95</th></tr></thead>
+        <tbody>
+          ${(summary.child_runs || []).map((run) => `
+            <tr>
+              <td>R${escapeHtml(run.round)}</td>
+              <td><code>${escapeHtml(run.run_id)}</code></td>
+              <td>${escapeHtml(statusText(run.status))}</td>
+              <td>${escapeHtml(fmtNumber(run.benchmark_score, 1))}</td>
+              <td>${escapeHtml(fmtNumber(run.average_quality_score, 2))}</td>
+              <td>${escapeHtml(fmtPercent(run.transport_success_rate))}</td>
+              <td>${escapeHtml(fmtMs(run.p95_latency_ms))}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+    <div class="table-wrap detail-table">
+      <table>
+        <thead><tr><th>题目</th><th>轮次</th><th>状态</th><th>得分</th><th>延迟</th><th>model_requested</th><th>model_returned</th><th>Judge 理由</th></tr></thead>
+        <tbody>
+          ${samples.slice(0, 120).map((sample) => `
+            <tr>
+              <td><code>${escapeHtml(sample.task_id || "-")}</code></td>
+              <td>R${escapeHtml(sample.round || "-")}</td>
+              <td>${sample.ok ? "通过" : `失败 / ${escapeHtml(sample.error_type || "unknown")}`}</td>
+              <td>${escapeHtml(fmtNumber(sample.score, 1))}</td>
+              <td>${escapeHtml(fmtMs(sample.latency_ms))}</td>
+              <td>${escapeHtml(sample.model_requested || "-")}</td>
+              <td>${escapeHtml(sample.model_returned || "-")}</td>
+              <td>${escapeHtml(sample.judge_reason || sample.error || "")}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
 }
 
 function renderResults(results) {
