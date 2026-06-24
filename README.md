@@ -26,6 +26,14 @@ Dry-runs do not load `local_secrets.env`; local secrets are loaded only for
 live provider calls, config-status display, or explicit probe/config-write
 flows.
 
+Each run performs a post-run trace evidence pass before the quality gate by
+default. Use `--skip-trace-evaluation` only when you intentionally want to omit
+trace evidence from the gate:
+
+```powershell
+python .\eval_cli.py run --job smoke_10 --skip-trace-evaluation
+```
+
 To open the local dashboard/API:
 
 ```powershell
@@ -85,6 +93,15 @@ Use `--live` only after the dry-run path is verified:
 ```powershell
 python .\eval_cli.py campaign --job smoke_10 --repeat 3 --live
 python .\eval_cli.py campaign --job smoke_100 --repeat 1 --live
+```
+
+Task-level concurrency is bounded and conservative. Job configs default to `1`
+to avoid gateway rate-limit noise; raise it explicitly only when you want a
+controlled throughput test:
+
+```powershell
+python .\eval_cli.py run --job smoke_100 --max-concurrency 2
+python .\eval_cli.py campaign --job smoke_100 --repeat 1 --max-concurrency 2
 ```
 
 For CI-style gates, add `--require-go`. The command still writes the run or
@@ -152,6 +169,11 @@ logs are excluded unless `--include-raw` is passed:
 python .\eval_cli.py export --latest --include-raw
 python .\eval_cli.py campaign-export --campaign-id CMP-... --include-raw
 ```
+
+The API marks `acceptance_pack.zip` artifacts with checksum verification status
+and refuses to download packs that are missing the manifest/checksum pair. If a
+run or campaign was exported before this safe-pack format, re-run `export` or
+`campaign-export` for that item.
 
 ## Install
 

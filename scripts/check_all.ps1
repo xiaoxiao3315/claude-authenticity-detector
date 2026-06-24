@@ -11,7 +11,7 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Push-Location $RepoRoot
 try {
     Write-Host "[check] python compile"
-    python -m py_compile eval_cli.py campaigns.py api_server.py run_records.py benchmarking.py quality_gate.py
+    python -m py_compile eval_cli.py campaigns.py api_server.py run_records.py benchmarking.py quality_gate.py trace_evaluation.py acceptance_pack.py redaction.py
 
     $node = Get-Command node -ErrorAction SilentlyContinue
     if ($node) {
@@ -33,6 +33,22 @@ try {
         Write-Host "[check] dry-run campaign $campaignId"
         python .\eval_cli.py campaign --job smoke_10 --providers configs\providers.example.json --repeat 1 --campaign-id $campaignId
         python .\eval_cli.py campaign-status --campaign-id $campaignId
+        python .\eval_cli.py campaign-export --campaign-id $campaignId
+        $packPath = Join-Path $RepoRoot "campaigns\$campaignId\artifacts\acceptance_pack.zip"
+        $env:CHECK_ACCEPTANCE_PACK = $packPath
+        try {
+            @'
+import os
+from pathlib import Path
+from acceptance_pack import verify_acceptance_pack
+pack = Path(os.environ["CHECK_ACCEPTANCE_PACK"])
+result = verify_acceptance_pack(pack)
+print(result)
+raise SystemExit(0 if result.get("verified") else 1)
+'@ | python -
+        } finally {
+            Remove-Item Env:\CHECK_ACCEPTANCE_PACK -ErrorAction SilentlyContinue
+        }
     }
 
     if (-not $SkipPackageSmoke) {

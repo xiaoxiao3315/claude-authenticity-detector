@@ -87,6 +87,31 @@ function renderJobs(jobs) {
   }
 }
 
+function renderPackLink(linkId, statusId, pack, href) {
+  const link = $(linkId);
+  const status = $(statusId);
+  const verification = pack && pack.verification ? pack.verification : null;
+  const verified = verification && verification.verified === true;
+  if (link) {
+    if (pack && href && verified) {
+      link.href = href;
+      link.classList.remove("link-disabled");
+    } else {
+      link.href = "#";
+      link.classList.add("link-disabled");
+    }
+  }
+  if (status) {
+    if (!pack) {
+      status.textContent = "未导出";
+    } else if (verified) {
+      status.textContent = "已校验";
+    } else {
+      status.textContent = `需重新导出 / ${verification?.error || "未校验"}`;
+    }
+  }
+}
+
 async function refreshJobs() {
   const [jobsResult, leaderboardResult] = await Promise.allSettled([
     api("/api/jobs"),
@@ -140,14 +165,7 @@ function renderState(jobState, artifacts) {
   $("jobDecision").textContent = decisionText(jobState.final_decision);
   $("jobDecision").className = decisionClass(jobState.final_decision);
   const pack = artifacts.find((item) => item.name === "acceptance_pack.zip");
-  const link = $("downloadPack");
-  if (pack && jobState.job_id) {
-    link.href = `/api/jobs/${encodeURIComponent(jobState.job_id)}/artifacts/acceptance_pack.zip`;
-    link.classList.remove("link-disabled");
-  } else {
-    link.href = "#";
-    link.classList.add("link-disabled");
-  }
+  renderPackLink("downloadPack", "downloadPackStatus", pack, jobState.job_id ? `/api/jobs/${encodeURIComponent(jobState.job_id)}/artifacts/acceptance_pack.zip` : "");
 }
 
 function renderSummary(summary) {
@@ -279,17 +297,8 @@ function renderCampaignDetail(summary, runs, artifacts) {
   if (!target) return;
   const status = $("campaignDetailStatus");
   const pack = artifacts.find((item) => item.name === "acceptance_pack.zip");
-  const link = $("campaignDownloadPack");
   if (status) status.textContent = summary.campaign_id || "-";
-  if (link) {
-    if (pack && summary.campaign_id) {
-      link.href = `/api/campaigns/${encodeURIComponent(summary.campaign_id)}/artifacts/acceptance_pack.zip`;
-      link.classList.remove("link-disabled");
-    } else {
-      link.href = "#";
-      link.classList.add("link-disabled");
-    }
-  }
+  renderPackLink("campaignDownloadPack", "campaignDownloadPackStatus", pack, summary.campaign_id ? `/api/campaigns/${encodeURIComponent(summary.campaign_id)}/artifacts/acceptance_pack.zip` : "");
   const metrics = summary.metrics || {};
   const decisions = summary.decisions || {};
   const trend = summary.trend || [];

@@ -15,6 +15,25 @@ from redaction import redact_text
 
 DECISION_ORDER = {"GO": 0, "REVIEW": 1, "NO-GO": 2}
 SUMMARY_SCHEMA_VERSION = "campaign_summary_v1"
+REQUIRED_SUMMARY_METRIC_KEYS = {
+    "total_runs",
+    "run_history_count",
+    "replaced_run_count",
+    "completed_runs",
+    "total_cases",
+    "model_response_success_rate",
+    "transport_success_rate",
+    "average_quality_score",
+    "median_quality_score",
+    "protocol_compatibility_score",
+    "model_name_consistency_rate",
+    "retried_request_count",
+    "total_retry_count",
+    "p50_latency_ms",
+    "p95_latency_ms",
+    "latest_tested_at",
+    "error_counts",
+}
 
 
 def read_json(path: Path) -> Any:
@@ -94,6 +113,22 @@ def load_run_index(campaign_dir_path: Path) -> dict[str, Any]:
     return read_json(path)
 
 
+def campaign_identity_problem(campaign_dir_path: Path) -> str | None:
+    try:
+        campaign = load_campaign(campaign_dir_path)
+        run_index = load_run_index(campaign_dir_path)
+    except Exception as exc:
+        return f"campaign metadata unreadable: {type(exc).__name__}"
+    expected = campaign_dir_path.name
+    campaign_id = str(campaign.get("campaign_id") or "")
+    run_index_id = str(run_index.get("campaign_id") or campaign_id or "")
+    if campaign_id and campaign_id != expected:
+        return f"campaign_id mismatch: dir={expected}, campaign_json={campaign_id}"
+    if run_index_id and run_index_id != expected:
+        return f"campaign_id mismatch: dir={expected}, run_ids={run_index_id}"
+    return None
+
+
 def load_summary(campaign_dir_path: Path) -> dict[str, Any] | None:
     path = campaign_dir_path / "summary.json"
     if not path.exists():
@@ -101,11 +136,28 @@ def load_summary(campaign_dir_path: Path) -> dict[str, Any] | None:
     return read_json(path)
 
 
+def summary_needs_refresh(summary: dict[str, Any] | None) -> bool:
+    if not isinstance(summary, dict):
+        return True
+    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
+    if not REQUIRED_SUMMARY_METRIC_KEYS.issubset(metrics):
+        return True
+    decisions = summary.get("decisions") if isinstance(summary.get("decisions"), dict) else {}
+    return not {"model_confidence_decision", "gateway_reliability_decision", "overall_decision"}.issubset(decisions)
+
+
 def list_campaign_dirs(campaigns_dir: Path) -> list[Path]:
     if not campaigns_dir.exists():
         return []
+    valid: list[Path] = []
+    for path in campaigns_dir.iterdir():
+        if not path.is_dir() or not (path / "campaign.json").exists():
+            continue
+        if campaign_identity_problem(path):
+            continue
+        valid.append(path)
     return sorted(
-        [path for path in campaigns_dir.iterdir() if path.is_dir() and (path / "campaign.json").exists()],
+        valid,
         key=lambda path: (path.stat().st_mtime, path.name),
         reverse=True,
     )
@@ -507,7 +559,7 @@ def list_campaign_summaries(
     summaries: list[dict[str, Any]] = []
     for path in list_campaign_dirs(campaigns_dir):
         summary = load_summary(path)
-        if summary is None and refresh_missing and runs_dir is not None:
+        if (summary is None or summary_needs_refresh(summary)) and refresh_missing and runs_dir is not None:
             summary = summarize_campaign(path, runs_dir, persist=persist_refresh)
         if summary is not None:
             summaries.append(summary)
@@ -651,7 +703,7 @@ def export_campaign(campaign_dir_path: Path, runs_dir: Path, *, include_raw: boo
                 path = run_dir / name
                 if path.exists():
                     _zip_add_file(zf, path, f"runs/{run_id}/{name}", checksums)
-            folders = ["quality_gates"]
+            folders = ["quality_gates", "trace_evaluations"]
             if include_raw:
                 folders.extend(["events", "responses", "judge_responses"])
             for folder in folders:

@@ -1399,6 +1399,7 @@ def main() -> int:
     parser.add_argument("--trace-eval-id")
     parser.add_argument("--gate-label")
     parser.add_argument("--require-rescore", action="store_true")
+    parser.add_argument("--require-go", action="store_true", help="return exit code 2 unless every provider decision is GO")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -1419,6 +1420,8 @@ def main() -> int:
         require_rescore=args.require_rescore,
     )
     print(json.dumps({"gate_id": result["gate_id"], "manifest": result["manifest"]}, ensure_ascii=False, indent=2))
+    if args.require_go and any(record.get("decision") != GO for record in result.get("records") or []):
+        return 2
     return 0
 
 

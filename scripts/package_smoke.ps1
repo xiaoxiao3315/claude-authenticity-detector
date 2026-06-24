@@ -68,7 +68,7 @@ try {
     }
 
     Write-Host "[package] syntax checks"
-    python -m py_compile eval_cli.py campaigns.py api_server.py run_records.py benchmarking.py quality_gate.py redaction.py
+    python -m py_compile eval_cli.py campaigns.py api_server.py run_records.py benchmarking.py quality_gate.py trace_evaluation.py acceptance_pack.py redaction.py
     $node = Get-Command node -ErrorAction SilentlyContinue
     if ($node) {
         node --check web\app.js
@@ -100,7 +100,8 @@ try {
         "acceptance_manifest.json",
         "checksums.sha256",
         "runs/$CampaignId-R01/run_records.jsonl",
-        "runs/$CampaignId-R01/quality_gates/"
+        "runs/$CampaignId-R01/quality_gates/",
+        "runs/$CampaignId-R01/trace_evaluations/"
     )) {
         $found = $false
         foreach ($name in $entryNames) {
@@ -126,6 +127,20 @@ try {
                 throw "acceptance pack contains forbidden entry prefix: $forbiddenPrefix"
             }
         }
+    }
+    $env:PACKAGE_SMOKE_PACK = $packPath
+    try {
+        @'
+import os
+from pathlib import Path
+from acceptance_pack import verify_acceptance_pack
+pack = Path(os.environ["PACKAGE_SMOKE_PACK"])
+result = verify_acceptance_pack(pack)
+print(result)
+raise SystemExit(0 if result.get("verified") else 1)
+'@ | python -
+    } finally {
+        Remove-Item Env:\PACKAGE_SMOKE_PACK -ErrorAction SilentlyContinue
     }
 
     Write-Host "[package] api smoke on port $Port"

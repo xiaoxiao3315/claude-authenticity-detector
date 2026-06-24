@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +44,8 @@ from campaigns import (
 )
 from local_env import load_local_env
 from quality_gate import run_quality_gate
-from run_records import stable_json_hash, text_hash
+from run_records import extract_raw_event_types, stable_json_hash, text_hash
+from trace_evaluation import run_trace_evaluation
 from validate_run_records import validate_records
 from redaction import redact_text
 
@@ -118,6 +120,14 @@ def append_jsonl(path: Path, value: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
         f.write("\n")
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+            f.write("\n")
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -315,6 +325,25 @@ def benchmark_metadata(job: dict[str, Any], benchmark_config: dict[str, Any], be
         "benchmark_mode": benchmark_mode,
         "score_formula_version": str(benchmark_config.get("score_formula_version") or SCORE_FORMULA_VERSION),
     }
+
+
+def benchmark_mode_settings(benchmark_config: dict[str, Any], benchmark_mode: str) -> dict[str, Any]:
+    modes = benchmark_config.get("modes") if isinstance(benchmark_config.get("modes"), dict) else {}
+    mode = modes.get(benchmark_mode) if isinstance(modes.get(benchmark_mode), dict) else {}
+    return mode
+
+
+def configured_max_concurrency(args: argparse.Namespace, job: dict[str, Any], benchmark_config: dict[str, Any], benchmark_mode: str) -> int:
+    raw = getattr(args, "max_concurrency", None)
+    if raw is None:
+        raw = job.get("max_concurrency")
+    if raw is None:
+        raw = benchmark_mode_settings(benchmark_config, benchmark_mode).get("max_concurrency")
+    try:
+        value = int(raw or 1)
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, value)
 
 
 def campaign_id_for(model: ModelConfig) -> str:
@@ -833,7 +862,7 @@ def run_record(
             "judge_model_requested": (judge_score or {}).get("model_requested"),
             "judge_model_returned": (judge_score or {}).get("model_returned"),
         },
-        "trace": {"tool_calls": [], "raw_event_types": []},
+        "trace": {"tool_calls": [], "raw_event_types": extract_raw_event_types(events_file)},
         "artifacts": {"response_file": str(response_file), "events_file": str(events_file)},
     }
 
@@ -942,6 +971,7 @@ def run_job(args: argparse.Namespace) -> int:
     retry_backoff = float(backoff_raw)
     request_retries = max(0, request_retries)
     retry_backoff = max(0.0, retry_backoff)
+    max_concurrency = min(configured_max_concurrency(args, job, benchmark_config, benchmark_mode), len(tasks))
 
     state = {
         "job_id": run_id,
@@ -954,6 +984,7 @@ def run_job(args: argparse.Namespace) -> int:
         "live_provider": live,
         "models": sanitized_models(models),
         "retry": {"retries": request_retries if live else 0, "backoff_seconds": retry_backoff if live else 0},
+        "execution": {"max_concurrency": max_concurrency},
         "final_decision": None,
         "artifacts": {},
     }
@@ -962,17 +993,12 @@ def run_job(args: argparse.Namespace) -> int:
     write_json(run_dir / "providers.redacted.json", sanitized_models(models))
     append_jsonl(run_dir / "events.jsonl", {"at": now_iso(), "type": "job_started", "job_id": run_id, "live_provider": live})
 
-    records: list[dict[str, Any]] = []
-    rows: list[dict[str, Any]] = []
-    results: list[dict[str, Any]] = []
     client_timeout = httpx.Timeout(timeout, connect=min(timeout, 20.0), read=timeout, write=min(timeout, 30.0), pool=10.0)
-    with httpx.Client(timeout=client_timeout, follow_redirects=True) as client:
-        for index, task in enumerate(tasks, start=1):
-            task_id = str(task.get("id") or f"task_{index}")
-            state["current_task"] = task_id
-            write_state(run_dir, state)
-            append_jsonl(run_dir / "events.jsonl", {"at": now_iso(), "type": "task_started", "task_id": task_id, "index": index})
+    task_items = list(enumerate(tasks, start=1))
 
+    def evaluate_task(index: int, task: dict[str, Any]) -> dict[str, Any]:
+        task_id = str(task.get("id") or f"task_{index}")
+        with httpx.Client(timeout=client_timeout, follow_redirects=True) as client:
             tested_events = run_dir / "events" / models["tested_model"].provider_id / f"{task_id}.jsonl"
             tested = call_model_with_retries(
                 client=client,
@@ -1045,11 +1071,12 @@ def run_job(args: argparse.Namespace) -> int:
                 max_tokens=tested_max_tokens,
                 temperature=temperature,
             )
-            append_jsonl(run_dir / "run_records.jsonl", record)
-            records.append(record)
-            rows.append(summary_row(record, response_file))
-            results.append(
-                {
+            return {
+                "index": index,
+                "task_id": task_id,
+                "record": record,
+                "row": summary_row(record, response_file),
+                "result": {
                     "task": task_metadata(task),
                     "tested_model": models["tested_model"].provider_id,
                     "judge_model": models["judge_model"].provider_id,
@@ -1057,14 +1084,51 @@ def run_job(args: argparse.Namespace) -> int:
                     "score": final_score,
                     "judge_score": judge_score,
                     "response_file": str(response_file),
-                }
-            )
-            state["progress"]["completed"] = index
-            append_jsonl(
-                run_dir / "events.jsonl",
-                {"at": now_iso(), "type": "task_completed", "task_id": task_id, "score": final_score.get("score"), "ok": tested.metrics.ok},
-            )
+                },
+                "score": final_score.get("score"),
+                "ok": tested.metrics.ok,
+            }
+
+    outcomes: list[dict[str, Any]] = []
+    completed_count = 0
+    if max_concurrency == 1:
+        for index, task in task_items:
+            task_id = str(task.get("id") or f"task_{index}")
+            state["current_task"] = task_id
             write_state(run_dir, state)
+            append_jsonl(run_dir / "events.jsonl", {"at": now_iso(), "type": "task_started", "task_id": task_id, "index": index})
+            outcome = evaluate_task(index, task)
+            outcomes.append(outcome)
+            completed_count += 1
+            state["progress"]["completed"] = completed_count
+            append_jsonl(run_dir / "events.jsonl", {"at": now_iso(), "type": "task_completed", "task_id": task_id, "score": outcome["score"], "ok": outcome["ok"]})
+            write_state(run_dir, state)
+    else:
+        state["current_task"] = f"{max_concurrency} concurrent tasks"
+        write_state(run_dir, state)
+        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+            futures = []
+            for index, task in task_items:
+                task_id = str(task.get("id") or f"task_{index}")
+                append_jsonl(run_dir / "events.jsonl", {"at": now_iso(), "type": "task_started", "task_id": task_id, "index": index})
+                futures.append(executor.submit(evaluate_task, index, task))
+            for future in as_completed(futures):
+                outcome = future.result()
+                outcomes.append(outcome)
+                completed_count += 1
+                state["progress"]["completed"] = completed_count
+                state["current_task"] = outcome["task_id"]
+                append_jsonl(
+                    run_dir / "events.jsonl",
+                    {"at": now_iso(), "type": "task_completed", "task_id": outcome["task_id"], "score": outcome["score"], "ok": outcome["ok"]},
+                )
+                write_state(run_dir, state)
+
+    outcomes.sort(key=lambda item: int(item["index"]))
+    records = [outcome["record"] for outcome in outcomes]
+    rows = [outcome["row"] for outcome in outcomes]
+    results = [outcome["result"] for outcome in outcomes]
+    write_jsonl(run_dir / "run_records.jsonl", records)
 
     write_json(run_dir / "results.json", results)
     write_summary_csv(run_dir / "summary.csv", rows)
@@ -1079,20 +1143,42 @@ def run_job(args: argparse.Namespace) -> int:
     write_json(run_dir / "validation.json", {"error_count": len(validation_errors), "errors": validation_errors})
     gate_result: dict[str, Any] | None = None
     policy_path = resolve_path(job.get("quality_gate_policy") or "quality_gate.policy.json")
+    trace_eval_id: str | None = None
+    trace_evaluation_enabled = bool(job.get("trace_evaluation", True)) and not bool(getattr(args, "skip_trace_evaluation", False))
+    if trace_evaluation_enabled:
+        trace_policy_path = resolve_path(job.get("trace_evaluation_policy") or "trace_evaluation.policy.json")
+        try:
+            trace_result = run_trace_evaluation(
+                runs_dir=runs_dir,
+                run_id=run_id,
+                policy_path=trace_policy_path,
+                provider_id=models["tested_model"].provider_id,
+                trace_eval_label="two_model_headless",
+            )
+            trace_eval_id = str(trace_result.get("trace_eval_id") or "")
+            if trace_eval_id:
+                state.setdefault("artifacts", {})["trace_eval_id"] = trace_eval_id
+                write_state(run_dir, state)
+        except Exception as exc:
+            validation_errors.append(f"trace evaluation failed: {redact_text(exc, max_chars=500)}")
+            append_jsonl(run_dir / "events.jsonl", {"at": now_iso(), "type": "trace_evaluation_warning", "error": redact_text(exc, max_chars=500)})
     try:
         gate_result = run_quality_gate(
             runs_dir=runs_dir,
             run_id=run_id,
             policy_path=policy_path,
             provider_id=models["tested_model"].provider_id,
+            trace_eval_id=trace_eval_id,
             gate_label="two_model_headless",
         )
     except Exception as exc:
-        append_jsonl(run_dir / "events.jsonl", {"at": now_iso(), "type": "quality_gate_warning", "error": str(exc)})
+        validation_errors.append(f"quality gate failed: {redact_text(exc, max_chars=500)}")
+        append_jsonl(run_dir / "events.jsonl", {"at": now_iso(), "type": "quality_gate_warning", "error": redact_text(exc, max_chars=500)})
 
     decision = "REVIEW"
     if gate_result and gate_result.get("records"):
         decision = str(gate_result["records"][0].get("decision") or "REVIEW")
+    write_json(run_dir / "validation.json", {"error_count": len(validation_errors), "errors": validation_errors})
     state["status"] = "completed" if not validation_errors else "partial"
     state["completed_at"] = now_iso()
     state["current_task"] = None
@@ -1149,7 +1235,7 @@ def export_job(args: argparse.Namespace) -> int:
                 data = path.read_bytes()
                 zf.writestr(name, data)
                 checksums[name] = hashlib.sha256(data).hexdigest()
-        folders = ["quality_gates"]
+        folders = ["quality_gates", "trace_evaluations"]
         if include_raw:
             folders.extend(["events", "responses", "judge_responses"])
         for folder in folders:
@@ -1345,9 +1431,11 @@ def run_campaign(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             tested_max_tokens=args.tested_max_tokens,
             judge_max_tokens=args.judge_max_tokens,
+            max_concurrency=getattr(args, "max_concurrency", None),
             retries=getattr(args, "retries", None),
             retry_backoff=getattr(args, "retry_backoff", None),
             require_go=False,
+            skip_trace_evaluation=getattr(args, "skip_trace_evaluation", False),
             **model_override_kwargs(args),
         )
         try:
@@ -1649,9 +1737,11 @@ def main() -> int:
     run_parser.add_argument("--timeout", type=float, help="per-request timeout seconds")
     run_parser.add_argument("--tested-max-tokens", type=int)
     run_parser.add_argument("--judge-max-tokens", type=int)
+    run_parser.add_argument("--max-concurrency", type=int, help="bounded task-level concurrency; defaults to job or benchmark setting")
     run_parser.add_argument("--retries", type=int, help="retry transient live provider failures this many times")
     run_parser.add_argument("--retry-backoff", type=float, help="initial retry backoff seconds for live provider failures")
     run_parser.add_argument("--require-go", action="store_true", help="return exit code 2 unless the final decision is GO")
+    run_parser.add_argument("--skip-trace-evaluation", action="store_true", help="skip the default post-run trace evidence pass")
     add_model_override_args(run_parser)
     run_parser.set_defaults(func=run_job)
 
@@ -1680,9 +1770,11 @@ def main() -> int:
     campaign_parser.add_argument("--timeout", type=float, help="per-request timeout seconds")
     campaign_parser.add_argument("--tested-max-tokens", type=int)
     campaign_parser.add_argument("--judge-max-tokens", type=int)
+    campaign_parser.add_argument("--max-concurrency", type=int, help="bounded task-level concurrency for each child run")
     campaign_parser.add_argument("--retries", type=int, help="retry transient live provider failures this many times")
     campaign_parser.add_argument("--retry-backoff", type=float, help="initial retry backoff seconds for live provider failures")
     campaign_parser.add_argument("--require-go", action="store_true", help="return exit code 2 unless the campaign overall decision is GO")
+    campaign_parser.add_argument("--skip-trace-evaluation", action="store_true", help="skip the default post-run trace evidence pass for child runs")
     add_model_override_args(campaign_parser)
     campaign_parser.set_defaults(func=run_campaign)
 

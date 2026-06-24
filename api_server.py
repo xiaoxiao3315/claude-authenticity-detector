@@ -8,12 +8,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from acceptance_pack import verify_acceptance_pack
 from campaigns import (
+    campaign_identity_problem,
     campaign_dir as resolve_campaign_dir,
     campaign_leaderboard,
     campaign_list_payload,
     load_run_index,
     load_summary,
+    summary_needs_refresh,
     summarize_campaign,
 )
 from local_env import load_local_env
@@ -469,6 +472,20 @@ def query_bool(qs: dict[str, list[str]], name: str, default: bool = False) -> bo
     return str((qs.get(name) or [str(default)])[0]).lower() in {"1", "true", "yes", "on"}
 
 
+def artifact_listing(root: Path) -> list[dict]:
+    artifacts = []
+    if not root.exists():
+        return artifacts
+    for item in root.iterdir():
+        if not item.is_file():
+            continue
+        row = {"name": item.name, "bytes": item.stat().st_size}
+        if item.name == "acceptance_pack.zip":
+            row["verification"] = verify_acceptance_pack(item)
+        artifacts.append(row)
+    return artifacts
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EvalAutomationAPI/0.2.2"
 
@@ -568,21 +585,24 @@ class Handler(BaseHTTPRequestHandler):
         camp_dir = resolve_campaign_dir(CAMPAIGNS_DIR, campaign_id)
         if not camp_dir.exists() or not camp_dir.is_dir():
             raise FileNotFoundError(campaign_id)
+        identity_problem = campaign_identity_problem(camp_dir)
+        if identity_problem:
+            self.send_error_json(HTTPStatus.CONFLICT, identity_problem)
+            return
         tail = parts[3:] if len(parts) > 3 else ["summary"]
         endpoint = tail[0]
         if endpoint == "summary":
-            self.send_json(load_summary(camp_dir) or summarize_campaign(camp_dir, RUNS_DIR, persist=False))
+            summary = load_summary(camp_dir)
+            if summary_needs_refresh(summary):
+                summary = summarize_campaign(camp_dir, RUNS_DIR, persist=False)
+            self.send_json(summary)
         elif endpoint == "runs":
             self.send_json(load_run_index(camp_dir))
         elif endpoint == "artifacts":
             if len(tail) > 1:
                 self.serve_campaign_artifact(camp_dir, tail[1])
             else:
-                artifacts = []
-                root = camp_dir / "artifacts"
-                if root.exists():
-                    artifacts = [{"name": item.name, "bytes": item.stat().st_size} for item in root.iterdir() if item.is_file()]
-                self.send_json({"artifacts": artifacts})
+                self.send_json({"artifacts": artifact_listing(camp_dir / "artifacts")})
         else:
             self.send_error_json(HTTPStatus.NOT_FOUND, "unknown campaign endpoint")
 
@@ -608,11 +628,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(tail) > 1:
                 self.serve_artifact(run_dir, tail[1])
             else:
-                artifacts = []
-                root = run_dir / "artifacts"
-                if root.exists():
-                    artifacts = [{"name": item.name, "bytes": item.stat().st_size} for item in root.iterdir() if item.is_file()]
-                self.send_json({"artifacts": artifacts})
+                self.send_json({"artifacts": artifact_listing(run_dir / "artifacts")})
         else:
             self.send_error_json(HTTPStatus.NOT_FOUND, "unknown job endpoint")
 
@@ -622,6 +638,11 @@ class Handler(BaseHTTPRequestHandler):
         path = camp_dir / "artifacts" / name
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(name)
+        if name == "acceptance_pack.zip":
+            verification = verify_acceptance_pack(path)
+            if not verification.get("verified"):
+                self.send_error_json(HTTPStatus.CONFLICT, f"acceptance pack failed verification: {verification.get('error')}")
+                return
         body = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("content-type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
@@ -636,6 +657,11 @@ class Handler(BaseHTTPRequestHandler):
         path = run_dir / "artifacts" / name
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(name)
+        if name == "acceptance_pack.zip":
+            verification = verify_acceptance_pack(path)
+            if not verification.get("verified"):
+                self.send_error_json(HTTPStatus.CONFLICT, f"acceptance pack failed verification: {verification.get('error')}")
+                return
         body = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("content-type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")

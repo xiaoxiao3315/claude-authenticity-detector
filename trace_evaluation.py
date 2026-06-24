@@ -343,13 +343,29 @@ def evaluate_source(source: dict[str, Any], policy: dict[str, Any], trace_eval_i
         parsed_events = parse_events(Path(events_path))
         evidence.update(parsed_events)
         required = ["message_start", "message_delta", "message_stop"]
+        positions = parsed_events["positions"]
+        non_streaming_terminal_events = {"response_completed", "dry_completion", "http_error", "request_failed", "response_parse_failed"}
+        is_non_streaming_runner = bool(non_streaming_terminal_events.intersection(positions))
+        if is_non_streaming_runner:
+            evidence["non_streaming_runner"] = True
         missing = [event for event in required if event not in parsed_events["positions"]]
         if missing:
-            checks.append(check("required_sse_events", FAIL, "required SSE events are missing", {"missing": missing, "event_types": parsed_events["unique_event_types"]}))
+            if is_non_streaming_runner:
+                checks.append(
+                    check(
+                        "required_sse_events",
+                        NOT_APPLICABLE,
+                        "runner recorded non-streaming request events; SSE trace checks are not available",
+                        {"missing": missing, "event_types": parsed_events["unique_event_types"]},
+                    )
+                )
+            else:
+                checks.append(check("required_sse_events", FAIL, "required SSE events are missing", {"missing": missing, "event_types": parsed_events["unique_event_types"]}))
         else:
             checks.append(check("required_sse_events", PASS, "required SSE events are present", {"event_types": parsed_events["unique_event_types"]}))
-        positions = parsed_events["positions"]
-        if (
+        if is_non_streaming_runner and missing:
+            checks.append(check("event_order", NOT_APPLICABLE, "SSE event order is not available for non-streaming runner events", positions))
+        elif (
             "message_start" in positions
             and "message_delta" in positions
             and "message_stop" in positions
@@ -358,7 +374,9 @@ def evaluate_source(source: dict[str, Any], policy: dict[str, Any], trace_eval_i
             checks.append(check("event_order", PASS, "SSE event order is plausible", positions))
         else:
             checks.append(check("event_order", FAIL, "SSE event order is invalid or incomplete", positions))
-        if parsed_events["text_delta_count"] <= 0:
+        if is_non_streaming_runner and missing:
+            checks.append(check("visible_text_path", NOT_APPLICABLE, "visible text deltas are not available for non-streaming runner events", {"text_delta_count": parsed_events["text_delta_count"]}))
+        elif parsed_events["text_delta_count"] <= 0:
             if parsed_events["thinking_delta_count"] > 0:
                 checks.append(check("visible_text_path", FAIL, "trace has thinking deltas but no visible text deltas", {"thinking_delta_count": parsed_events["thinking_delta_count"]}))
                 evidence["thinking_only"] = True
@@ -368,7 +386,14 @@ def evaluate_source(source: dict[str, Any], policy: dict[str, Any], trace_eval_i
             checks.append(check("visible_text_path", WARN, "thinking path is long before/alongside visible text", {"thinking_delta_count": parsed_events["thinking_delta_count"], "threshold": thinking_warn_count}))
         else:
             checks.append(check("visible_text_path", PASS, "trace contains visible text deltas", {"text_delta_count": parsed_events["text_delta_count"]}))
-        if "message_stop" not in positions:
+        if is_non_streaming_runner:
+            if telemetry.get("error") or boolish(telemetry.get("ok")) is False:
+                checks.append(check("terminal_state", FAIL, "run telemetry indicates an error", {"ok": telemetry.get("ok"), "error": telemetry.get("error")}))
+            elif "response_completed" in positions or "dry_completion" in positions:
+                checks.append(check("terminal_state", PASS, "non-streaming runner reached a terminal event"))
+            else:
+                checks.append(check("terminal_state", WARN, "non-streaming runner did not record a successful terminal event", {"event_types": parsed_events["unique_event_types"]}))
+        elif "message_stop" not in positions:
             checks.append(check("terminal_state", FAIL, "message_stop is missing"))
         elif telemetry.get("error") or boolish(telemetry.get("ok")) is False:
             checks.append(check("terminal_state", FAIL, "run telemetry indicates an error", {"ok": telemetry.get("ok"), "error": telemetry.get("error")}))
