@@ -58,16 +58,22 @@ run as a model-level conclusion.
 python .\eval_cli.py campaign --job smoke_10 --repeat 3
 python .\eval_cli.py campaign --job smoke_10 --repeat 3 --retries 2 --retry-backoff 2
 python .\eval_cli.py campaign --job smoke_10 --campaign-id CMP-... --resume
+python .\eval_cli.py campaign --job smoke_100 --repeat 1
 python .\eval_cli.py campaign-list
 python .\eval_cli.py campaign-status --campaign-id CMP-...
 python .\eval_cli.py campaign-inspect --campaign-id CMP-...
 python .\eval_cli.py campaign-export --campaign-id CMP-...
 ```
 
+Use `smoke_10` for quick checks and `smoke_100` for a small comparison run.
+`smoke_100` selects up to 100 eligible tasks from the current 130-task private
+bank.
+
 Use `--live` only after the dry-run path is verified:
 
 ```powershell
 python .\eval_cli.py campaign --job smoke_10 --repeat 3 --live
+python .\eval_cli.py campaign --job smoke_100 --repeat 1 --live
 ```
 
 Campaign files are runtime artifacts under `campaigns/CMP-.../`:

@@ -1,0 +1,19 @@
+{
+  "job_id_prefix": "JOB100",
+  "label": "Small 100 acceptance",
+  "providers_file": "configs/providers.local.json",
+  "tasks_file": "tasks/enterprise_v0_2.json",
+  "benchmarks_file": "benchmarks/enterprise_modes.json",
+  "benchmark_mode": "mode_100",
+  "max_tasks": 100,
+  "live_provider": false,
+  "max_concurrency": 1,
+  "tested_max_tokens": 768,
+  "judge_max_tokens": 512,
+  "temperature": 0,
+  "timeout": 180,
+  "request_retries": 2,
+  "retry_backoff_seconds": 2,
+  "runs_dir": "runs",
+  "quality_gate_policy": "quality_gate.policy.json"
+}
