@@ -1,0 +1,27 @@
+local_secrets.env
+.env
+.env.*
+*.local.env
+providers.local.json
+providers.test.local.json
+
+# Runtime artifacts
+runs/
+campaigns/
+archives/
+imports/
+*.log
+*.tmp
+_shot*.png
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Accidental Windows test output
+%SystemDrive%/

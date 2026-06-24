@@ -1,0 +1,28 @@
+{
+  "providers": [
+    {
+      "id": "anthropic_official",
+      "provider_channel": "official",
+      "provider_display_name": "Anthropic Official",
+      "base_url": "https://api.anthropic.com",
+      "model": "claude-opus-4-7",
+      "claimed_model": "claude-opus-4-7",
+      "baseline_model": "claude-opus-4-7",
+      "leaderboard_group": "official_baseline",
+      "auth_type": "x-api-key",
+      "auth_env": "ANTHROPIC_API_KEY"
+    },
+    {
+      "id": "proxy_bearer_example",
+      "provider_channel": "gateway",
+      "provider_display_name": "Example Gateway",
+      "base_url": "https://your-proxy.example.com",
+      "model": "claude-opus-4-7",
+      "claimed_model": "claude-opus-4-7",
+      "baseline_model": "claude-opus-4-7",
+      "leaderboard_group": "gateway_candidate",
+      "auth_type": "bearer",
+      "auth_env": "PROXY_API_KEY"
+    }
+  ]
+}
