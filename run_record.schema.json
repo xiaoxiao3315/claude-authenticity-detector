@@ -143,7 +143,9 @@
         "total_ms": { "type": ["number", "integer", "null"] },
         "event_count": { "type": ["integer", "number", "null"] },
         "content_event_count": { "type": ["integer", "number", "null"] },
-        "stop_reason": { "type": ["string", "null"] }
+        "stop_reason": { "type": ["string", "null"] },
+        "attempts": { "type": ["integer", "number", "null"] },
+        "retry_count": { "type": ["integer", "number", "null"] }
       }
     },
     "usage": {

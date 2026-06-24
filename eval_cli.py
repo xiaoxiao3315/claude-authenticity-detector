@@ -83,6 +83,8 @@ class CallMetrics:
     cache_read_input_tokens: int | None = None
     server_model: str | None = None
     stop_reason: str | None = None
+    attempts: int = 1
+    retry_count: int = 0
 
 
 @dataclass
@@ -101,7 +103,7 @@ def utcish_job_id(prefix: str) -> str:
 
 
 def read_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -420,7 +422,12 @@ def call_model(
         append_jsonl(events_file, {"at": now_iso(), "type": "http_error", "status": response.status_code, "body_preview": body[:300]})
         return Completion(text="", metrics=metrics)
 
-    data = response.json()
+    try:
+        data = response.json()
+    except Exception as exc:
+        metrics = CallMetrics(ok=False, error=f"{type(exc).__name__}: response JSON parse failed", total_ms=elapsed)
+        append_jsonl(events_file, {"at": now_iso(), "type": "response_parse_failed", "error": metrics.error})
+        return Completion(text="", metrics=metrics)
     text = ""
     usage: dict[str, Any] = {}
     stop_reason: str | None = None
@@ -468,6 +475,102 @@ def call_model(
         },
     )
     return Completion(text=text, metrics=metrics, raw=data)
+
+
+RETRYABLE_HTTP_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def retryable_call_failure(metrics: CallMetrics) -> bool:
+    error = str(metrics.error or "")
+    if not error:
+        return False
+    match = re.search(r"HTTP\s+(\d+)", error)
+    if match:
+        return int(match.group(1)) in RETRYABLE_HTTP_STATUS
+    lowered = error.lower()
+    retryable_tokens = (
+        "timeout",
+        "timed out",
+        "connect",
+        "connection",
+        "readerror",
+        "read error",
+        "ssl",
+        "temporar",
+        "server disconnected",
+        "remote protocol",
+        "network",
+    )
+    return any(token in lowered for token in retryable_tokens)
+
+
+def call_model_with_retries(
+    *,
+    client: httpx.Client,
+    model: ModelConfig,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float | None,
+    live: bool,
+    events_file: Path,
+    retries: int,
+    retry_backoff: float,
+) -> Completion:
+    if not live:
+        return call_model(
+            client=client,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            live=live,
+            events_file=events_file,
+        )
+
+    retries = max(0, int(retries or 0))
+    retry_backoff = max(0.0, float(retry_backoff or 0.0))
+    total_attempts = retries + 1
+    overall_started = time.perf_counter()
+    for attempt in range(1, total_attempts + 1):
+        result = call_model(
+            client=client,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            live=live,
+            events_file=events_file,
+        )
+        result.metrics.attempts = attempt
+        result.metrics.retry_count = attempt - 1
+        final_attempt = attempt >= total_attempts
+        if result.metrics.ok or final_attempt or not retryable_call_failure(result.metrics):
+            if attempt > 1:
+                elapsed = round((time.perf_counter() - overall_started) * 1000, 2)
+                result.metrics.total_ms = elapsed
+                result.metrics.first_event_ms = elapsed
+                if result.metrics.content_chars:
+                    result.metrics.first_content_token_ms = elapsed
+            return result
+
+        sleep_seconds = min(60.0, retry_backoff * (2 ** (attempt - 1)))
+        append_jsonl(
+            events_file,
+            {
+                "at": now_iso(),
+                "type": "request_retry",
+                "provider_id": model.provider_id,
+                "attempt": attempt,
+                "next_attempt": attempt + 1,
+                "max_attempts": total_attempts,
+                "sleep_seconds": round(sleep_seconds, 3),
+                "error": (result.metrics.error or "")[:500],
+            },
+        )
+        if sleep_seconds:
+            time.sleep(sleep_seconds)
+
+    raise RuntimeError("unreachable retry loop state")
 
 
 def expected_context(task: dict[str, Any]) -> dict[str, Any]:
@@ -654,6 +757,8 @@ def run_record(
             "event_count": metrics.event_count,
             "content_event_count": metrics.content_event_count,
             "stop_reason": metrics.stop_reason,
+            "attempts": metrics.attempts,
+            "retry_count": metrics.retry_count,
         },
         "usage": {
             "input_tokens": metrics.input_tokens,
@@ -707,6 +812,8 @@ def summary_row(record: dict[str, Any], response_file: Path) -> dict[str, Any]:
         "stop_reason": telemetry.get("stop_reason"),
         "first_content_token_ms": telemetry.get("first_content_token_ms"),
         "total_ms": telemetry.get("total_ms"),
+        "attempts": telemetry.get("attempts"),
+        "retry_count": telemetry.get("retry_count"),
         "input_tokens": usage.get("input_tokens"),
         "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
         "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
@@ -760,6 +867,20 @@ def run_job(args: argparse.Namespace) -> int:
     tested_max_tokens = int(args.tested_max_tokens or job.get("tested_max_tokens") or 768)
     judge_max_tokens = int(args.judge_max_tokens or job.get("judge_max_tokens") or 512)
     timeout = float(args.timeout or job.get("timeout") or 120)
+    retries_raw = getattr(args, "retries", None)
+    if retries_raw is None:
+        retries_raw = job.get("request_retries")
+    if retries_raw is None:
+        retries_raw = 2 if live else 0
+    backoff_raw = getattr(args, "retry_backoff", None)
+    if backoff_raw is None:
+        backoff_raw = job.get("retry_backoff_seconds")
+    if backoff_raw is None:
+        backoff_raw = 2.0
+    request_retries = int(retries_raw)
+    retry_backoff = float(backoff_raw)
+    request_retries = max(0, request_retries)
+    retry_backoff = max(0.0, retry_backoff)
 
     state = {
         "job_id": run_id,
@@ -771,6 +892,7 @@ def run_job(args: argparse.Namespace) -> int:
         "current_task": None,
         "live_provider": live,
         "models": sanitized_models(models),
+        "retry": {"retries": request_retries if live else 0, "backoff_seconds": retry_backoff if live else 0},
         "final_decision": None,
         "artifacts": {},
     }
@@ -791,7 +913,7 @@ def run_job(args: argparse.Namespace) -> int:
             append_jsonl(run_dir / "events.jsonl", {"at": now_iso(), "type": "task_started", "task_id": task_id, "index": index})
 
             tested_events = run_dir / "events" / models["tested_model"].provider_id / f"{task_id}.jsonl"
-            tested = call_model(
+            tested = call_model_with_retries(
                 client=client,
                 model=models["tested_model"],
                 messages=[{"role": "user", "content": str(task.get("prompt") or "")}],
@@ -799,6 +921,8 @@ def run_job(args: argparse.Namespace) -> int:
                 temperature=temperature,
                 live=live,
                 events_file=tested_events,
+                retries=request_retries,
+                retry_backoff=retry_backoff,
             )
             response_file = run_dir / "responses" / models["tested_model"].provider_id / f"{task_id}.txt"
             response_file.parent.mkdir(parents=True, exist_ok=True)
@@ -810,7 +934,7 @@ def run_job(args: argparse.Namespace) -> int:
             judge_parse_error: str | None = None
             if tested.metrics.ok:
                 judge_events = run_dir / "events" / models["judge_model"].provider_id / f"{task_id}.jsonl"
-                judge_completion = call_model(
+                judge_completion = call_model_with_retries(
                     client=client,
                     model=models["judge_model"],
                     messages=judge_messages(task, tested.text),
@@ -818,6 +942,8 @@ def run_job(args: argparse.Namespace) -> int:
                     temperature=0,
                     live=live,
                     events_file=judge_events,
+                    retries=request_retries,
+                    retry_backoff=retry_backoff,
                 )
                 judge_response_file = run_dir / "judge_responses" / models["judge_model"].provider_id / f"{task_id}.txt"
                 judge_response_file.parent.mkdir(parents=True, exist_ok=True)
@@ -975,8 +1101,47 @@ def campaign_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     return campaigns_dir, runs_dir
 
 
+def active_run_refs(run_index: dict[str, Any]) -> list[dict[str, Any]]:
+    refs = run_index.get("runs") if isinstance(run_index.get("runs"), list) else []
+    return [ref for ref in refs if ref.get("status") != "replaced"]
+
+
+def run_state_for(runs_dir: Path, run_id: str) -> dict[str, Any]:
+    path = runs_dir / run_id / "state.json"
+    if not path.exists():
+        return {}
+    return read_json(path)
+
+
+def run_ref_completed(run_ref: dict[str, Any], runs_dir: Path) -> bool:
+    run_id = str(run_ref.get("run_id") or "")
+    state = run_state_for(runs_dir, run_id)
+    status = state.get("status") or run_ref.get("status")
+    return status == "completed"
+
+
+def latest_active_run_ref(run_index: dict[str, Any], round_index: int) -> dict[str, Any] | None:
+    refs = [ref for ref in active_run_refs(run_index) if int(ref.get("round") or 0) == round_index]
+    return refs[-1] if refs else None
+
+
+def next_campaign_run_id(campaign_id: str, round_index: int, run_index: dict[str, Any], runs_dir: Path) -> tuple[str, int]:
+    refs = run_index.get("runs") if isinstance(run_index.get("runs"), list) else []
+    attempt = max([int(ref.get("attempt") or 1) for ref in refs if int(ref.get("round") or 0) == round_index] or [0]) + 1
+    while True:
+        run_id = f"{campaign_id}-R{round_index:02d}" if attempt == 1 else f"{campaign_id}-R{round_index:02d}-A{attempt:02d}"
+        if not (runs_dir / run_id).exists():
+            return run_id, attempt
+        attempt += 1
+
+
 def run_campaign(args: argparse.Namespace) -> int:
-    if int(args.repeat) < 1:
+    resume = bool(getattr(args, "resume", False))
+    if resume and not args.campaign_id:
+        raise ValueError("--resume requires --campaign-id")
+    if not resume and args.repeat is None:
+        raise ValueError("--repeat is required when creating a campaign")
+    if args.repeat is not None and int(args.repeat) < 1:
         raise ValueError("--repeat must be >= 1")
     job_path = resolve_job(args.job)
     job = read_json(job_path)
@@ -990,10 +1155,21 @@ def run_campaign(args: argparse.Namespace) -> int:
     campaigns_dir, runs_dir = campaign_paths(args)
     campaign_id = safe_campaign_id(args.campaign_id or campaign_id_for(models["tested_model"]))
     out_dir = campaign_dir(campaigns_dir, campaign_id)
-    out_dir.mkdir(parents=True, exist_ok=False)
-    live = bool(args.live)
-    if not live and bool(job.get("live_provider")):
-        live = True
+    if resume:
+        if not out_dir.exists():
+            raise FileNotFoundError(f"campaign not found: {campaign_id}")
+        campaign_doc = load_campaign(out_dir)
+        run_index = load_run_index(out_dir)
+        live = campaign_doc.get("live_provider") is True
+        repeat = int(args.repeat or campaign_doc.get("repeat") or 0)
+    else:
+        out_dir.mkdir(parents=True, exist_ok=False)
+        campaign_doc = {}
+        run_index = {"campaign_id": campaign_id, "runs": []}
+        live = bool(args.live)
+        if not live and bool(job.get("live_provider")):
+            live = True
+        repeat = int(args.repeat)
     tested_identity = campaign_model_identity(models["tested_model"])
     judge_identity = campaign_model_identity(models["judge_model"])
     config_hash = stable_json_hash(
@@ -1008,42 +1184,64 @@ def run_campaign(args: argparse.Namespace) -> int:
             "live_provider": live,
         }
     )
-    campaign_doc = {
-        "schema_version": "campaign_v1",
-        "campaign_id": campaign_id,
-        "job": str(args.job),
-        "job_path": str(job_path),
-        "repeat": int(args.repeat),
-        "status": "running",
-        "created_at": now_iso(),
-        "completed_at": None,
-        "live_provider": live,
-        "tested_model": tested_identity,
-        "judge_model": judge_identity,
-        "benchmark_config_version": benchmark_meta["benchmark_config_version"],
-        "benchmark_version": benchmark_meta["benchmark_version"],
-        "benchmark_mode": benchmark_meta["benchmark_mode"],
-        "score_formula_version": benchmark_meta["score_formula_version"],
-        "quality_gate_version": policy_meta["policy_version"],
-        "quality_gate_policy_id": policy_meta["policy_id"],
-        "code_git_commit": git_commit(),
-        "config_hash": config_hash,
-        "artifacts": {},
-    }
+    if resume:
+        existing_hash = campaign_doc.get("config_hash")
+        if existing_hash and existing_hash != config_hash:
+            raise ValueError("campaign config hash changed; refusing resume")
+        if repeat != int(campaign_doc.get("repeat") or repeat):
+            raise ValueError("--repeat must match the existing campaign when using --resume")
+        campaign_doc["status"] = "running"
+        campaign_doc["completed_at"] = None
+        campaign_doc["resumed_at"] = now_iso()
+    else:
+        campaign_doc = {
+            "schema_version": "campaign_v1",
+            "campaign_id": campaign_id,
+            "job": str(args.job),
+            "job_path": str(job_path),
+            "repeat": repeat,
+            "status": "running",
+            "created_at": now_iso(),
+            "completed_at": None,
+            "live_provider": live,
+            "tested_model": tested_identity,
+            "judge_model": judge_identity,
+            "benchmark_config_version": benchmark_meta["benchmark_config_version"],
+            "benchmark_version": benchmark_meta["benchmark_version"],
+            "benchmark_mode": benchmark_meta["benchmark_mode"],
+            "score_formula_version": benchmark_meta["score_formula_version"],
+            "quality_gate_version": policy_meta["policy_version"],
+            "quality_gate_policy_id": policy_meta["policy_id"],
+            "code_git_commit": git_commit(),
+            "config_hash": config_hash,
+            "artifacts": {},
+        }
     write_campaign_json(out_dir / "campaign.json", campaign_doc)
-    run_index = {"campaign_id": campaign_id, "runs": []}
     write_campaign_json(out_dir / "run_ids.json", run_index)
 
     exit_code = 0
-    for round_index in range(1, int(args.repeat) + 1):
-        run_id = f"{campaign_id}-R{round_index:02d}"
+    skipped_rounds = 0
+    for round_index in range(1, repeat + 1):
+        existing_ref = latest_active_run_ref(run_index, round_index)
+        if existing_ref and run_ref_completed(existing_ref, runs_dir):
+            skipped_rounds += 1
+            continue
+        replaced_run_id = None
+        if existing_ref:
+            existing_ref["status"] = "replaced"
+            existing_ref["replaced_at"] = now_iso()
+            replaced_run_id = existing_ref.get("run_id")
+        run_id, attempt = next_campaign_run_id(campaign_id, round_index, run_index, runs_dir)
         run_ref = {
             "round": round_index,
+            "attempt": attempt,
             "run_id": run_id,
             "status": "running",
             "started_at": now_iso(),
             "completed_at": None,
         }
+        if replaced_run_id:
+            run_ref["replaces_run_id"] = replaced_run_id
         run_index["runs"].append(run_ref)
         write_campaign_json(out_dir / "run_ids.json", run_index)
         summarize_campaign(out_dir, runs_dir)
@@ -1056,6 +1254,8 @@ def run_campaign(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             tested_max_tokens=args.tested_max_tokens,
             judge_max_tokens=args.judge_max_tokens,
+            retries=getattr(args, "retries", None),
+            retry_backoff=getattr(args, "retry_backoff", None),
         )
         try:
             run_job(child_args)
@@ -1077,7 +1277,7 @@ def run_campaign(args: argparse.Namespace) -> int:
     campaign_doc["completed_at"] = now_iso()
     if exit_code:
         campaign_doc["status"] = "failed"
-    elif all(run.get("status") == "completed" for run in run_index["runs"]):
+    elif active_run_refs(run_index) and all(run_ref_completed(run, runs_dir) for run in active_run_refs(run_index)):
         campaign_doc["status"] = "completed"
     else:
         campaign_doc["status"] = "partial"
@@ -1093,6 +1293,7 @@ def run_campaign(args: argparse.Namespace) -> int:
                     "total_runs": summary["metrics"]["total_runs"],
                     "total_cases": summary["metrics"]["total_cases"],
                     "overall_decision": summary["decisions"]["overall_decision"],
+                    "skipped_completed_rounds": skipped_rounds,
                 },
             },
             ensure_ascii=False,
@@ -1342,6 +1543,8 @@ def main() -> int:
     run_parser.add_argument("--timeout", type=float, help="per-request timeout seconds")
     run_parser.add_argument("--tested-max-tokens", type=int)
     run_parser.add_argument("--judge-max-tokens", type=int)
+    run_parser.add_argument("--retries", type=int, help="retry transient live provider failures this many times")
+    run_parser.add_argument("--retry-backoff", type=float, help="initial retry backoff seconds for live provider failures")
     run_parser.set_defaults(func=run_job)
 
     inspect_parser = sub.add_parser("inspect", help="inspect a job state")
@@ -1362,11 +1565,14 @@ def main() -> int:
     campaign_parser.add_argument("--runs-dir", type=Path, help="runs directory")
     campaign_parser.add_argument("--campaigns-dir", type=Path, help="campaigns directory")
     campaign_parser.add_argument("--campaign-id", help="explicit campaign id")
-    campaign_parser.add_argument("--repeat", type=int, required=True)
+    campaign_parser.add_argument("--repeat", type=int)
+    campaign_parser.add_argument("--resume", action="store_true", help="resume an existing campaign by rerunning incomplete rounds")
     campaign_parser.add_argument("--live", action="store_true", help="call configured live providers")
     campaign_parser.add_argument("--timeout", type=float, help="per-request timeout seconds")
     campaign_parser.add_argument("--tested-max-tokens", type=int)
     campaign_parser.add_argument("--judge-max-tokens", type=int)
+    campaign_parser.add_argument("--retries", type=int, help="retry transient live provider failures this many times")
+    campaign_parser.add_argument("--retry-backoff", type=float, help="initial retry backoff seconds for live provider failures")
     campaign_parser.set_defaults(func=run_campaign)
 
     campaign_list_parser = sub.add_parser("campaign-list", help="list campaigns")

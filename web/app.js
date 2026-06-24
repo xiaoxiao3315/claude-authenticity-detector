@@ -291,9 +291,10 @@ function renderCampaignDetail(summary, runs, artifacts) {
       ${metricTile("网关成功率", fmtPercent(metrics.transport_success_rate))}
       ${metricTile("平均质量", fmtNumber(metrics.average_quality_score, 2), `中位 ${fmtNumber(metrics.median_quality_score, 2)}`)}
       ${metricTile("P50 / P95", `${fmtMs(metrics.p50_latency_ms)} / ${fmtMs(metrics.p95_latency_ms)}`)}
+      ${metricTile("重试/替换", `${metrics.retried_request_count ?? 0} / ${metrics.total_retry_count ?? 0}`, `替换轮次 ${metrics.replaced_run_count ?? 0}`)}
     </div>
     <div class="decision-strip">
-      <span class="${decisionClass(decisions.model_confidence_decision)}">模型可信度：${escapeHtml(decisionText(decisions.model_confidence_decision))}</span>
+      <span class="${decisionClass(decisions.model_confidence_decision)}">模型身份/质量迹象：${escapeHtml(decisionText(decisions.model_confidence_decision))}</span>
       <span class="${decisionClass(decisions.gateway_reliability_decision)}">网关稳定性：${escapeHtml(decisionText(decisions.gateway_reliability_decision))}</span>
       <span class="${decisionClass(decisions.overall_decision)}">综合结论：${escapeHtml(decisionText(decisions.overall_decision))}</span>
     </div>

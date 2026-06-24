@@ -15,7 +15,7 @@ SUMMARY_SCHEMA_VERSION = "campaign_summary_v1"
 
 
 def read_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -251,6 +251,7 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path) -> dict[str, Any
     campaign = load_campaign(campaign_dir_path)
     run_index = load_run_index(campaign_dir_path)
     run_refs = run_index.get("runs") if isinstance(run_index.get("runs"), list) else []
+    active_refs = [run_ref for run_ref in run_refs if run_ref.get("status") != "replaced"]
     tested_identity = campaign.get("tested_model") if isinstance(campaign.get("tested_model"), dict) else {}
     tested_provider_id = str(tested_identity.get("provider_id") or "")
     expected_protocol = str(tested_identity.get("protocol") or "")
@@ -269,9 +270,11 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path) -> dict[str, Any
     protocol_match_count = 0
     returned_seen_count = 0
     returned_match_count = 0
+    retried_request_count = 0
+    total_retry_count = 0
     latest_tested_at = ""
 
-    for index, run_ref in enumerate(run_refs, start=1):
+    for index, run_ref in enumerate(active_refs, start=1):
         run_id = str(run_ref.get("run_id") or "")
         run_dir = runs_dir / run_id
         state = read_json(run_dir / "state.json") if (run_dir / "state.json").exists() else {}
@@ -318,6 +321,10 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path) -> dict[str, Any
                 errors[error_type(telemetry.get("error"))] += 1
             if judge_score.get("error"):
                 errors["judge_error"] += 1
+            retry_count = numeric(telemetry.get("retry_count")) or 0
+            if retry_count > 0:
+                retried_request_count += 1
+                total_retry_count += int(retry_count)
 
             samples.append(
                 {
@@ -377,7 +384,9 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path) -> dict[str, Any
     total_cases = len(all_records)
     completed_runs = sum(1 for run in child_runs if run.get("status") == "completed")
     metrics = {
-        "total_runs": len(run_refs),
+        "total_runs": len(active_refs),
+        "run_history_count": len(run_refs),
+        "replaced_run_count": len(run_refs) - len(active_refs),
         "completed_runs": completed_runs,
         "total_cases": total_cases,
         "successful_model_responses": model_response_count,
@@ -395,6 +404,8 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path) -> dict[str, Any
         "model_returned_seen_count": returned_seen_count,
         "model_returned_match_count": returned_match_count,
         "model_returned_missing_count": total_cases - returned_seen_count,
+        "retried_request_count": retried_request_count,
+        "total_retry_count": total_retry_count,
         "p50_latency_ms": percentile(latencies, 0.50),
         "p95_latency_ms": percentile(latencies, 0.95),
         "latest_tested_at": latest_tested_at or None,
@@ -409,7 +420,7 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path) -> dict[str, Any
     elif campaign_status in {"failed", "partial"}:
         status = campaign_status
     else:
-        status = "completed" if completed_runs == len(run_refs) and run_refs else "partial"
+        status = "completed" if completed_runs == len(active_refs) and active_refs else "partial"
     summary = {
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "campaign_id": campaign.get("campaign_id") or campaign_dir_path.name,
@@ -597,6 +608,8 @@ def export_campaign(campaign_dir_path: Path, runs_dir: Path) -> Path:
             if path.exists():
                 zf.write(path, arcname=name)
         for run_ref in run_index.get("runs") or []:
+            if run_ref.get("status") == "replaced":
+                continue
             run_id = str(run_ref.get("run_id") or "")
             run_dir = runs_dir / run_id
             if not run_dir.exists():

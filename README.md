@@ -56,6 +56,8 @@ run as a model-level conclusion.
 
 ```powershell
 python .\eval_cli.py campaign --job smoke_10 --repeat 3
+python .\eval_cli.py campaign --job smoke_10 --repeat 3 --retries 2 --retry-backoff 2
+python .\eval_cli.py campaign --job smoke_10 --campaign-id CMP-... --resume
 python .\eval_cli.py campaign-list
 python .\eval_cli.py campaign-status --campaign-id CMP-...
 python .\eval_cli.py campaign-inspect --campaign-id CMP-...
@@ -77,10 +79,16 @@ summary.json    aggregate metrics, separated decisions, trend and evidence data
 artifacts/      campaign acceptance pack after campaign-export
 ```
 
-The model confidence decision and gateway reliability decision are separate.
-Transport failures lower gateway reliability, but are not treated as proof of
-poor model identity. API keys are never written; campaign metadata stores only
-redacted config and a SHA-256 key fingerprint prefix.
+The model identity/quality evidence decision and gateway reliability decision
+are separate. Transport failures lower gateway reliability, but are not treated
+as proof of poor model identity or proof that a provider is not using the
+claimed upstream model. API keys are never written; campaign metadata stores
+only redacted config and a SHA-256 key fingerprint prefix.
+
+Live provider calls retry transient transport failures by default (`2` retries
+unless overridden by job config or CLI). Resume does not overwrite old child
+runs: incomplete rounds are rerun with a new attempt id and the previous run is
+marked `replaced`.
 
 Campaign API routes:
 
@@ -108,19 +116,25 @@ python -m pip install -r requirements.txt
 
 ## Config
 
-Create a local provider file from the template:
+For the v0.2.x CLI/dashboard flow, create the two-model provider file from the
+template:
 
 ```powershell
-Copy-Item .\providers.example.json .\providers.local.json
 Copy-Item .\configs\providers.example.json .\configs\providers.local.json
 ```
 
-Edit `providers.local.json` with your provider id, Base URL, model, auth type, and auth environment variable. Do not commit `providers.local.json`.
+Edit `configs/providers.local.json` with your tested model, judge model, Base
+URL, model names, protocol, auth type, and auth environment variable names. Do
+not commit `configs/providers.local.json`.
+
+The root-level `providers.example.json` is retained for the older `run_eval.py`
+flow only.
 
 Set secrets in the shell or create `local_secrets.env`:
 
 ```env
-ANTHROPIC_API_KEY=your_key_here
+TESTED_MODEL_API_KEY=your_tested_model_key_here
+JUDGE_MODEL_API_KEY=your_judge_model_key_here
 ```
 
 Do not commit `local_secrets.env`.
@@ -149,6 +163,20 @@ python .\validate_run_records.py --jsonl .\runs\<run_id>\run_records.jsonl
 ```
 
 ## Local Self-Checks
+
+Preferred full local gate:
+
+```powershell
+.\scripts\check_all.ps1
+```
+
+Fresh package smoke only:
+
+```powershell
+.\scripts\package_smoke.ps1
+```
+
+Lower-level checks:
 
 ```powershell
 python -m py_compile run_eval.py run_records.py benchmarking.py local_env.py compatibility.py trace_evaluation.py rescore.py quality_gate.py audit_export.py evidence_registry.py archive_registry.py job_runtime.py validate_run_records.py
