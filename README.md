@@ -22,10 +22,21 @@ Live provider calls are off by default. Use `--live` only when local keys are co
 python .\eval_cli.py run --job smoke_10 --live
 ```
 
+Dry-runs do not load `local_secrets.env`; local secrets are loaded only for
+live provider calls, config-status display, or explicit probe/config-write
+flows.
+
 To open the local dashboard/API:
 
 ```powershell
 python .\api_server.py --host 127.0.0.1 --port 18081
+```
+
+The dashboard/API is read-only by default. To allow the web form to write
+`configs/providers.local.json` and `local_secrets.env`, start it explicitly:
+
+```powershell
+python .\api_server.py --host 127.0.0.1 --port 18081 --enable-config-write
 ```
 
 To identify the correct gateway model/protocol/auth combination, use `probe`.
@@ -76,6 +87,14 @@ python .\eval_cli.py campaign --job smoke_10 --repeat 3 --live
 python .\eval_cli.py campaign --job smoke_100 --repeat 1 --live
 ```
 
+For CI-style gates, add `--require-go`. The command still writes the run or
+campaign evidence, but exits `2` when the final decision is not `GO`:
+
+```powershell
+python .\eval_cli.py run --job smoke_10 --require-go
+python .\eval_cli.py campaign --job smoke_10 --repeat 3 --require-go
+```
+
 For control campaigns, keep the same local provider keys and override only the
 tested model identity at the CLI layer:
 
@@ -123,6 +142,16 @@ GET /api/campaigns/<campaign_id>/artifacts/acceptance_pack.zip
 `/api/leaderboard` defaults to completed live campaigns only. It excludes
 dry-run campaigns unless `include_dry_run=true` is passed, and only ranks
 campaigns within one compatible comparison group.
+
+Acceptance packs are safe-by-default. `export` and `campaign-export` include
+summary evidence, quality gates, `acceptance_manifest.json`, and
+`checksums.sha256`; raw model responses, judge responses, and per-request event
+logs are excluded unless `--include-raw` is passed:
+
+```powershell
+python .\eval_cli.py export --latest --include-raw
+python .\eval_cli.py campaign-export --campaign-id CMP-... --include-raw
+```
 
 ## Install
 

@@ -31,8 +31,12 @@ $tracked = & git -C $RepoRoot ls-files
 if ($LASTEXITCODE -ne 0) {
     throw "git ls-files failed"
 }
+$untracked = & git -C $RepoRoot ls-files --others --exclude-standard
+if ($LASTEXITCODE -ne 0) {
+    throw "git ls-files --others failed"
+}
 
-foreach ($file in $tracked) {
+foreach ($file in @($tracked + $untracked)) {
     $src = Join-Path $RepoRoot $file
     $dest = Join-Path $PackageRoot $file
     New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
@@ -64,7 +68,7 @@ try {
     }
 
     Write-Host "[package] syntax checks"
-    python -m py_compile eval_cli.py campaigns.py api_server.py run_records.py benchmarking.py quality_gate.py
+    python -m py_compile eval_cli.py campaigns.py api_server.py run_records.py benchmarking.py quality_gate.py redaction.py
     $node = Get-Command node -ErrorAction SilentlyContinue
     if ($node) {
         node --check web\app.js
@@ -75,6 +79,54 @@ try {
     Write-Host "[package] dry-run campaign $CampaignId"
     python .\eval_cli.py campaign --job smoke_10 --repeat 1 --campaign-id $CampaignId
     python .\eval_cli.py campaign-status --campaign-id $CampaignId
+    python .\eval_cli.py campaign-export --campaign-id $CampaignId
+
+    Write-Host "[package] acceptance pack contents"
+    $packPath = Join-Path $PackageRoot "campaigns\$CampaignId\artifacts\acceptance_pack.zip"
+    if (-not (Test-Path $packPath)) {
+        throw "acceptance pack missing: $packPath"
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($packPath)
+    try {
+        $entryNames = @($zip.Entries | ForEach-Object { $_.FullName })
+    } finally {
+        $zip.Dispose()
+    }
+    foreach ($required in @(
+        "campaign.json",
+        "summary.json",
+        "run_ids.json",
+        "acceptance_manifest.json",
+        "checksums.sha256",
+        "runs/$CampaignId-R01/run_records.jsonl",
+        "runs/$CampaignId-R01/quality_gates/"
+    )) {
+        $found = $false
+        foreach ($name in $entryNames) {
+            if ($name -eq $required -or $name.StartsWith($required)) {
+                $found = $true
+                break
+            }
+        }
+        if (-not $found) {
+            throw "acceptance pack missing required entry prefix: $required"
+        }
+    }
+    foreach ($forbiddenPrefix in @(
+        "runs/$CampaignId-R01/responses/",
+        "runs/$CampaignId-R01/judge_responses/",
+        "runs/$CampaignId-R01/events/",
+        "local_secrets.env",
+        ".env",
+        "configs/providers.local.json"
+    )) {
+        foreach ($name in $entryNames) {
+            if ($name -eq $forbiddenPrefix -or $name.StartsWith($forbiddenPrefix)) {
+                throw "acceptance pack contains forbidden entry prefix: $forbiddenPrefix"
+            }
+        }
+    }
 
     Write-Host "[package] api smoke on port $Port"
     $server = Start-Process -FilePath python -ArgumentList ".\api_server.py", "--host", "127.0.0.1", "--port", "$Port" -WorkingDirectory $PackageRoot -WindowStyle Hidden -PassThru

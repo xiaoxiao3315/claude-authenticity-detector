@@ -81,19 +81,28 @@ function renderJobs(jobs) {
   for (const job of jobs) {
     const button = document.createElement("button");
     button.className = "job-item";
-    button.innerHTML = `<strong>${job.job_id}</strong><span>${escapeHtml(statusText(job.status))} / ${escapeHtml(decisionText(job.final_decision || "pending"))}</span>`;
+    button.innerHTML = `<strong>${escapeHtml(job.job_id)}</strong><span>${escapeHtml(statusText(job.status))} / ${escapeHtml(decisionText(job.final_decision || "pending"))}</span>`;
     button.addEventListener("click", () => loadJob(job.job_id));
     list.appendChild(button);
   }
 }
 
 async function refreshJobs() {
-  const [jobsData, leaderboardData] = await Promise.all([
+  const [jobsResult, leaderboardResult] = await Promise.allSettled([
     api("/api/jobs"),
     api("/api/leaderboard?limit=20"),
   ]);
-  renderJobs(jobsData.jobs || []);
-  renderLeaderboard(leaderboardData);
+  if (jobsResult.status === "fulfilled") {
+    renderJobs(jobsResult.value.jobs || []);
+  } else {
+    $("jobList").innerHTML = `<div class="muted">${escapeHtml(jobsResult.reason.message || "任务列表加载失败")}</div>`;
+  }
+  if (leaderboardResult.status === "fulfilled") {
+    renderLeaderboard(leaderboardResult.value);
+  } else {
+    $("leaderboardStatus").textContent = leaderboardResult.reason.message || "排行加载失败";
+    $("leaderboardBody").innerHTML = '<tr><td colspan="15" class="empty-table">排行加载失败，可刷新重试</td></tr>';
+  }
 }
 
 async function openLatest() {
@@ -105,17 +114,22 @@ async function openLatest() {
 
 async function loadJob(jobId) {
   state.currentJobId = jobId;
-  const [jobState, summary, results, events, artifacts] = await Promise.all([
-    api(`/api/jobs/${encodeURIComponent(jobId)}/state`),
+  const jobState = await api(`/api/jobs/${encodeURIComponent(jobId)}/state`);
+  const [summaryResult, resultsResult, eventsResult, artifactsResult] = await Promise.allSettled([
     api(`/api/jobs/${encodeURIComponent(jobId)}/summary`),
     api(`/api/jobs/${encodeURIComponent(jobId)}/results`),
     api(`/api/jobs/${encodeURIComponent(jobId)}/events`),
     api(`/api/jobs/${encodeURIComponent(jobId)}/artifacts`),
   ]);
+  const artifacts = artifactsResult.status === "fulfilled" ? artifactsResult.value : { artifacts: [] };
   renderState(jobState, artifacts.artifacts || []);
-  renderSummary(summary);
-  renderResults(results || []);
-  renderEvents(events.events || []);
+  if (summaryResult.status === "fulfilled") renderSummary(summaryResult.value);
+  if (resultsResult.status === "fulfilled") renderResults(resultsResult.value || []);
+  if (eventsResult.status === "fulfilled") {
+    renderEvents(eventsResult.value.events || []);
+  } else {
+    $("eventLog").textContent = eventsResult.reason.message || "事件日志加载失败";
+  }
 }
 
 function renderState(jobState, artifacts) {
@@ -404,33 +418,37 @@ async function loadConfig() {
 async function saveConfig(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  await api("/api/config", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      providers: {
-        tested_model: {
-          provider_id: "tested_model",
-          base_url: form.tested_base_url.value,
-          model: form.tested_model.value,
-          protocol: form.tested_protocol.value,
-          auth_type: form.tested_auth_type.value,
-          api_key: form.tested_api_key.value,
+  try {
+    await api("/api/config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        providers: {
+          tested_model: {
+            provider_id: "tested_model",
+            base_url: form.tested_base_url.value,
+            model: form.tested_model.value,
+            protocol: form.tested_protocol.value,
+            auth_type: form.tested_auth_type.value,
+            api_key: form.tested_api_key.value,
+          },
+          judge_model: {
+            provider_id: "judge_model",
+            base_url: form.judge_base_url.value,
+            model: form.judge_model.value,
+            protocol: form.judge_protocol.value,
+            auth_type: form.judge_auth_type.value,
+            api_key: form.judge_api_key.value,
+          },
         },
-        judge_model: {
-          provider_id: "judge_model",
-          base_url: form.judge_base_url.value,
-          model: form.judge_model.value,
-          protocol: form.judge_protocol.value,
-          auth_type: form.judge_auth_type.value,
-          api_key: form.judge_api_key.value,
-        },
-      },
-    }),
-  });
-  form.tested_api_key.value = "";
-  form.judge_api_key.value = "";
-  await loadConfig();
+      }),
+    });
+    form.tested_api_key.value = "";
+    form.judge_api_key.value = "";
+    await loadConfig();
+  } catch (error) {
+    $("configStatus").textContent = error.message || "保存失败";
+  }
 }
 
 $("refreshJobs").addEventListener("click", refreshJobs);

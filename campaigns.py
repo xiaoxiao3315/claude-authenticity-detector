@@ -6,8 +6,11 @@ import statistics
 import zipfile
 from collections import Counter
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
+
+from redaction import redact_text
 
 
 DECISION_ORDER = {"GO": 0, "REVIEW": 1, "NO-GO": 2}
@@ -129,7 +132,7 @@ def score_value(record: dict[str, Any]) -> float | None:
 def judge_reason(record: dict[str, Any]) -> str:
     scoring = record.get("scoring") if isinstance(record.get("scoring"), dict) else {}
     final_score = scoring.get("final_score") if isinstance(scoring.get("final_score"), dict) else {}
-    return str(final_score.get("details") or "")
+    return redact_text(final_score.get("details") or "", max_chars=500) or ""
 
 
 def error_type(error: Any) -> str:
@@ -247,7 +250,7 @@ def compatibility_key_string(key: dict[str, Any]) -> str:
     return "|".join(f"{name}={key.get(name)}" for name in sorted(key))
 
 
-def summarize_campaign(campaign_dir_path: Path, runs_dir: Path) -> dict[str, Any]:
+def summarize_campaign(campaign_dir_path: Path, runs_dir: Path, *, persist: bool = True) -> dict[str, Any]:
     campaign = load_campaign(campaign_dir_path)
     run_index = load_run_index(campaign_dir_path)
     run_refs = run_index.get("runs") if isinstance(run_index.get("runs"), list) else []
@@ -335,7 +338,7 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path) -> dict[str, Any
                     "ok": ok,
                     "score": score,
                     "latency_ms": latency,
-                    "error": telemetry.get("error"),
+                    "error": redact_text(telemetry.get("error"), max_chars=500),
                     "error_type": error_type(telemetry.get("error")) if telemetry.get("error") else None,
                     "model_requested": provider.get("model_requested"),
                     "model_returned": provider.get("model_returned"),
@@ -450,7 +453,8 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path) -> dict[str, Any
         "latency_values_ms": latencies,
         "failure_counts": metrics["error_counts"],
     }
-    write_json(campaign_dir_path / "summary.json", summary)
+    if persist:
+        write_json(campaign_dir_path / "summary.json", summary)
     return summary
 
 
@@ -493,12 +497,18 @@ def summary_to_leaderboard_entry(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def list_campaign_summaries(campaigns_dir: Path, runs_dir: Path | None = None, *, refresh_missing: bool = False) -> list[dict[str, Any]]:
+def list_campaign_summaries(
+    campaigns_dir: Path,
+    runs_dir: Path | None = None,
+    *,
+    refresh_missing: bool = False,
+    persist_refresh: bool = True,
+) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for path in list_campaign_dirs(campaigns_dir):
         summary = load_summary(path)
         if summary is None and refresh_missing and runs_dir is not None:
-            summary = summarize_campaign(path, runs_dir)
+            summary = summarize_campaign(path, runs_dir, persist=persist_refresh)
         if summary is not None:
             summaries.append(summary)
     return summaries
@@ -517,8 +527,12 @@ def campaign_leaderboard(
     date_to: str = "",
     min_samples: int = 1,
     limit: int = 50,
+    persist_refresh: bool = True,
 ) -> dict[str, Any]:
-    entries = [summary_to_leaderboard_entry(summary) for summary in list_campaign_summaries(campaigns_dir, runs_dir, refresh_missing=True)]
+    entries = [
+        summary_to_leaderboard_entry(summary)
+        for summary in list_campaign_summaries(campaigns_dir, runs_dir, refresh_missing=True, persist_refresh=persist_refresh)
+    ]
     filtered: list[dict[str, Any]] = []
     for entry in entries:
         if entry.get("status") != "completed":
@@ -575,16 +589,28 @@ def campaign_leaderboard(
     }
 
 
-def campaign_list_payload(campaigns_dir: Path, runs_dir: Path) -> dict[str, Any]:
+def campaign_list_payload(campaigns_dir: Path, runs_dir: Path, *, persist_refresh: bool = True) -> dict[str, Any]:
     campaigns = []
-    for summary in list_campaign_summaries(campaigns_dir, runs_dir, refresh_missing=True):
+    for summary in list_campaign_summaries(campaigns_dir, runs_dir, refresh_missing=True, persist_refresh=persist_refresh):
         entry = summary_to_leaderboard_entry(summary)
         campaigns.append(entry)
     campaigns.sort(key=lambda item: str(item.get("latest_tested_at") or ""), reverse=True)
     return {"campaigns": campaigns}
 
 
-def export_campaign(campaign_dir_path: Path, runs_dir: Path) -> Path:
+def _zip_add_file(zf: zipfile.ZipFile, path: Path, arcname: str, checksums: dict[str, str]) -> None:
+    data = path.read_bytes()
+    zf.writestr(arcname, data)
+    checksums[arcname] = sha256(data).hexdigest()
+
+
+def _zip_add_json(zf: zipfile.ZipFile, arcname: str, value: Any, checksums: dict[str, str]) -> None:
+    data = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+    zf.writestr(arcname, data)
+    checksums[arcname] = sha256(data).hexdigest()
+
+
+def export_campaign(campaign_dir_path: Path, runs_dir: Path, *, include_raw: bool = False) -> Path:
     campaign = load_campaign(campaign_dir_path)
     run_index = load_run_index(campaign_dir_path)
     artifacts_dir = campaign_dir_path / "artifacts"
@@ -593,7 +619,6 @@ def export_campaign(campaign_dir_path: Path, runs_dir: Path) -> Path:
     include_campaign_files = ["campaign.json", "summary.json", "run_ids.json"]
     include_run_files = [
         "state.json",
-        "events.jsonl",
         "run_records.jsonl",
         "results.json",
         "summary.csv",
@@ -602,29 +627,56 @@ def export_campaign(campaign_dir_path: Path, runs_dir: Path) -> Path:
         "job_config.snapshot.json",
         "providers.redacted.json",
     ]
+    if include_raw:
+        include_run_files.append("events.jsonl")
+    checksums: dict[str, str] = {}
+    included_runs: list[str] = []
+    excluded_replaced_runs: list[str] = []
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for name in include_campaign_files:
             path = campaign_dir_path / name
             if path.exists():
-                zf.write(path, arcname=name)
+                _zip_add_file(zf, path, name, checksums)
         for run_ref in run_index.get("runs") or []:
             if run_ref.get("status") == "replaced":
+                if run_ref.get("run_id"):
+                    excluded_replaced_runs.append(str(run_ref.get("run_id")))
                 continue
             run_id = str(run_ref.get("run_id") or "")
             run_dir = runs_dir / run_id
             if not run_dir.exists():
                 continue
+            included_runs.append(run_id)
             for name in include_run_files:
                 path = run_dir / name
                 if path.exists():
-                    zf.write(path, arcname=f"runs/{run_id}/{name}")
-            for folder in ("quality_gates",):
+                    _zip_add_file(zf, path, f"runs/{run_id}/{name}", checksums)
+            folders = ["quality_gates"]
+            if include_raw:
+                folders.extend(["events", "responses", "judge_responses"])
+            for folder in folders:
                 root = run_dir / folder
                 if not root.exists():
                     continue
                 for path in root.rglob("*"):
                     if path.is_file():
-                        zf.write(path, arcname=f"runs/{run_id}/{path.relative_to(run_dir)}")
+                        rel_name = path.relative_to(run_dir).as_posix()
+                        _zip_add_file(zf, path, f"runs/{run_id}/{rel_name}", checksums)
+        manifest = {
+            "schema_version": "acceptance_pack_manifest_v1",
+            "pack_type": "campaign",
+            "campaign_id": campaign.get("campaign_id") or campaign_dir_path.name,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "include_raw": include_raw,
+            "included_runs": included_runs,
+            "excluded_replaced_runs": excluded_replaced_runs,
+            "entry_count_without_manifest": len(checksums),
+            "raw_entry_policy": "included by explicit request" if include_raw else "excluded by default",
+        }
+        _zip_add_json(zf, "acceptance_manifest.json", manifest, checksums)
+        checksum_lines = [f"{digest}  {name}" for name, digest in sorted(checksums.items())]
+        checksum_data = ("\n".join(checksum_lines) + "\n").encode("utf-8")
+        zf.writestr("checksums.sha256", checksum_data)
     campaign.setdefault("artifacts", {})["acceptance_pack"] = str(zip_path)
     write_json(campaign_dir_path / "campaign.json", campaign)
     return zip_path

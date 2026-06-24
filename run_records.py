@@ -3,13 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, is_dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from redaction import redact_text
+
 
 RUN_RECORD_SCHEMA_VERSION = "run_record_v1"
 ALLOWED_RUN_STATUSES = {"completed", "failed", "stopped", "partial"}
+SCHEMA_PATH = Path(__file__).with_name("run_record.schema.json")
 
 
 def as_plain_dict(value: Any) -> dict[str, Any]:
@@ -193,7 +197,7 @@ def build_run_record(
         },
         "telemetry": {
             "ok": metrics_data.get("ok"),
-            "error": metrics_data.get("error"),
+            "error": redact_text(metrics_data.get("error"), max_chars=500),
             "first_event_ms": metrics_data.get("first_event_ms"),
             "first_content_token_ms": metrics_data.get("first_content_token_ms"),
             "total_ms": metrics_data.get("total_ms"),
@@ -233,8 +237,73 @@ def append_run_record_jsonl(path: Path, record: dict[str, Any]) -> None:
         f.write("\n")
 
 
-def validate_run_record(record: dict[str, Any]) -> list[str]:
+@lru_cache(maxsize=1)
+def load_run_record_schema() -> dict[str, Any]:
+    with SCHEMA_PATH.open("r", encoding="utf-8") as f:
+        schema = json.load(f)
+    if not isinstance(schema, dict):
+        raise ValueError(f"{SCHEMA_PATH} must contain a JSON object")
+    return schema
+
+
+def _type_matches(value: Any, expected: str) -> bool:
+    if expected == "null":
+        return value is None
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return (isinstance(value, int) or isinstance(value, float)) and not isinstance(value, bool)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    return True
+
+
+def _schema_type_matches(value: Any, expected: Any) -> bool:
+    if isinstance(expected, list):
+        return any(_type_matches(value, item) for item in expected)
+    if isinstance(expected, str):
+        return _type_matches(value, expected)
+    return True
+
+
+def _validate_schema_subset(value: Any, schema: dict[str, Any], path: str) -> list[str]:
     errors: list[str] = []
+    if "const" in schema and value != schema["const"]:
+        errors.append(f"{path} must equal {schema['const']!r}")
+    if "enum" in schema and value not in schema["enum"]:
+        allowed = ", ".join(str(item) for item in schema["enum"])
+        errors.append(f"{path} must be one of: {allowed}")
+    if "type" in schema and not _schema_type_matches(value, schema["type"]):
+        errors.append(f"{path} must match type {schema['type']}")
+        return errors
+    if isinstance(value, str) and "minLength" in schema and len(value) < int(schema["minLength"]):
+        errors.append(f"{path} must have length >= {schema['minLength']}")
+    if isinstance(value, dict):
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        for key in required:
+            if key not in value:
+                errors.append(f"missing {path}.{key}" if path != "$" else f"missing top-level key: {key}")
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        for key, child_schema in properties.items():
+            if key in value and isinstance(child_schema, dict):
+                child_path = f"{path}.{key}" if path != "$" else key
+                errors.extend(_validate_schema_subset(value[key], child_schema, child_path))
+    if isinstance(value, list):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                errors.extend(_validate_schema_subset(item, item_schema, f"{path}[{index}]"))
+    return errors
+
+
+def validate_run_record(record: dict[str, Any]) -> list[str]:
+    errors: list[str] = _validate_schema_subset(record, load_run_record_schema(), "$")
     required_top = [
         "schema_version",
         "record_id",

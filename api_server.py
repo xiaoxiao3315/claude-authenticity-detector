@@ -17,6 +17,7 @@ from campaigns import (
     summarize_campaign,
 )
 from local_env import load_local_env
+from redaction import redact_text, redact_value
 
 
 ROOT = Path(__file__).resolve().parent
@@ -357,7 +358,7 @@ def summarize_run(run_dir: Path) -> dict:
                 "dimension": task.get("enterprise_dimension"),
                 "ok": ok,
                 "score": score,
-                "error": telemetry.get("error"),
+                "error": redact_text(telemetry.get("error"), max_chars=500),
                 "latency_ms": latency_value,
                 "model_returned": provider.get("model_returned"),
             }
@@ -472,7 +473,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "EvalAutomationAPI/0.2.2"
 
     def send_json(self, value, status: int = 200) -> None:
-        body = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+        body = json.dumps(redact_value(value), ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json; charset=utf-8")
         self.send_header("content-length", str(len(body)))
@@ -516,12 +517,13 @@ class Handler(BaseHTTPRequestHandler):
                         date_to=(qs.get("date_to") or [""])[0],
                         min_samples=min_samples,
                         limit=limit,
+                        persist_refresh=False,
                     )
                 )
             elif path == "/api/campaigns":
-                self.send_json(campaign_list_payload(CAMPAIGNS_DIR, RUNS_DIR))
+                self.send_json(campaign_list_payload(CAMPAIGNS_DIR, RUNS_DIR, persist_refresh=False))
             elif path == "/api/campaigns/latest":
-                campaigns = campaign_list_payload(CAMPAIGNS_DIR, RUNS_DIR).get("campaigns") or []
+                campaigns = campaign_list_payload(CAMPAIGNS_DIR, RUNS_DIR, persist_refresh=False).get("campaigns") or []
                 self.send_json(campaigns[0] if campaigns else {})
             elif path.startswith("/api/campaigns/"):
                 self.handle_campaign_get(path)
@@ -538,13 +540,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
         except ValueError as exc:
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
-        except Exception as exc:
-            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+        except Exception:
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error")
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path != "/api/config":
             self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+            return
+        if not getattr(self.server, "config_write_enabled", False):
+            self.send_error_json(HTTPStatus.FORBIDDEN, "config writes are disabled; restart with --enable-config-write to allow this endpoint")
             return
         length = int(self.headers.get("content-length") or 0)
         raw = self.rfile.read(length)
@@ -566,7 +571,7 @@ class Handler(BaseHTTPRequestHandler):
         tail = parts[3:] if len(parts) > 3 else ["summary"]
         endpoint = tail[0]
         if endpoint == "summary":
-            self.send_json(load_summary(camp_dir) or summarize_campaign(camp_dir, RUNS_DIR))
+            self.send_json(load_summary(camp_dir) or summarize_campaign(camp_dir, RUNS_DIR, persist=False))
         elif endpoint == "runs":
             self.send_json(load_run_index(camp_dir))
         elif endpoint == "artifacts":
@@ -666,8 +671,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Serve the eval dashboard and read-only run APIs")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18081)
+    parser.add_argument("--enable-config-write", action="store_true", help="enable POST /api/config writes to local provider and secret files")
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server.config_write_enabled = bool(args.enable_config_write)
     print(f"serving http://{args.host}:{args.port}")
     try:
         server.serve_forever()

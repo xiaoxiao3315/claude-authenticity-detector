@@ -45,6 +45,7 @@ from local_env import load_local_env
 from quality_gate import run_quality_gate
 from run_records import stable_json_hash, text_hash
 from validate_run_records import validate_records
+from redaction import redact_text
 
 
 ROOT = Path(__file__).resolve().parent
@@ -179,7 +180,6 @@ def load_model_config(raw: dict[str, Any], label: str) -> ModelConfig:
 
 
 def load_two_model_config(path: Path) -> dict[str, ModelConfig]:
-    load_local_env()
     data = read_json(path)
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a JSON object")
@@ -269,13 +269,13 @@ def key_fingerprint(env_name: str) -> str | None:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
-def campaign_model_identity(model: ModelConfig) -> dict[str, Any]:
+def campaign_model_identity(model: ModelConfig, *, include_key_fingerprint: bool = False) -> dict[str, Any]:
     return {
         "provider_id": model.provider_id,
         "base_url_host": base_url_host(model.base_url),
         "model": model.model,
         "api_key_env": model.api_key_env,
-        "key_fingerprint": key_fingerprint(model.api_key_env),
+        "key_fingerprint": key_fingerprint(model.api_key_env) if include_key_fingerprint else None,
         "protocol": model.protocol,
         "auth_type": model.auth_type,
         "provider_channel": model.provider_channel,
@@ -469,21 +469,21 @@ def call_model(
         response = client.post(url, headers=headers, json=payload)
     except Exception as exc:
         elapsed = round((time.perf_counter() - started) * 1000, 2)
-        metrics = CallMetrics(ok=False, error=f"{type(exc).__name__}: {exc}", total_ms=elapsed)
+        metrics = CallMetrics(ok=False, error=redact_text(f"{type(exc).__name__}: {exc}", max_chars=500), total_ms=elapsed)
         append_jsonl(events_file, {"at": now_iso(), "type": "request_failed", "error": metrics.error})
         return Completion(text="", metrics=metrics)
 
     elapsed = round((time.perf_counter() - started) * 1000, 2)
     if response.status_code != 200:
         body = response.text[:1000]
-        metrics = CallMetrics(ok=False, error=f"HTTP {response.status_code}: {body}", total_ms=elapsed)
+        metrics = CallMetrics(ok=False, error=redact_text(f"HTTP {response.status_code}: {body}", max_chars=500), total_ms=elapsed)
         append_jsonl(events_file, {"at": now_iso(), "type": "http_error", "status": response.status_code, "body_preview": body[:300]})
         return Completion(text="", metrics=metrics)
 
     try:
         data = response.json()
     except Exception as exc:
-        metrics = CallMetrics(ok=False, error=f"{type(exc).__name__}: response JSON parse failed", total_ms=elapsed)
+        metrics = CallMetrics(ok=False, error=redact_text(f"{type(exc).__name__}: response JSON parse failed", max_chars=500), total_ms=elapsed)
         append_jsonl(events_file, {"at": now_iso(), "type": "response_parse_failed", "error": metrics.error})
         return Completion(text="", metrics=metrics)
     text = ""
@@ -622,7 +622,7 @@ def call_model_with_retries(
                 "next_attempt": attempt + 1,
                 "max_attempts": total_attempts,
                 "sleep_seconds": round(sleep_seconds, 3),
-                "error": (result.metrics.error or "")[:500],
+                "error": redact_text(result.metrics.error, max_chars=500),
             },
         )
         if sleep_seconds:
@@ -714,7 +714,7 @@ def final_score_from_judge(
     rule_score: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     if not tested.metrics.ok:
-        return {"score": 0.0, "format_ok": False, "details": tested.metrics.error}, None
+        return {"score": 0.0, "format_ok": False, "details": redact_text(tested.metrics.error, max_chars=500)}, None
     if judge_payload is not None:
         score = normalize_score(judge_payload.get("score_0_10"))
         if score is not None:
@@ -728,9 +728,10 @@ def final_score_from_judge(
                 judge_payload,
             )
     if rule_score is not None:
-        return rule_score, {"error": judge_error or "judge unavailable; used rule score"}
+        return rule_score, {"error": redact_text(judge_error or "judge unavailable; used rule score", max_chars=500)}
     fallback = 0.0 if judge_error else 5.0
-    return {"score": fallback, "format_ok": None, "details": judge_error or "no judge score"}, {"error": judge_error or "no judge score"}
+    redacted_error = redact_text(judge_error or "no judge score", max_chars=500)
+    return {"score": fallback, "format_ok": None, "details": redacted_error}, {"error": redacted_error}
 
 
 def run_record(
@@ -808,7 +809,7 @@ def run_record(
         },
         "telemetry": {
             "ok": metrics.ok,
-            "error": metrics.error,
+            "error": redact_text(metrics.error, max_chars=500),
             "first_event_ms": metrics.first_event_ms,
             "first_content_token_ms": metrics.first_content_token_ms,
             "total_ms": metrics.total_ms,
@@ -858,10 +859,10 @@ def summary_row(record: dict[str, Any], response_file: Path) -> dict[str, Any]:
         "point_value": task.get("point_value"),
         "scoring_confidence": task.get("scoring_confidence"),
         "ok": telemetry.get("ok"),
-        "error": telemetry.get("error"),
+        "error": redact_text(telemetry.get("error"), max_chars=500),
         "quality_0_10": final_score.get("score"),
         "format_ok": final_score.get("format_ok"),
-        "judge_error": judge_score.get("error") if isinstance(judge_score, dict) else None,
+        "judge_error": redact_text(judge_score.get("error"), max_chars=500) if isinstance(judge_score, dict) else None,
         "judge_provider": scoring.get("judge_provider"),
         "judge_score_0_10": judge_score.get("score_0_10") if isinstance(judge_score, dict) else None,
         "judge_format_ok": judge_score.get("format_ok") if isinstance(judge_score, dict) else None,
@@ -913,6 +914,8 @@ def run_job(args: argparse.Namespace) -> int:
     live = bool(args.live)
     if not live and bool(job.get("live_provider")):
         live = True
+    if live:
+        load_local_env()
     run_id = args.run_id or utcish_job_id(str(job.get("job_id_prefix") or "JOB"))
     runs_dir = resolve_path(args.runs_dir or job.get("runs_dir") or "runs")
     run_dir = runs_dir / run_id
@@ -1098,6 +1101,8 @@ def run_job(args: argparse.Namespace) -> int:
     write_state(run_dir, state)
     append_jsonl(run_dir / "events.jsonl", {"at": now_iso(), "type": "job_completed", "job_id": run_id, "decision": decision})
     print(json.dumps({"job_id": run_id, "status": state["status"], "decision": decision, "run_dir": str(run_dir)}, ensure_ascii=False, indent=2))
+    if bool(getattr(args, "require_go", False)) and decision != "GO":
+        return 2
     return 0
 
 
@@ -1120,12 +1125,12 @@ def inspect_job(args: argparse.Namespace) -> int:
 def export_job(args: argparse.Namespace) -> int:
     runs_dir = resolve_path(args.runs_dir or "runs")
     run_dir = latest_run_dir(runs_dir) if args.latest else runs_dir / str(args.job_id)
+    include_raw = bool(getattr(args, "include_raw", False))
     artifacts_dir = run_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     zip_path = artifacts_dir / "acceptance_pack.zip"
     include_names = [
         "state.json",
-        "events.jsonl",
         "run_records.jsonl",
         "results.json",
         "summary.csv",
@@ -1134,18 +1139,43 @@ def export_job(args: argparse.Namespace) -> int:
         "job_config.snapshot.json",
         "providers.redacted.json",
     ]
+    if include_raw:
+        include_names.append("events.jsonl")
+    checksums: dict[str, str] = {}
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for name in include_names:
             path = run_dir / name
             if path.exists():
-                zf.write(path, arcname=name)
-        for folder in ("responses", "judge_responses", "quality_gates"):
+                data = path.read_bytes()
+                zf.writestr(name, data)
+                checksums[name] = hashlib.sha256(data).hexdigest()
+        folders = ["quality_gates"]
+        if include_raw:
+            folders.extend(["events", "responses", "judge_responses"])
+        for folder in folders:
             root = run_dir / folder
             if not root.exists():
                 continue
             for path in root.rglob("*"):
                 if path.is_file():
-                    zf.write(path, arcname=str(path.relative_to(run_dir)))
+                    arcname = path.relative_to(run_dir).as_posix()
+                    data = path.read_bytes()
+                    zf.writestr(arcname, data)
+                    checksums[arcname] = hashlib.sha256(data).hexdigest()
+        manifest = {
+            "schema_version": "acceptance_pack_manifest_v1",
+            "pack_type": "run",
+            "job_id": run_dir.name,
+            "generated_at": now_iso(),
+            "include_raw": include_raw,
+            "entry_count_without_manifest": len(checksums),
+            "raw_entry_policy": "included by explicit request" if include_raw else "excluded by default",
+        }
+        manifest_data = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        zf.writestr("acceptance_manifest.json", manifest_data)
+        checksums["acceptance_manifest.json"] = hashlib.sha256(manifest_data).hexdigest()
+        checksum_lines = [f"{digest}  {name}" for name, digest in sorted(checksums.items())]
+        zf.writestr("checksums.sha256", ("\n".join(checksum_lines) + "\n").encode("utf-8"))
     state = read_json(run_dir / "state.json")
     state.setdefault("artifacts", {})["acceptance_pack"] = str(zip_path)
     write_state(run_dir, state)
@@ -1228,8 +1258,10 @@ def run_campaign(args: argparse.Namespace) -> int:
         if not live and bool(job.get("live_provider")):
             live = True
         repeat = int(args.repeat)
-    tested_identity = campaign_model_identity(models["tested_model"])
-    judge_identity = campaign_model_identity(models["judge_model"])
+    if live:
+        load_local_env()
+    tested_identity = campaign_model_identity(models["tested_model"], include_key_fingerprint=live)
+    judge_identity = campaign_model_identity(models["judge_model"], include_key_fingerprint=live)
     config_hash = stable_json_hash(
         {
             "job": {**job, "job_path": str(job_path)},
@@ -1315,6 +1347,7 @@ def run_campaign(args: argparse.Namespace) -> int:
             judge_max_tokens=args.judge_max_tokens,
             retries=getattr(args, "retries", None),
             retry_backoff=getattr(args, "retry_backoff", None),
+            require_go=False,
             **model_override_kwargs(args),
         )
         try:
@@ -1327,7 +1360,7 @@ def run_campaign(args: argparse.Namespace) -> int:
         except Exception as exc:
             run_ref["status"] = "failed"
             run_ref["completed_at"] = now_iso()
-            run_ref["error"] = str(exc)
+            run_ref["error"] = redact_text(exc, max_chars=500)
             exit_code = 1
         write_campaign_json(out_dir / "run_ids.json", run_index)
         summarize_campaign(out_dir, runs_dir)
@@ -1360,6 +1393,8 @@ def run_campaign(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
+    if bool(getattr(args, "require_go", False)) and summary["decisions"]["overall_decision"] != "GO":
+        return exit_code or 2
     return exit_code
 
 
@@ -1405,7 +1440,7 @@ def campaign_export(args: argparse.Namespace) -> int:
     campaigns_dir, runs_dir = campaign_paths(args)
     out_dir = campaign_dir(campaigns_dir, args.campaign_id)
     summarize_campaign(out_dir, runs_dir)
-    zip_path = export_campaign(out_dir, runs_dir)
+    zip_path = export_campaign(out_dir, runs_dir, include_raw=bool(getattr(args, "include_raw", False)))
     print(json.dumps({"campaign_id": args.campaign_id, "artifact": str(zip_path)}, ensure_ascii=False, indent=2))
     return 0
 
@@ -1442,7 +1477,7 @@ def probe_models_endpoint(client: httpx.Client, model: ModelConfig, auth_type: s
     try:
         response = client.get(f"{model.base_url}/v1/models", headers=auth_headers(temp, secret))
     except Exception as exc:
-        return {"auth_type": auth_type, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"auth_type": auth_type, "ok": False, "error": redact_text(f"{type(exc).__name__}: {exc}", max_chars=500)}
     try:
         data = response.json()
     except Exception:
@@ -1505,7 +1540,7 @@ def probe_single_call(
         "status": "ok" if completion.metrics.ok else "failed",
         "returned_model": completion.metrics.server_model,
         "content_preview": completion.text[:80] if completion.metrics.ok else None,
-        "error_preview": completion.metrics.error[:240] if completion.metrics.error else None,
+        "error_preview": redact_text(completion.metrics.error, max_chars=240) if completion.metrics.error else None,
         "total_ms": completion.metrics.total_ms,
         "timeout": timeout_label,
     }
@@ -1616,6 +1651,7 @@ def main() -> int:
     run_parser.add_argument("--judge-max-tokens", type=int)
     run_parser.add_argument("--retries", type=int, help="retry transient live provider failures this many times")
     run_parser.add_argument("--retry-backoff", type=float, help="initial retry backoff seconds for live provider failures")
+    run_parser.add_argument("--require-go", action="store_true", help="return exit code 2 unless the final decision is GO")
     add_model_override_args(run_parser)
     run_parser.set_defaults(func=run_job)
 
@@ -1629,6 +1665,7 @@ def main() -> int:
     export_parser.add_argument("--latest", action="store_true")
     export_parser.add_argument("--job-id")
     export_parser.add_argument("--runs-dir", type=Path)
+    export_parser.add_argument("--include-raw", action="store_true", help="include raw responses, judge responses, and event logs")
     export_parser.set_defaults(func=export_job)
 
     campaign_parser = sub.add_parser("campaign", help="run a repeated campaign")
@@ -1645,6 +1682,7 @@ def main() -> int:
     campaign_parser.add_argument("--judge-max-tokens", type=int)
     campaign_parser.add_argument("--retries", type=int, help="retry transient live provider failures this many times")
     campaign_parser.add_argument("--retry-backoff", type=float, help="initial retry backoff seconds for live provider failures")
+    campaign_parser.add_argument("--require-go", action="store_true", help="return exit code 2 unless the campaign overall decision is GO")
     add_model_override_args(campaign_parser)
     campaign_parser.set_defaults(func=run_campaign)
 
@@ -1669,6 +1707,7 @@ def main() -> int:
     campaign_export_parser.add_argument("--campaign-id", required=True)
     campaign_export_parser.add_argument("--campaigns-dir", type=Path)
     campaign_export_parser.add_argument("--runs-dir", type=Path)
+    campaign_export_parser.add_argument("--include-raw", action="store_true", help="include raw responses, judge responses, and event logs")
     campaign_export_parser.set_defaults(func=campaign_export)
 
     probe_parser = sub.add_parser("probe", help="probe model/protocol/auth combinations")
