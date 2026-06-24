@@ -78,7 +78,7 @@
       ],
       "properties": {
         "id": { "type": "string" },
-        "api_style": { "const": "anthropic_messages" },
+        "api_style": { "enum": ["anthropic_messages", "openai_chat"] },
           "base_url_host": { "type": ["string", "null"] },
           "auth_env_name": { "type": ["string", "null"] },
           "model_requested": { "type": ["string", "null"] },

@@ -283,8 +283,8 @@ def validate_run_record(record: dict[str, Any]) -> list[str]:
     if run.get("status") not in ALLOWED_RUN_STATUSES:
         errors.append("run.status must be completed, failed, stopped, or partial")
     provider = record.get("provider") if isinstance(record.get("provider"), dict) else {}
-    if provider.get("api_style") != "anthropic_messages":
-        errors.append("provider.api_style must be anthropic_messages")
+    if provider.get("api_style") not in {"anthropic_messages", "openai_chat"}:
+        errors.append("provider.api_style must be anthropic_messages or openai_chat")
     trace = record.get("trace") if isinstance(record.get("trace"), dict) else {}
     if not isinstance(trace.get("tool_calls"), list):
         errors.append("trace.tool_calls must be an array")

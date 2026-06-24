@@ -1,0 +1,18 @@
+{
+  "tested_model": {
+    "provider_id": "tested_gateway",
+    "base_url": "https://your-gateway.example.com",
+    "model": "gpt-4o-mini",
+    "api_key_env": "TESTED_MODEL_API_KEY",
+    "protocol": "openai_chat",
+    "auth_type": "bearer"
+  },
+  "judge_model": {
+    "provider_id": "judge_gateway",
+    "base_url": "https://your-gateway.example.com",
+    "model": "gpt-4o-mini",
+    "api_key_env": "JUDGE_MODEL_API_KEY",
+    "protocol": "openai_chat",
+    "auth_type": "bearer"
+  }
+}

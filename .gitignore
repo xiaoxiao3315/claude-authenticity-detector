@@ -4,6 +4,8 @@ local_secrets.env
 *.local.env
 providers.local.json
 providers.test.local.json
+configs/providers.local.json
+configs/*.local.json
 
 # Runtime artifacts
 runs/
