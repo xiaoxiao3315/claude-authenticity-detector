@@ -175,6 +175,66 @@ and refuses to download packs that are missing the manifest/checksum pair. If a
 run or campaign was exported before this safe-pack format, re-run `export` or
 `campaign-export` for that item.
 
+## v0.3 Provider Authenticity Evidence Layer
+
+The v0.3 layer treats provider trust as evidence, not as a single benchmark
+score. It keeps the existing campaign runner and adds campaign-level evidence
+for model quality, gateway reliability, protocol fingerprint, official or
+direct baseline similarity, auditability, and overall trust.
+
+Black-box API testing cannot prove upstream identity absolutely. Missing
+upstream request IDs or official baselines lower auditability or similarity
+confidence; they do not by themselves prove model substitution.
+
+Dry-safe commands:
+
+```powershell
+python .\eval_cli.py authenticity --job smoke_10 --campaign-id CMP-AUTH-SMOKE --repeat 1 --baseline-provider official_dry_run --gateway-provider gateway_dry_run
+python .\eval_cli.py fingerprint --provider tested_model
+python .\eval_cli.py authenticity-inspect --campaign-id CMP-AUTH-SMOKE
+python .\eval_cli.py authenticity-export --campaign-id CMP-AUTH-SMOKE
+```
+
+To compare a gateway campaign with an official/direct baseline campaign, run
+both campaigns under comparable job, judge, policy, and live/dry-run settings,
+then pass the official campaign as the baseline:
+
+```powershell
+python .\eval_cli.py authenticity --job smoke_10 --campaign-id CMP-GATEWAY --baseline-campaign-id CMP-OFFICIAL --baseline-provider official_direct --gateway-provider gateway_candidate
+```
+
+`authenticity_summary.json` contains separated decisions:
+
+```text
+model_quality_decision
+gateway_reliability_decision
+protocol_fingerprint_decision
+baseline_similarity_decision
+auditability_decision
+overall_trust_decision
+```
+
+Campaign evidence files:
+
+```text
+authenticity_summary.json
+baseline_comparisons/baseline_comparison.json
+protocol_fingerprints/<provider_id>.json
+artifacts/acceptance_pack.zip
+```
+
+The authenticity export path remains safe-by-default. It includes sanitized
+campaign summaries, protocol and baseline evidence, quality gates, manifest,
+and checksums. Raw responses, judge responses, and event logs remain excluded
+unless `--include-raw` is passed explicitly.
+
+Authenticity API routes:
+
+```text
+GET /api/authenticity/latest
+GET /api/campaigns/<campaign_id>/authenticity
+```
+
 ## Install
 
 ```powershell

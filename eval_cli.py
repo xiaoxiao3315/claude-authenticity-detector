@@ -42,6 +42,7 @@ from campaigns import (
     summarize_campaign,
     write_json as write_campaign_json,
 )
+from authenticity import build_config_protocol_fingerprint, load_or_build_authenticity, write_authenticity_evidence
 from local_env import load_local_env
 from quality_gate import run_quality_gate
 from run_records import extract_raw_event_types, stable_json_hash, text_hash
@@ -56,6 +57,21 @@ DEFAULT_PROVIDERS = Path("configs/providers.local.json")
 DEFAULT_CAMPAIGNS_DIR = Path("campaigns")
 ALLOWED_PROTOCOLS = {"openai_chat", "anthropic_messages"}
 ALLOWED_AUTH_TYPES = {"bearer", "x-api-key"}
+SAFE_RESPONSE_HEADER_NAMES = {
+    "request-id",
+    "x-request-id",
+    "x-correlation-id",
+    "openai-request-id",
+    "anthropic-request-id",
+    "cf-ray",
+    "server",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-tokens",
+}
 
 
 @dataclass
@@ -406,6 +422,23 @@ def auth_headers(model: ModelConfig, secret: str) -> dict[str, str]:
     raise ValueError(f"unsupported auth_type: {model.auth_type}")
 
 
+def safe_response_headers(headers: Any) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in dict(headers or {}).items():
+        normalized = str(key).lower()
+        if normalized in SAFE_RESPONSE_HEADER_NAMES:
+            out[normalized] = redact_text(str(value), max_chars=160)
+    return dict(sorted(out.items()))
+
+
+def response_request_id(headers: Any) -> str | None:
+    safe = safe_response_headers(headers)
+    for key in ("request-id", "x-request-id", "openai-request-id", "anthropic-request-id", "x-correlation-id", "cf-ray"):
+        if safe.get(key):
+            return safe[key]
+    return None
+
+
 def dry_completion(model: ModelConfig, messages: list[dict[str, str]], max_tokens: int) -> Completion:
     user_text = " ".join(message.get("content", "") for message in messages if message.get("role") == "user")
     if model.provider_id.startswith("judge"):
@@ -556,6 +589,8 @@ def call_model(
             "type": "response_completed",
             "provider_id": model.provider_id,
             "status": response.status_code,
+            "request_id": response_request_id(response.headers),
+            "response_headers": safe_response_headers(response.headers),
             "total_ms": elapsed,
             "content_chars": len(text),
             "model_returned": metrics.server_model,
@@ -1260,6 +1295,7 @@ def export_job(args: argparse.Namespace) -> int:
         "validation.json",
         "job_config.snapshot.json",
         "providers.redacted.json",
+        "authenticity_summary.json",
     ]
     if include_raw:
         include_names.append("events.jsonl")
@@ -1271,7 +1307,7 @@ def export_job(args: argparse.Namespace) -> int:
                 data = path.read_bytes()
                 zf.writestr(name, data)
                 checksums[name] = hashlib.sha256(data).hexdigest()
-        folders = ["quality_gates", "trace_evaluations"]
+        folders = ["quality_gates", "trace_evaluations", "baseline_comparisons", "protocol_fingerprints"]
         if include_raw:
             folders.extend(["events", "responses", "judge_responses"])
         for folder in folders:
@@ -1564,6 +1600,117 @@ def campaign_export(args: argparse.Namespace) -> int:
     campaigns_dir, runs_dir = campaign_paths(args)
     out_dir = campaign_dir(campaigns_dir, args.campaign_id)
     summarize_campaign(out_dir, runs_dir)
+    write_authenticity_evidence(out_dir, runs_dir, persist=True)
+    zip_path = export_campaign(out_dir, runs_dir, include_raw=bool(getattr(args, "include_raw", False)))
+    print(json.dumps({"campaign_id": args.campaign_id, "artifact": str(zip_path)}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def baseline_campaign_path(args: argparse.Namespace, campaigns_dir: Path) -> Path | None:
+    baseline_id = str(getattr(args, "baseline_campaign_id", "") or "").strip()
+    if not baseline_id:
+        return None
+    path = campaign_dir(campaigns_dir, baseline_id)
+    if not path.exists():
+        raise FileNotFoundError(f"baseline campaign not found: {baseline_id}")
+    return path
+
+
+def authenticity(args: argparse.Namespace) -> int:
+    campaigns_dir, runs_dir = campaign_paths(args)
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    campaign_id = safe_campaign_id(args.campaign_id or f"CMP-AUTH-{campaign_id_for(models['tested_model'])[4:]}")
+    out_dir = campaign_dir(campaigns_dir, campaign_id)
+    exit_code = 0
+    if not out_dir.exists():
+        child_args = argparse.Namespace(
+            job=args.job,
+            providers=args.providers,
+            runs_dir=runs_dir,
+            campaigns_dir=campaigns_dir,
+            campaign_id=campaign_id,
+            repeat=int(args.repeat or 1),
+            resume=False,
+            live=bool(args.live),
+            timeout=args.timeout,
+            tested_max_tokens=args.tested_max_tokens,
+            judge_max_tokens=args.judge_max_tokens,
+            max_concurrency=getattr(args, "max_concurrency", None),
+            retries=getattr(args, "retries", None),
+            retry_backoff=getattr(args, "retry_backoff", None),
+            require_go=False,
+            skip_trace_evaluation=getattr(args, "skip_trace_evaluation", False),
+            **model_override_kwargs(args),
+        )
+        exit_code = run_campaign(child_args)
+    else:
+        summarize_campaign(out_dir, runs_dir)
+
+    baseline_dir = baseline_campaign_path(args, campaigns_dir)
+    evidence = write_authenticity_evidence(
+        out_dir,
+        runs_dir,
+        baseline_campaign_dir=baseline_dir,
+        baseline_provider=str(args.baseline_provider or "official_baseline"),
+        gateway_provider=str(args.gateway_provider or models["tested_model"].provider_id),
+        persist=True,
+    )
+    print(
+        json.dumps(
+            {
+                "campaign_id": campaign_id,
+                "status": evidence.get("status"),
+                "authenticity_summary": str(out_dir / "authenticity_summary.json"),
+                "decisions": evidence.get("decisions"),
+                "metrics": evidence.get("metrics"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return exit_code
+
+
+def fingerprint(args: argparse.Namespace) -> int:
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    role = str(args.provider or "tested_model")
+    if role not in models:
+        raise ValueError("--provider must be tested_model or judge_model")
+    identity = campaign_model_identity(models[role], include_key_fingerprint=False)
+    fingerprint_doc = build_config_protocol_fingerprint(identity, provider_label=role, live=bool(getattr(args, "live", False)))
+    if getattr(args, "campaign_id", None):
+        campaigns_dir, runs_dir = campaign_paths(args)
+        out_dir = campaign_dir(campaigns_dir, args.campaign_id)
+        write_authenticity_evidence(out_dir, runs_dir, persist=True)
+        provider_id = str(identity.get("provider_id") or role).replace("/", "_").replace("\\", "_")
+        path = out_dir / "protocol_fingerprints" / f"{provider_id}.json"
+        fingerprint_doc = read_json(path) if path.exists() else fingerprint_doc
+    print(json.dumps(fingerprint_doc, ensure_ascii=False, indent=2))
+    return 0
+
+
+def authenticity_inspect(args: argparse.Namespace) -> int:
+    campaigns_dir, runs_dir = campaign_paths(args)
+    out_dir = campaign_dir(campaigns_dir, args.campaign_id)
+    evidence = load_or_build_authenticity(out_dir, runs_dir, persist=False)
+    print(json.dumps(evidence, ensure_ascii=False, indent=2))
+    return 0
+
+
+def authenticity_export(args: argparse.Namespace) -> int:
+    campaigns_dir, runs_dir = campaign_paths(args)
+    out_dir = campaign_dir(campaigns_dir, args.campaign_id)
+    baseline_dir = baseline_campaign_path(args, campaigns_dir)
+    write_authenticity_evidence(
+        out_dir,
+        runs_dir,
+        baseline_campaign_dir=baseline_dir,
+        baseline_provider=str(args.baseline_provider or "official_baseline"),
+        gateway_provider=str(args.gateway_provider or "gateway_candidate"),
+        persist=True,
+    )
     zip_path = export_campaign(out_dir, runs_dir, include_raw=bool(getattr(args, "include_raw", False)))
     print(json.dumps({"campaign_id": args.campaign_id, "artifact": str(zip_path)}, ensure_ascii=False, indent=2))
     return 0
@@ -1840,6 +1987,53 @@ def main() -> int:
     campaign_export_parser.add_argument("--runs-dir", type=Path)
     campaign_export_parser.add_argument("--include-raw", action="store_true", help="include raw responses, judge responses, and event logs")
     campaign_export_parser.set_defaults(func=campaign_export)
+
+    authenticity_parser = sub.add_parser("authenticity", help="run or refresh provider authenticity evidence for a campaign")
+    authenticity_parser.add_argument("--job", default=DEFAULT_JOB, help="job name or path")
+    authenticity_parser.add_argument("--providers", type=Path, help="providers config path")
+    authenticity_parser.add_argument("--runs-dir", type=Path, help="runs directory")
+    authenticity_parser.add_argument("--campaigns-dir", type=Path, help="campaigns directory")
+    authenticity_parser.add_argument("--campaign-id", help="existing or new campaign id")
+    authenticity_parser.add_argument("--repeat", type=int, default=1)
+    authenticity_parser.add_argument("--baseline-campaign-id", help="optional official/direct baseline campaign id")
+    authenticity_parser.add_argument("--baseline-provider", default="official_baseline", help="baseline provider label for evidence")
+    authenticity_parser.add_argument("--gateway-provider", default="gateway_candidate", help="gateway provider label for evidence")
+    authenticity_parser.add_argument("--live", action="store_true", help="call configured live providers if a new campaign must be created")
+    authenticity_parser.add_argument("--timeout", type=float, help="per-request timeout seconds")
+    authenticity_parser.add_argument("--tested-max-tokens", type=int)
+    authenticity_parser.add_argument("--judge-max-tokens", type=int)
+    authenticity_parser.add_argument("--max-concurrency", type=int)
+    authenticity_parser.add_argument("--retries", type=int)
+    authenticity_parser.add_argument("--retry-backoff", type=float)
+    authenticity_parser.add_argument("--skip-trace-evaluation", action="store_true")
+    add_model_override_args(authenticity_parser)
+    authenticity_parser.set_defaults(func=authenticity)
+
+    fingerprint_parser = sub.add_parser("fingerprint", help="emit protocol fingerprint evidence for a configured provider")
+    fingerprint_parser.add_argument("--provider", choices=["tested_model", "judge_model"], default="tested_model")
+    fingerprint_parser.add_argument("--providers", type=Path, help="providers config path")
+    fingerprint_parser.add_argument("--campaign-id", help="optional campaign id to refresh and read persisted fingerprint evidence")
+    fingerprint_parser.add_argument("--campaigns-dir", type=Path)
+    fingerprint_parser.add_argument("--runs-dir", type=Path)
+    fingerprint_parser.add_argument("--live", action="store_true", help="mark fingerprint as live-intended; network probing is not performed by this dry-safe command")
+    add_model_override_args(fingerprint_parser)
+    fingerprint_parser.set_defaults(func=fingerprint)
+
+    authenticity_inspect_parser = sub.add_parser("authenticity-inspect", help="inspect campaign authenticity evidence")
+    authenticity_inspect_parser.add_argument("--campaign-id", required=True)
+    authenticity_inspect_parser.add_argument("--campaigns-dir", type=Path)
+    authenticity_inspect_parser.add_argument("--runs-dir", type=Path)
+    authenticity_inspect_parser.set_defaults(func=authenticity_inspect)
+
+    authenticity_export_parser = sub.add_parser("authenticity-export", help="refresh authenticity evidence and export a campaign acceptance pack")
+    authenticity_export_parser.add_argument("--campaign-id", required=True)
+    authenticity_export_parser.add_argument("--campaigns-dir", type=Path)
+    authenticity_export_parser.add_argument("--runs-dir", type=Path)
+    authenticity_export_parser.add_argument("--baseline-campaign-id")
+    authenticity_export_parser.add_argument("--baseline-provider", default="official_baseline")
+    authenticity_export_parser.add_argument("--gateway-provider", default="gateway_candidate")
+    authenticity_export_parser.add_argument("--include-raw", action="store_true", help="include raw responses, judge responses, and event logs")
+    authenticity_export_parser.set_defaults(func=authenticity_export)
 
     probe_parser = sub.add_parser("probe", help="probe model/protocol/auth combinations")
     probe_parser.add_argument("--providers", type=Path, help="providers config path")

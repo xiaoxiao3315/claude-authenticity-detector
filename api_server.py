@@ -19,6 +19,7 @@ from campaigns import (
     summary_needs_refresh,
     summarize_campaign,
 )
+from authenticity import load_or_build_authenticity
 from local_env import load_local_env
 from redaction import redact_text, redact_value
 
@@ -542,6 +543,13 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/campaigns/latest":
                 campaigns = campaign_list_payload(CAMPAIGNS_DIR, RUNS_DIR, persist_refresh=False).get("campaigns") or []
                 self.send_json(campaigns[0] if campaigns else {})
+            elif path == "/api/authenticity/latest":
+                campaigns = campaign_list_payload(CAMPAIGNS_DIR, RUNS_DIR, persist_refresh=False).get("campaigns") or []
+                if not campaigns:
+                    self.send_json({})
+                else:
+                    camp_dir = resolve_campaign_dir(CAMPAIGNS_DIR, str(campaigns[0].get("campaign_id") or ""))
+                    self.send_json(load_or_build_authenticity(camp_dir, RUNS_DIR, persist=False))
             elif path.startswith("/api/campaigns/"):
                 self.handle_campaign_get(path)
             elif path == "/api/jobs":
@@ -596,6 +604,8 @@ class Handler(BaseHTTPRequestHandler):
             if summary_needs_refresh(summary):
                 summary = summarize_campaign(camp_dir, RUNS_DIR, persist=False)
             self.send_json(summary)
+        elif endpoint == "authenticity":
+            self.send_json(load_or_build_authenticity(camp_dir, RUNS_DIR, persist=False))
         elif endpoint == "runs":
             self.send_json(load_run_index(camp_dir))
         elif endpoint == "artifacts":

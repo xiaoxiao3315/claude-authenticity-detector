@@ -123,7 +123,16 @@ async function refreshJobs() {
     $("jobList").innerHTML = `<div class="muted">${escapeHtml(jobsResult.reason.message || "任务列表加载失败")}</div>`;
   }
   if (leaderboardResult.status === "fulfilled") {
-    renderLeaderboard(leaderboardResult.value);
+    let leaderboard = leaderboardResult.value;
+    if (!((leaderboard.entries || []).length)) {
+      try {
+        leaderboard = await api("/api/leaderboard?include_dry_run=true&limit=20");
+        leaderboard.dry_run_fallback = true;
+      } catch (error) {
+        leaderboard = leaderboardResult.value;
+      }
+    }
+    renderLeaderboard(leaderboard);
   } else {
     $("leaderboardStatus").textContent = leaderboardResult.reason.message || "排行加载失败";
     $("leaderboardBody").innerHTML = '<tr><td colspan="15" class="empty-table">排行加载失败，可刷新重试</td></tr>';
@@ -227,7 +236,10 @@ function renderLeaderboard(data) {
   if (!status || !body) return;
   const rows = (data && data.entries) || [];
   state.leaderboard.entries = rows;
-  status.textContent = rows.length ? `${rows.length} 个 campaign / 兼容组 ${data.selected_comparison_key_id || "-"}` : "暂无真实 campaign 排行";
+  const fallback = data && data.dry_run_fallback;
+  status.textContent = rows.length
+    ? `${rows.length} 个 campaign / 兼容组 ${data.selected_comparison_key_id || "-"}${fallback ? " / dry-run fallback" : ""}`
+    : "暂无真实 campaign 排行";
   body.innerHTML = "";
   if (!rows.length) {
     body.innerHTML = '<tr><td colspan="15" class="empty-table">暂无 completed live campaign；dry-run 可通过 API 参数 include_dry_run=true 查看</td></tr>';
@@ -274,12 +286,13 @@ function renderLeaderboard(data) {
 
 async function loadCampaign(campaignId) {
   state.currentCampaignId = campaignId;
-  const [summary, runs, artifacts] = await Promise.all([
+  const [summary, runs, artifacts, authenticity] = await Promise.all([
     api(`/api/campaigns/${encodeURIComponent(campaignId)}/summary`),
     api(`/api/campaigns/${encodeURIComponent(campaignId)}/runs`),
     api(`/api/campaigns/${encodeURIComponent(campaignId)}/artifacts`),
+    api(`/api/campaigns/${encodeURIComponent(campaignId)}/authenticity`),
   ]);
-  renderCampaignDetail(summary, runs.runs || [], artifacts.artifacts || []);
+  renderCampaignDetail(summary, runs.runs || [], artifacts.artifacts || [], authenticity);
 }
 
 function metricTile(label, value, hint = "") {
@@ -292,7 +305,13 @@ function metricTile(label, value, hint = "") {
   `;
 }
 
-function renderCampaignDetail(summary, runs, artifacts) {
+function reasonChips(items) {
+  const values = Array.isArray(items) ? items : [];
+  if (!values.length) return '<span class="empty-note">无额外原因</span>';
+  return values.slice(0, 8).map((item) => `<code>${escapeHtml(item)}</code>`).join("");
+}
+
+function renderCampaignDetail(summary, runs, artifacts, authenticity = {}) {
   const target = $("campaignDetail");
   if (!target) return;
   const status = $("campaignDetailStatus");
@@ -304,6 +323,16 @@ function renderCampaignDetail(summary, runs, artifacts) {
   const trend = summary.trend || [];
   const samples = summary.samples || [];
   const failures = summary.failure_counts || {};
+  const authMetrics = authenticity.metrics || {};
+  const authDecisions = authenticity.decisions || {};
+  const authReasons = authenticity.reasons || {};
+  const authStats = authMetrics.statistical_confidence || {};
+  const authStatReasons = [
+    `样本 ${authStats.total_samples ?? 0}/${authStats.min_sample_threshold ?? 30}`,
+    authStats.sample_threshold_met ? "sample_threshold_met" : "sample_threshold_not_met",
+    Array.isArray(authStats.bootstrap_95_ci) ? `bootstrap_95_ci ${authStats.bootstrap_95_ci.join("..")}` : "bootstrap_ci_missing",
+    Array.isArray(authStats.anomalies) && authStats.anomalies.length ? `anomalies ${authStats.anomalies.length}` : "no_anomaly",
+  ];
   const maxBenchmark = Math.max(1, ...trend.map((item) => Number(item.benchmark_score || 0)));
   const maxFailure = Math.max(1, ...Object.values(failures).map((value) => Number(value || 0)));
   target.innerHTML = `
@@ -316,6 +345,31 @@ function renderCampaignDetail(summary, runs, artifacts) {
       ${metricTile("P50 / P95", `${fmtMs(metrics.p50_latency_ms)} / ${fmtMs(metrics.p95_latency_ms)}`)}
       ${metricTile("重试/替换", `${metrics.retried_request_count ?? 0} / ${metrics.total_retry_count ?? 0}`, `替换轮次 ${metrics.replaced_run_count ?? 0}`)}
     </div>
+    <section class="authenticity-panel">
+      <h4>可信度证据层</h4>
+      <div class="campaign-summary-grid">
+        ${metricTile("模型质量", decisionText(authDecisions.model_quality_decision), fmtNumber(authMetrics.model_quality_score, 2))}
+        ${metricTile("网关稳定性", decisionText(authDecisions.gateway_reliability_decision), fmtNumber(authMetrics.gateway_reliability_score, 2))}
+        ${metricTile("协议指纹", decisionText(authDecisions.protocol_fingerprint_decision), fmtNumber(authMetrics.protocol_fingerprint_score, 2))}
+        ${metricTile("基线相似度", decisionText(authDecisions.baseline_similarity_decision), fmtNumber(authMetrics.baseline_similarity_score, 2))}
+        ${metricTile("可审计性", decisionText(authDecisions.auditability_decision), fmtNumber(authMetrics.auditability_score, 2))}
+        ${metricTile("综合可信度", decisionText(authDecisions.overall_trust_decision), fmtNumber(authMetrics.overall_trust_score, 2))}
+      </div>
+      <div class="decision-strip">
+        <span class="${decisionClass(authDecisions.model_quality_decision)}">模型质量：${escapeHtml(decisionText(authDecisions.model_quality_decision))}</span>
+        <span class="${decisionClass(authDecisions.gateway_reliability_decision)}">网关稳定性：${escapeHtml(decisionText(authDecisions.gateway_reliability_decision))}</span>
+        <span class="${decisionClass(authDecisions.protocol_fingerprint_decision)}">协议指纹：${escapeHtml(decisionText(authDecisions.protocol_fingerprint_decision))}</span>
+        <span class="${decisionClass(authDecisions.baseline_similarity_decision)}">基线相似度：${escapeHtml(decisionText(authDecisions.baseline_similarity_decision))}</span>
+        <span class="${decisionClass(authDecisions.auditability_decision)}">可审计性：${escapeHtml(decisionText(authDecisions.auditability_decision))}</span>
+        <span class="${decisionClass(authDecisions.overall_trust_decision)}">综合可信度：${escapeHtml(decisionText(authDecisions.overall_trust_decision))}</span>
+      </div>
+      <div class="auth-reasons">
+        <div><strong>协议证据</strong>${reasonChips(authReasons.protocol_fingerprint)}</div>
+        <div><strong>基线证据</strong>${reasonChips(authReasons.baseline_similarity)}</div>
+        <div><strong>审计证据</strong>${reasonChips(authReasons.auditability)}</div>
+        <div><strong>统计证据</strong>${reasonChips(authStatReasons)}</div>
+      </div>
+    </section>
     <div class="decision-strip">
       <span class="${decisionClass(decisions.model_confidence_decision)}">模型身份/质量迹象：${escapeHtml(decisionText(decisions.model_confidence_decision))}</span>
       <span class="${decisionClass(decisions.gateway_reliability_decision)}">网关稳定性：${escapeHtml(decisionText(decisions.gateway_reliability_decision))}</span>
@@ -465,7 +519,13 @@ $("openLatest").addEventListener("click", openLatest);
 $("configForm").addEventListener("submit", saveConfig);
 
 Promise.all([refreshJobs(), loadConfig()])
-  .then(openLatest)
+  .then(async () => {
+    await openLatest();
+    const firstCampaign = state.leaderboard.entries[0];
+    if (!state.currentCampaignId && firstCampaign && firstCampaign.campaign_id) {
+      await loadCampaign(firstCampaign.campaign_id);
+    }
+  })
   .catch((error) => {
     $("eventLog").textContent = error.message;
   });

@@ -668,7 +668,7 @@ def export_campaign(campaign_dir_path: Path, runs_dir: Path, *, include_raw: boo
     artifacts_dir = campaign_dir_path / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     zip_path = artifacts_dir / "acceptance_pack.zip"
-    include_campaign_files = ["campaign.json", "summary.json", "run_ids.json"]
+    include_campaign_files = ["campaign.json", "summary.json", "run_ids.json", "authenticity_summary.json"]
     include_run_files = [
         "state.json",
         "run_records.jsonl",
@@ -689,6 +689,14 @@ def export_campaign(campaign_dir_path: Path, runs_dir: Path, *, include_raw: boo
             path = campaign_dir_path / name
             if path.exists():
                 _zip_add_file(zf, path, name, checksums)
+        for folder in ["baseline_comparisons", "protocol_fingerprints"]:
+            root = campaign_dir_path / folder
+            if not root.exists():
+                continue
+            for path in root.rglob("*"):
+                if path.is_file():
+                    rel_name = path.relative_to(campaign_dir_path).as_posix()
+                    _zip_add_file(zf, path, rel_name, checksums)
         for run_ref in run_index.get("runs") or []:
             if run_ref.get("status") == "replaced":
                 if run_ref.get("run_id"):
@@ -703,7 +711,7 @@ def export_campaign(campaign_dir_path: Path, runs_dir: Path, *, include_raw: boo
                 path = run_dir / name
                 if path.exists():
                     _zip_add_file(zf, path, f"runs/{run_id}/{name}", checksums)
-            folders = ["quality_gates", "trace_evaluations"]
+            folders = ["quality_gates", "trace_evaluations", "baseline_comparisons", "protocol_fingerprints"]
             if include_raw:
                 folders.extend(["events", "responses", "judge_responses"])
             for folder in folders:

@@ -68,7 +68,7 @@ try {
     }
 
     Write-Host "[package] syntax checks"
-    python -m py_compile eval_cli.py campaigns.py api_server.py run_records.py benchmarking.py quality_gate.py trace_evaluation.py acceptance_pack.py redaction.py
+    python -m py_compile eval_cli.py campaigns.py api_server.py run_records.py benchmarking.py quality_gate.py trace_evaluation.py acceptance_pack.py redaction.py authenticity.py
     $node = Get-Command node -ErrorAction SilentlyContinue
     if ($node) {
         node --check web\app.js
@@ -79,7 +79,9 @@ try {
     Write-Host "[package] dry-run campaign $CampaignId"
     python .\eval_cli.py campaign --job smoke_10 --repeat 1 --campaign-id $CampaignId
     python .\eval_cli.py campaign-status --campaign-id $CampaignId
-    python .\eval_cli.py campaign-export --campaign-id $CampaignId
+    python .\eval_cli.py authenticity --job smoke_10 --campaign-id $CampaignId --repeat 1 --baseline-provider official_dry_run --gateway-provider gateway_dry_run
+    python .\eval_cli.py authenticity-inspect --campaign-id $CampaignId
+    python .\eval_cli.py authenticity-export --campaign-id $CampaignId --baseline-provider official_dry_run --gateway-provider gateway_dry_run
 
     Write-Host "[package] acceptance pack contents"
     $packPath = Join-Path $PackageRoot "campaigns\$CampaignId\artifacts\acceptance_pack.zip"
@@ -97,6 +99,9 @@ try {
         "campaign.json",
         "summary.json",
         "run_ids.json",
+        "authenticity_summary.json",
+        "baseline_comparisons/",
+        "protocol_fingerprints/",
         "acceptance_manifest.json",
         "checksums.sha256",
         "runs/$CampaignId-R01/run_records.jsonl",
@@ -160,6 +165,16 @@ raise SystemExit(0 if result.get("verified") else 1)
     }
     if ($content -notmatch [regex]::Escape($CampaignId)) {
         throw "API smoke did not include campaign id $CampaignId"
+    }
+    $authCampaignUrl = "http://127.0.0.1:$Port/api/campaigns/$CampaignId/authenticity"
+    $authCampaignContent = (Invoke-WebRequest -UseBasicParsing $authCampaignUrl).Content
+    if ($authCampaignContent -notmatch [regex]::Escape($CampaignId) -or $authCampaignContent -notmatch "authenticity_summary_v1") {
+        throw "API smoke did not return campaign authenticity summary"
+    }
+    $authLatestUrl = "http://127.0.0.1:$Port/api/authenticity/latest"
+    $authLatestContent = (Invoke-WebRequest -UseBasicParsing $authLatestUrl).Content
+    if ($authLatestContent -notmatch [regex]::Escape($CampaignId) -or $authLatestContent -notmatch "authenticity_summary_v1") {
+        throw "API smoke did not return latest authenticity summary"
     }
 
     Write-Host "PACKAGE-SMOKE-OK $PackageRoot"

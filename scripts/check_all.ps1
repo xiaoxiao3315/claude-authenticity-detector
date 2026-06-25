@@ -11,7 +11,7 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Push-Location $RepoRoot
 try {
     Write-Host "[check] python compile"
-    python -m py_compile eval_cli.py campaigns.py api_server.py run_records.py benchmarking.py quality_gate.py trace_evaluation.py acceptance_pack.py redaction.py
+    python -m py_compile eval_cli.py campaigns.py api_server.py run_records.py benchmarking.py quality_gate.py trace_evaluation.py acceptance_pack.py redaction.py authenticity.py
 
     $node = Get-Command node -ErrorAction SilentlyContinue
     if ($node) {
@@ -28,13 +28,16 @@ try {
     python .\compatibility.py --self-test
     python .\trace_evaluation.py --self-test
     python .\audit_export.py --self-test
+    python .\authenticity.py --self-test
 
     if (-not $SkipDryRun) {
         $campaignId = "CMP-CHECK-" + (Get-Date -Format "yyyyMMddHHmmss")
         Write-Host "[check] dry-run campaign $campaignId"
         python .\eval_cli.py campaign --job smoke_10 --providers configs\providers.example.json --repeat 1 --campaign-id $campaignId
         python .\eval_cli.py campaign-status --campaign-id $campaignId
-        python .\eval_cli.py campaign-export --campaign-id $campaignId
+        python .\eval_cli.py authenticity --job smoke_10 --providers configs\providers.example.json --campaign-id $campaignId --repeat 1 --baseline-provider official_dry_run --gateway-provider gateway_dry_run
+        python .\eval_cli.py authenticity-inspect --campaign-id $campaignId
+        python .\eval_cli.py authenticity-export --campaign-id $campaignId --baseline-provider official_dry_run --gateway-provider gateway_dry_run
         $packPath = Join-Path $RepoRoot "campaigns\$campaignId\artifacts\acceptance_pack.zip"
         $env:CHECK_ACCEPTANCE_PACK = $packPath
         try {
