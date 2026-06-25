@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import statistics
 import zipfile
 from collections import Counter
@@ -76,6 +77,20 @@ def ratio(numerator: int | float, denominator: int | float) -> float | None:
     if not denominator:
         return None
     return round(float(numerator) / float(denominator), 6)
+
+
+def model_name_matches(requested: str, returned: str) -> bool:
+    requested = str(requested or "").strip()
+    returned = str(returned or "").strip()
+    if not requested or not returned:
+        return False
+    if requested == returned:
+        return True
+    if returned.startswith(f"{requested}-"):
+        suffix = returned[len(requested) + 1 :]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", suffix):
+            return True
+    return False
 
 
 def percentile(values: list[float], pct: float) -> float | None:
@@ -361,7 +376,7 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path, *, persist: bool
             returned = str(provider.get("model_returned") or "")
             if returned:
                 returned_seen_count += 1
-                if requested and requested == returned:
+                if model_name_matches(requested, returned):
                     returned_match_count += 1
 
             score = score_value(record)
