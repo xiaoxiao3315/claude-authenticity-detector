@@ -2,6 +2,7 @@ const state = {
   currentJobId: null,
   currentCampaignId: null,
   leaderboard: { entries: [] },
+  config: { providers: {} },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -46,8 +47,8 @@ async function api(path, options) {
 }
 
 function decisionClass(value) {
-  if (value === "GO") return "pill-go";
-  if (value === "NO-GO") return "pill-nogo";
+  if (value === "GO" || value === "PASS") return "pill-go";
+  if (value === "NO-GO" || value === "FAIL") return "pill-nogo";
   return "pill-review";
 }
 
@@ -64,9 +65,13 @@ function statusText(value) {
 
 function decisionText(value) {
   const map = {
-    GO: "GO / 通过",
-    REVIEW: "REVIEW / 需复核",
-    "NO-GO": "NO-GO / 不通过",
+    GO: "PASS / 通过",
+    PASS: "PASS / 通过",
+    REVIEW: "RETEST / 自动复验",
+    RETEST: "RETEST / 自动复验",
+    "NO-GO": "FAIL / 不通过",
+    FAIL: "FAIL / 不通过",
+    PENDING: "PENDING / 等待结果",
   };
   return map[value] || value || "-";
 }
@@ -199,7 +204,7 @@ function renderSummary(summary) {
   $("gateStatus").textContent = decisionText(gate.decision);
   $("gateStatus").className = `muted ${decisionClass(gate.decision)}`;
   const blockers = (gate.blockers || []).map((item) => ({ ...item, kind: "阻断" }));
-  const reviews = (gate.review_items || []).map((item) => ({ ...item, kind: "复核" }));
+  const reviews = (gate.review_items || []).map((item) => ({ ...item, kind: "复测" }));
   const reasons = [...blockers, ...reviews];
   $("gateReasons").innerHTML = reasons.length ? reasons.map((item) => `
     <div class="reason-item ${item.kind === "阻断" ? "reason-blocker" : ""}">
@@ -265,9 +270,9 @@ function renderLeaderboard(data) {
       <td>${escapeHtml(fmtPercent(row.protocol_compatibility_score))}</td>
       <td>${escapeHtml(fmtPercent(row.model_name_consistency_rate))}</td>
       <td>${escapeHtml(fmtMs(row.p50_latency_ms))} / ${escapeHtml(fmtMs(row.p95_latency_ms))}</td>
-      <td><span class="${decisionClass(row.model_confidence_decision)}">${escapeHtml(decisionText(row.model_confidence_decision))}</span></td>
-      <td><span class="${decisionClass(row.gateway_reliability_decision)}">${escapeHtml(decisionText(row.gateway_reliability_decision))}</span></td>
-      <td><span class="${decisionClass(row.overall_decision)}">${escapeHtml(decisionText(row.overall_decision))}</span></td>
+      <td><span class="${decisionClass(row.model_outcome || row.model_confidence_decision)}">${escapeHtml(decisionText(row.model_outcome || row.model_confidence_decision))}</span></td>
+      <td><span class="${decisionClass(row.gateway_outcome || row.gateway_reliability_decision)}">${escapeHtml(decisionText(row.gateway_outcome || row.gateway_reliability_decision))}</span></td>
+      <td><span class="${decisionClass(row.overall_outcome || row.overall_decision)}">${escapeHtml(decisionText(row.overall_outcome || row.overall_decision))}</span></td>
       <td><code>${escapeHtml(row.campaign_id || "-")}</code><span class="cell-note">${escapeHtml(fmtDate(row.latest_tested_at))}</span></td>
     `;
     const openCampaign = () => {
@@ -320,6 +325,7 @@ function renderCampaignDetail(summary, runs, artifacts, authenticity = {}) {
   renderPackLink("campaignDownloadPack", "campaignDownloadPackStatus", pack, summary.campaign_id ? `/api/campaigns/${encodeURIComponent(summary.campaign_id)}/artifacts/acceptance_pack.zip` : "");
   const metrics = summary.metrics || {};
   const decisions = summary.decisions || {};
+  const outcomes = summary.outcomes || {};
   const trend = summary.trend || [];
   const samples = summary.samples || [];
   const failures = summary.failure_counts || {};
@@ -344,6 +350,7 @@ function renderCampaignDetail(summary, runs, artifacts, authenticity = {}) {
       ${metricTile("平均质量", fmtNumber(metrics.average_quality_score, 2), `中位 ${fmtNumber(metrics.median_quality_score, 2)}`)}
       ${metricTile("P50 / P95", `${fmtMs(metrics.p50_latency_ms)} / ${fmtMs(metrics.p95_latency_ms)}`)}
       ${metricTile("重试/替换", `${metrics.retried_request_count ?? 0} / ${metrics.total_retry_count ?? 0}`, `替换轮次 ${metrics.replaced_run_count ?? 0}`)}
+      ${metricTile("下一步动作", outcomes.next_action || summary.next_action || "-", outcomes.next_action_reason || summary.next_action_reason || "")}
     </div>
     <section class="authenticity-panel">
       <h4>可信度证据层</h4>
@@ -371,9 +378,9 @@ function renderCampaignDetail(summary, runs, artifacts, authenticity = {}) {
       </div>
     </section>
     <div class="decision-strip">
-      <span class="${decisionClass(decisions.model_confidence_decision)}">模型身份/质量迹象：${escapeHtml(decisionText(decisions.model_confidence_decision))}</span>
-      <span class="${decisionClass(decisions.gateway_reliability_decision)}">网关稳定性：${escapeHtml(decisionText(decisions.gateway_reliability_decision))}</span>
-      <span class="${decisionClass(decisions.overall_decision)}">综合结论：${escapeHtml(decisionText(decisions.overall_decision))}</span>
+      <span class="${decisionClass(outcomes.model_outcome || summary.model_outcome || decisions.model_confidence_decision)}">模型身份/质量迹象：${escapeHtml(decisionText(outcomes.model_outcome || summary.model_outcome || decisions.model_confidence_decision))}</span>
+      <span class="${decisionClass(outcomes.gateway_outcome || summary.gateway_outcome || decisions.gateway_reliability_decision)}">网关稳定性：${escapeHtml(decisionText(outcomes.gateway_outcome || summary.gateway_outcome || decisions.gateway_reliability_decision))}</span>
+      <span class="${decisionClass(outcomes.overall_outcome || summary.overall_outcome || decisions.overall_decision)}">综合结论：${escapeHtml(decisionText(outcomes.overall_outcome || summary.overall_outcome || decisions.overall_decision))}</span>
     </div>
     <div class="detail-columns">
       <section>
@@ -461,8 +468,72 @@ function renderEvents(events) {
   }).join("\n");
 }
 
+function setDatalist(id, values) {
+  const list = $(id);
+  if (!list) return;
+  list.innerHTML = "";
+  for (const value of values || []) {
+    const option = document.createElement("option");
+    option.value = value;
+    list.appendChild(option);
+  }
+}
+
+function providerFor(role) {
+  return (state.config.providers || {})[role] || {};
+}
+
+function configPayloadFor(role, prefix, form) {
+  const current = providerFor(role);
+  return {
+    provider_id: current.provider_id || role,
+    base_url: form[`${prefix}_base_url`].value,
+    model: form[`${prefix}_model`].value,
+    protocol: form[`${prefix}_protocol`].value,
+    auth_type: form[`${prefix}_auth_type`].value,
+    reasoning_effort: form[`${prefix}_reasoning_effort`].value,
+    api_key: form[`${prefix}_api_key`].value,
+  };
+}
+
+function renderProbeResult(result) {
+  const output = $("probeOutput");
+  const roleLabel = result.role === "tested_model" ? "被测模型" : "验收模型";
+  const models = result.text_models || result.models || [];
+  const modelPreview = models.slice(0, 12);
+  const probe = result.reasoning_probe || {};
+  const supported = probe.supported_values || ["none", "low", "medium", "high", "xhigh"];
+  const rejected = (probe.rejected || []).map((item) => item.value);
+  const datalistId = result.role === "tested_model" ? "testedModelOptions" : "judgeModelOptions";
+  setDatalist(datalistId, models);
+  output.classList.remove("muted");
+  output.innerHTML = `
+    <strong>${escapeHtml(roleLabel)}检测完成</strong>
+    <span>模型数量：${escapeHtml(result.model_count ?? 0)}，文本模型：${escapeHtml(models.length)}</span>
+    <span>可选模型：${modelPreview.map(escapeHtml).join("、") || "-"}</span>
+    <span>推理强度选项：${supported.map(escapeHtml).join("、")}${rejected.length ? `；不支持：${rejected.map(escapeHtml).join("、")}` : ""}</span>
+  `;
+}
+
+async function probeConfig(role) {
+  const output = $("probeOutput");
+  output.classList.add("muted");
+  output.textContent = role === "tested_model" ? "正在检测被测 Key..." : "正在检测验收 Key...";
+  try {
+    const result = await api(`/api/config/probe?role=${encodeURIComponent(role)}&reasoning=false`);
+    if (result.error) {
+      output.textContent = result.error;
+      return;
+    }
+    renderProbeResult(result);
+  } catch (error) {
+    output.textContent = error.message || "检测失败";
+  }
+}
+
 async function loadConfig() {
   const data = await api("/api/config");
+  state.config = data;
   const providers = data.providers || {};
   const tested = providers.tested_model || {};
   const judge = providers.judge_model || {};
@@ -472,10 +543,12 @@ async function loadConfig() {
   form.tested_model.value = tested.model || "";
   form.tested_protocol.value = tested.protocol || "openai_chat";
   form.tested_auth_type.value = tested.auth_type || "bearer";
+  form.tested_reasoning_effort.value = tested.reasoning_effort || "";
   form.judge_base_url.value = judge.base_url || "";
   form.judge_model.value = judge.model || "";
   form.judge_protocol.value = judge.protocol || "openai_chat";
   form.judge_auth_type.value = judge.auth_type || "bearer";
+  form.judge_reasoning_effort.value = judge.reasoning_effort || "";
 }
 
 async function saveConfig(event) {
@@ -487,22 +560,8 @@ async function saveConfig(event) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         providers: {
-          tested_model: {
-            provider_id: "tested_model",
-            base_url: form.tested_base_url.value,
-            model: form.tested_model.value,
-            protocol: form.tested_protocol.value,
-            auth_type: form.tested_auth_type.value,
-            api_key: form.tested_api_key.value,
-          },
-          judge_model: {
-            provider_id: "judge_model",
-            base_url: form.judge_base_url.value,
-            model: form.judge_model.value,
-            protocol: form.judge_protocol.value,
-            auth_type: form.judge_auth_type.value,
-            api_key: form.judge_api_key.value,
-          },
+          tested_model: configPayloadFor("tested_model", "tested", form),
+          judge_model: configPayloadFor("judge_model", "judge", form),
         },
       }),
     });
@@ -517,6 +576,8 @@ async function saveConfig(event) {
 $("refreshJobs").addEventListener("click", refreshJobs);
 $("openLatest").addEventListener("click", openLatest);
 $("configForm").addEventListener("submit", saveConfig);
+$("probeTested").addEventListener("click", () => probeConfig("tested_model"));
+$("probeJudge").addEventListener("click", () => probeConfig("judge_model"));
 
 Promise.all([refreshJobs(), loadConfig()])
   .then(async () => {

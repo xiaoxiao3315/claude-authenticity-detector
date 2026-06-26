@@ -146,15 +146,24 @@
           </div>
           <form id="configForm" class="config-form">
             <label>被测模型 Base URL<input name="tested_base_url"></label>
-            <label>被测模型名称<input name="tested_model"></label>
+            <label>被测模型名称<input name="tested_model" list="testedModelOptions"></label>
+            <datalist id="testedModelOptions"></datalist>
             <label>被测协议类型<select name="tested_protocol"><option>openai_chat</option><option>anthropic_messages</option></select></label>
             <label>被测鉴权方式<select name="tested_auth_type"><option>bearer</option><option>x-api-key</option></select></label>
+            <label>被测推理强度<select name="tested_reasoning_effort"><option value="">默认</option><option value="none">none / 快速</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh / 最高</option></select></label>
             <label>被测 API Key<input name="tested_api_key" type="password" autocomplete="off" placeholder="留空则不修改"></label>
             <label>验收模型 Base URL<input name="judge_base_url"></label>
-            <label>验收模型名称<input name="judge_model"></label>
+            <label>验收模型名称<input name="judge_model" list="judgeModelOptions"></label>
+            <datalist id="judgeModelOptions"></datalist>
             <label>验收协议类型<select name="judge_protocol"><option>openai_chat</option><option>anthropic_messages</option></select></label>
             <label>验收鉴权方式<select name="judge_auth_type"><option>bearer</option><option>x-api-key</option></select></label>
+            <label>验收推理强度<select name="judge_reasoning_effort"><option value="">默认</option><option value="none">none / 快速</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh / 最高</option></select></label>
             <label>验收 API Key<input name="judge_api_key" type="password" autocomplete="off" placeholder="留空则不修改"></label>
+            <div class="config-actions">
+              <button id="probeTested" class="tool-button" type="button">检测被测 Key</button>
+              <button id="probeJudge" class="tool-button" type="button">检测验收 Key</button>
+            </div>
+            <div id="probeOutput" class="probe-output muted">尚未检测模型</div>
             <button class="tool-button primary" type="submit">保存配置</button>
           </form>
         </div>
@@ -169,6 +178,6 @@
       </section>
     </section>
   </main>
-  <script src="/web/app.js"></script>
+  <script src="/web/app.js?v=probe-config-1"></script>
 </body>
 </html>

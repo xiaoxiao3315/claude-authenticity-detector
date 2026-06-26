@@ -15,7 +15,16 @@ from redaction import redact_text
 
 
 DECISION_ORDER = {"GO": 0, "REVIEW": 1, "NO-GO": 2}
+OUTCOME_ORDER = {"PASS": 0, "RETEST": 1, "FAIL": 2, "PENDING": 3}
+DECISION_OUTCOME_MAP = {"GO": "PASS", "REVIEW": "RETEST", "NO-GO": "FAIL"}
 SUMMARY_SCHEMA_VERSION = "campaign_summary_v1"
+REQUIRED_SUMMARY_OUTCOME_KEYS = {
+    "model_outcome",
+    "gateway_outcome",
+    "overall_outcome",
+    "next_action",
+    "next_action_reason",
+}
 REQUIRED_SUMMARY_METRIC_KEYS = {
     "total_runs",
     "run_history_count",
@@ -158,7 +167,10 @@ def summary_needs_refresh(summary: dict[str, Any] | None) -> bool:
     if not REQUIRED_SUMMARY_METRIC_KEYS.issubset(metrics):
         return True
     decisions = summary.get("decisions") if isinstance(summary.get("decisions"), dict) else {}
-    return not {"model_confidence_decision", "gateway_reliability_decision", "overall_decision"}.issubset(decisions)
+    if not {"model_confidence_decision", "gateway_reliability_decision", "overall_decision"}.issubset(decisions):
+        return True
+    outcomes = summary.get("outcomes") if isinstance(summary.get("outcomes"), dict) else {}
+    return not REQUIRED_SUMMARY_OUTCOME_KEYS.issubset(outcomes)
 
 
 def list_campaign_dirs(campaigns_dir: Path) -> list[Path]:
@@ -228,6 +240,78 @@ def worst_decision(*decisions: str | None) -> str:
         if DECISION_ORDER.get(str(decision or "GO"), 0) > DECISION_ORDER[selected]:
             selected = str(decision)
     return selected
+
+
+def decision_to_outcome(decision: str | None) -> str:
+    value = str(decision or "").strip().upper()
+    if value in DECISION_OUTCOME_MAP:
+        return DECISION_OUTCOME_MAP[value]
+    if value in OUTCOME_ORDER:
+        return value
+    return "PENDING"
+
+
+def retest_action(
+    *,
+    model_decision: str,
+    model_reasons: list[str],
+    gateway_decision: str,
+    gateway_reasons: list[str],
+    overall_decision: str,
+) -> tuple[str, str]:
+    if overall_decision == "GO":
+        return "accept", "all campaign evidence met the current pass thresholds"
+    if overall_decision == "NO-GO":
+        return "reject", "one or more hard failure thresholds were triggered"
+
+    model_reason_text = " ".join(model_reasons)
+    gateway_reason_text = " ".join(gateway_reasons)
+    if model_decision == "REVIEW":
+        if "quality" in model_reason_text:
+            return "auto_retest_quality", "quality evidence is not strong enough; rerun the same benchmark with the configured judge model"
+        if "model" in model_reason_text or "protocol" in model_reason_text:
+            return "auto_retest_identity", "model identity or protocol evidence is incomplete; rerun identity/protocol checks"
+        return "auto_retest_quality", "model confidence evidence is incomplete; rerun to collect more judge/rule score samples"
+
+    if gateway_decision == "REVIEW":
+        if "latency" in gateway_reason_text:
+            return "auto_retest_latency", "P95 latency is above the threshold; rerun one same-job round to separate gateway/tested-model latency from judge latency"
+        return "auto_retest_gateway", "gateway transport evidence is incomplete or unstable; rerun with the same provider settings"
+
+    return "auto_retest_quality", "campaign evidence is incomplete; rerun to collect more samples"
+
+
+def campaign_outcomes(metrics: dict[str, Any], decisions: dict[str, Any]) -> dict[str, Any]:
+    model_decision = str(decisions.get("model_confidence_decision") or "REVIEW")
+    gateway_decision = str(decisions.get("gateway_reliability_decision") or "REVIEW")
+    overall_decision = str(decisions.get("overall_decision") or worst_decision(model_decision, gateway_decision))
+    model_reasons = decisions.get("model_confidence_reasons") if isinstance(decisions.get("model_confidence_reasons"), list) else []
+    gateway_reasons = decisions.get("gateway_reliability_reasons") if isinstance(decisions.get("gateway_reliability_reasons"), list) else []
+    next_action, next_action_reason = retest_action(
+        model_decision=model_decision,
+        model_reasons=[str(item) for item in model_reasons],
+        gateway_decision=gateway_decision,
+        gateway_reasons=[str(item) for item in gateway_reasons],
+        overall_decision=overall_decision,
+    )
+    return {
+        "model_outcome": decision_to_outcome(model_decision),
+        "gateway_outcome": decision_to_outcome(gateway_decision),
+        "overall_outcome": decision_to_outcome(overall_decision),
+        "next_action": next_action,
+        "next_action_reason": next_action_reason,
+        "outcome_mapping": "GO=PASS, REVIEW=RETEST, NO-GO=FAIL",
+        "automation_policy": "RETEST means explicit CLI retest is recommended; dashboard does not start live calls automatically",
+    }
+
+
+def outcomes_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    existing = summary.get("outcomes") if isinstance(summary.get("outcomes"), dict) else {}
+    if REQUIRED_SUMMARY_OUTCOME_KEYS.issubset(existing):
+        return existing
+    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
+    decisions = summary.get("decisions") if isinstance(summary.get("decisions"), dict) else {}
+    return campaign_outcomes(metrics, decisions)
 
 
 def model_confidence_decision(metrics: dict[str, Any]) -> tuple[str, list[str]]:
@@ -484,6 +568,14 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path, *, persist: bool
     model_decision, model_reasons = model_confidence_decision(metrics)
     gateway_decision, gateway_reasons = gateway_reliability_decision(metrics)
     overall = worst_decision(model_decision, gateway_decision)
+    decisions = {
+        "model_confidence_decision": model_decision,
+        "model_confidence_reasons": model_reasons,
+        "gateway_reliability_decision": gateway_decision,
+        "gateway_reliability_reasons": gateway_reasons,
+        "overall_decision": overall,
+    }
+    outcomes = campaign_outcomes(metrics, decisions)
     campaign_status = str(campaign.get("status") or "")
     if campaign_status == "running":
         status = "running"
@@ -507,13 +599,13 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path, *, persist: bool
         "comparison_key": compatibility_key(campaign),
         "comparison_key_id": compatibility_key_string(compatibility_key(campaign)),
         "metrics": metrics,
-        "decisions": {
-            "model_confidence_decision": model_decision,
-            "model_confidence_reasons": model_reasons,
-            "gateway_reliability_decision": gateway_decision,
-            "gateway_reliability_reasons": gateway_reasons,
-            "overall_decision": overall,
-        },
+        "decisions": decisions,
+        "outcomes": outcomes,
+        "model_outcome": outcomes["model_outcome"],
+        "gateway_outcome": outcomes["gateway_outcome"],
+        "overall_outcome": outcomes["overall_outcome"],
+        "next_action": outcomes["next_action"],
+        "next_action_reason": outcomes["next_action_reason"],
         "child_runs": child_runs,
         "trend": trend,
         "samples": samples,
@@ -528,6 +620,7 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path, *, persist: bool
 def summary_to_leaderboard_entry(summary: dict[str, Any]) -> dict[str, Any]:
     metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
     decisions = summary.get("decisions") if isinstance(summary.get("decisions"), dict) else {}
+    outcomes = outcomes_from_summary(summary)
     tested = summary.get("tested_model") if isinstance(summary.get("tested_model"), dict) else {}
     judge = summary.get("judge_model") if isinstance(summary.get("judge_model"), dict) else {}
     return {
@@ -558,6 +651,11 @@ def summary_to_leaderboard_entry(summary: dict[str, Any]) -> dict[str, Any]:
         "model_confidence_decision": decisions.get("model_confidence_decision"),
         "gateway_reliability_decision": decisions.get("gateway_reliability_decision"),
         "overall_decision": decisions.get("overall_decision"),
+        "model_outcome": outcomes.get("model_outcome"),
+        "gateway_outcome": outcomes.get("gateway_outcome"),
+        "overall_outcome": outcomes.get("overall_outcome"),
+        "next_action": outcomes.get("next_action"),
+        "next_action_reason": outcomes.get("next_action_reason"),
         "latest_tested_at": metrics.get("latest_tested_at") or summary.get("completed_at"),
         "status": summary.get("status"),
         "score": metrics.get("average_benchmark_score") or ((metrics.get("average_quality_score") or 0) * 100),

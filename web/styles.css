@@ -536,6 +536,24 @@ input, select {
   background: #fff;
   color: var(--ink);
 }
+.config-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.probe-output {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #f8fafc;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.probe-output strong {
+  color: var(--ink);
+}
 
 .log-panel { margin-top: 18px; }
 pre {

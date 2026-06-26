@@ -13,6 +13,9 @@
     "model": "gpt-4o-mini",
     "api_key_env": "JUDGE_MODEL_API_KEY",
     "protocol": "openai_chat",
-    "auth_type": "bearer"
+    "auth_type": "bearer",
+    "extra_body": {
+      "reasoning_effort": "xhigh"
+    }
   }
 }

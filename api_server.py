@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import time
+import urllib.error
+import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,9 +30,26 @@ from redaction import redact_text, redact_value
 ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / "runs"
 CAMPAIGNS_DIR = ROOT / "campaigns"
-WEB_DIR = ROOT / "web"
+REACT_DIST_DIR = ROOT.parent / "llm_eval_result_site" / "dist"
+WEB_DIR = REACT_DIST_DIR if REACT_DIST_DIR.exists() else ROOT / "web"
 PROVIDERS_LOCAL = ROOT / "configs" / "providers.local.json"
 LOCAL_SECRETS = ROOT / "local_secrets.env"
+ALLOWED_PROTOCOLS = {"openai_chat", "anthropic_messages"}
+ALLOWED_AUTH_TYPES = {"bearer", "x-api-key"}
+ALLOWED_REASONING_EFFORTS = {"", "none", "low", "medium", "high", "xhigh"}
+REASONING_PROBE_VALUES = ["none", "minimal", "low", "medium", "high", "xhigh"]
+TEXT_MODEL_HINTS = (
+    "gpt",
+    "claude",
+    "gemini",
+    "opus",
+    "sonnet",
+    "haiku",
+    "llama",
+    "qwen",
+    "deepseek",
+    "mistral",
+)
 
 
 def read_json(path: Path):
@@ -40,6 +60,21 @@ def read_json(path: Path):
 def write_json(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def sanitize_config_value(value):
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(token in lowered for token in ("authorization", "credential", "key", "password", "secret", "token")):
+                out[str(key)] = "[REDACTED]"
+            else:
+                out[str(key)] = sanitize_config_value(item)
+        return out
+    if isinstance(value, list):
+        return [sanitize_config_value(item) for item in value]
+    return value
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -412,6 +447,7 @@ def sanitized_config() -> dict:
     for label in ("tested_model", "judge_model"):
         item = data.get(label) or {}
         env_name = str(item.get("api_key_env") or "")
+        extra_body = item.get("extra_body") if isinstance(item.get("extra_body"), dict) else {}
         out["providers"][label] = {
             "provider_id": item.get("provider_id"),
             "base_url": item.get("base_url"),
@@ -420,6 +456,8 @@ def sanitized_config() -> dict:
             "auth_type": item.get("auth_type") or "bearer",
             "api_key_env": env_name,
             "api_key_present": bool(os.environ.get(env_name)),
+            "reasoning_effort": extra_body.get("reasoning_effort") or "",
+            "extra_body": sanitize_config_value(extra_body),
         }
     return out
 
@@ -450,14 +488,33 @@ def save_config(payload: dict) -> dict:
         item = providers.get(label)
         if not isinstance(item, dict):
             raise ValueError(f"{label} is required")
+        protocol = str(item["protocol"])
+        auth_type = str(item.get("auth_type") or "bearer")
+        if protocol not in ALLOWED_PROTOCOLS:
+            raise ValueError(f"{label}.protocol must be one of: {', '.join(sorted(ALLOWED_PROTOCOLS))}")
+        if auth_type not in ALLOWED_AUTH_TYPES:
+            raise ValueError(f"{label}.auth_type must be one of: {', '.join(sorted(ALLOWED_AUTH_TYPES))}")
+        existing = current.get(label, {}) if isinstance(current.get(label), dict) else {}
+        extra_body = dict(existing.get("extra_body") or {}) if isinstance(existing.get("extra_body"), dict) else {}
+        if isinstance(item.get("extra_body"), dict):
+            extra_body.update(item["extra_body"])
+        reasoning_effort = str(item.get("reasoning_effort") or "").strip()
+        if reasoning_effort not in ALLOWED_REASONING_EFFORTS:
+            raise ValueError(f"{label}.reasoning_effort must be one of: none, low, medium, high, xhigh")
+        if reasoning_effort:
+            extra_body["reasoning_effort"] = reasoning_effort
+        else:
+            extra_body.pop("reasoning_effort", None)
         current[label] = {
-            "provider_id": str(item.get("provider_id") or current.get(label, {}).get("provider_id") or label),
+            "provider_id": str(item.get("provider_id") or existing.get("provider_id") or label),
             "base_url": str(item["base_url"]).rstrip("/"),
             "model": str(item["model"]),
             "api_key_env": env_name,
-            "protocol": str(item["protocol"]),
-            "auth_type": str(item.get("auth_type") or "bearer"),
+            "protocol": protocol,
+            "auth_type": auth_type,
         }
+        if extra_body:
+            current[label]["extra_body"] = extra_body
         api_key = str(item.get("api_key") or "")
         if api_key:
             env_updates[env_name] = api_key
@@ -465,6 +522,168 @@ def save_config(payload: dict) -> dict:
     if env_updates:
         update_env_file(env_updates)
     return sanitized_config()
+
+
+def model_ids_from_payload(data) -> list[str]:
+    if isinstance(data, dict):
+        raw = data.get("data") or data.get("models") or data.get("items") or []
+    elif isinstance(data, list):
+        raw = data
+    else:
+        raw = []
+    ids: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            ids.append(item)
+        elif isinstance(item, dict):
+            value = item.get("id") or item.get("name") or item.get("model")
+            if value:
+                ids.append(str(value))
+    return ids
+
+
+def is_text_model(model_id: str) -> bool:
+    lowered = model_id.lower()
+    if "image" in lowered or "embedding" in lowered or "moderation" in lowered or "tts" in lowered:
+        return False
+    return any(hint in lowered for hint in TEXT_MODEL_HINTS)
+
+
+def provider_auth_headers(item: dict, secret: str) -> dict[str, str]:
+    auth_type = str(item.get("auth_type") or "bearer")
+    if auth_type == "bearer":
+        return {"Authorization": f"Bearer {secret}"}
+    if auth_type == "x-api-key":
+        return {"x-api-key": secret}
+    raise ValueError(f"unsupported auth_type: {auth_type}")
+
+
+def http_json(method: str, url: str, *, headers: dict[str, str], payload: dict | None = None, timeout: float = 30.0) -> tuple[int, dict, float]:
+    body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request_headers = dict(headers)
+    if payload is not None:
+        request_headers["content-type"] = "application/json"
+    request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+    started = time.perf_counter()
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        try:
+            data = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            data = {"body_preview": raw[:400]}
+        return int(response.status), data, elapsed_ms
+
+
+def probe_reasoning_efforts(item: dict, secret: str, model_id: str) -> dict:
+    if str(item.get("protocol") or "") != "openai_chat":
+        return {"supported": [], "rejected": [], "skipped": "reasoning_effort probe only supports openai_chat"}
+    base_url = str(item.get("base_url") or "").rstrip("/")
+    headers = provider_auth_headers(item, secret)
+    supported: list[dict] = []
+    rejected: list[dict] = []
+    for effort in REASONING_PROBE_VALUES:
+        payload = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "Reply exactly OK."}],
+            "max_tokens": 32,
+            "temperature": 0,
+            "reasoning_effort": effort,
+        }
+        try:
+            status, data, elapsed_ms = http_json("POST", f"{base_url}/v1/chat/completions", headers=headers, payload=payload, timeout=90.0)
+            choice = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
+            message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            supported.append(
+                {
+                    "value": effort,
+                    "status": status,
+                    "elapsed_ms": elapsed_ms,
+                    "model_returned": data.get("model") if isinstance(data, dict) else None,
+                    "output_tokens": ((data.get("usage") or {}).get("completion_tokens") if isinstance(data, dict) else None),
+                    "content_preview": str(message.get("content") or choice.get("text") or "")[:80],
+                }
+            )
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            rejected.append(
+                {
+                    "value": effort,
+                    "status": exc.code,
+                    "error": redact_text(body, max_chars=260),
+                }
+            )
+        except Exception as exc:
+            rejected.append({"value": effort, "status": None, "error": redact_text(f"{type(exc).__name__}: {exc}", max_chars=260)})
+    return {
+        "probe_model": model_id,
+        "supported": supported,
+        "supported_values": [item["value"] for item in supported],
+        "rejected": rejected,
+    }
+
+
+def probe_config_role(role: str, *, include_reasoning: bool = True) -> dict:
+    if role not in {"tested_model", "judge_model"}:
+        raise ValueError("role must be tested_model or judge_model")
+    load_local_env()
+    if not PROVIDERS_LOCAL.exists():
+        raise FileNotFoundError("providers.local.json")
+    data = read_json(PROVIDERS_LOCAL)
+    item = data.get(role)
+    if not isinstance(item, dict):
+        raise ValueError(f"{role} is not configured")
+    env_name = str(item.get("api_key_env") or "")
+    secret = os.environ.get(env_name)
+    if not secret:
+        return {
+            "role": role,
+            "provider_id": item.get("provider_id"),
+            "base_url_host": urlparse(str(item.get("base_url") or "")).netloc,
+            "api_key_env": env_name,
+            "api_key_present": False,
+            "error": f"missing environment variable {env_name}",
+        }
+    base_url = str(item.get("base_url") or "").rstrip("/")
+    headers = provider_auth_headers(item, secret)
+    try:
+        status, payload, elapsed_ms = http_json("GET", f"{base_url}/v1/models", headers=headers, timeout=30.0)
+        models = model_ids_from_payload(payload)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "role": role,
+            "provider_id": item.get("provider_id"),
+            "base_url_host": urlparse(base_url).netloc,
+            "api_key_env": env_name,
+            "api_key_present": True,
+            "models_ok": False,
+            "models_status": exc.code,
+            "error": redact_text(body, max_chars=500),
+        }
+    text_models = [model for model in models if is_text_model(model)]
+    result = {
+        "role": role,
+        "provider_id": item.get("provider_id"),
+        "base_url_host": urlparse(base_url).netloc,
+        "api_key_env": env_name,
+        "api_key_present": True,
+        "protocol": item.get("protocol"),
+        "auth_type": item.get("auth_type") or "bearer",
+        "configured_model": item.get("model"),
+        "configured_reasoning_effort": ((item.get("extra_body") or {}).get("reasoning_effort") if isinstance(item.get("extra_body"), dict) else ""),
+        "models_ok": status == 200,
+        "models_status": status,
+        "models_elapsed_ms": elapsed_ms,
+        "model_count": len(models),
+        "models": models,
+        "text_models": text_models,
+    }
+    configured_model = str(item.get("model") or "")
+    probe_model = configured_model if configured_model else (text_models[0] if text_models else "")
+    if include_reasoning and probe_model:
+        result["reasoning_probe"] = probe_reasoning_efforts(item, secret, probe_model)
+    return result
 
 
 def query_bool(qs: dict[str, list[str]], name: str, default: bool = False) -> bool:
@@ -488,7 +707,7 @@ def artifact_listing(root: Path) -> list[dict]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EvalAutomationAPI/0.2.2"
+    server_version = "EvalAutomationAPI/0.2.3"
 
     def send_json(self, value, status: int = 200) -> None:
         body = json.dumps(redact_value(value), ensure_ascii=False, indent=2).encode("utf-8")
@@ -505,7 +724,12 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         try:
-            if path == "/api/config":
+            if path == "/api/config/probe":
+                qs = parse_qs(parsed.query)
+                role = (qs.get("role") or ["judge_model"])[0]
+                include_reasoning = query_bool(qs, "reasoning", default=True)
+                self.send_json(probe_config_role(role, include_reasoning=include_reasoning))
+            elif path == "/api/config":
                 self.send_json(sanitized_config())
             elif path == "/api/leaderboard":
                 qs = parse_qs(parsed.query)
@@ -560,6 +784,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/api/jobs/"):
                 self.handle_job_get(path)
             else:
+                if path.startswith("/api/"):
+                    self.send_error_json(HTTPStatus.NOT_FOUND, "unknown api endpoint")
+                    return
                 self.serve_static(path)
         except FileNotFoundError:
             self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
@@ -692,7 +919,10 @@ class Handler(BaseHTTPRequestHandler):
         if WEB_DIR.resolve() not in file_path.parents and file_path != (WEB_DIR / "index.html").resolve():
             raise ValueError("invalid static path")
         if not file_path.exists() or not file_path.is_file():
-            raise FileNotFoundError(str(file_path))
+            if file_path.suffix == "":
+                file_path = (WEB_DIR / "index.html").resolve()
+            else:
+                raise FileNotFoundError(str(file_path))
         body = file_path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("content-type", mimetypes.guess_type(file_path.name)[0] or "application/octet-stream")

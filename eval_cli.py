@@ -11,7 +11,7 @@ import sys
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -38,6 +38,7 @@ from campaigns import (
     load_campaign,
     load_run_index,
     load_summary,
+    outcomes_from_summary,
     safe_campaign_id,
     summarize_campaign,
     write_json as write_campaign_json,
@@ -84,6 +85,7 @@ class ModelConfig:
     auth_type: str = "bearer"
     provider_channel: str = "gateway"
     provider_display_name: str | None = None
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -186,6 +188,35 @@ def base_url_host(base_url: str) -> str | None:
     return parsed.netloc or parsed.path or None
 
 
+SENSITIVE_CONFIG_KEY_TOKENS = ("authorization", "credential", "key", "password", "secret", "token")
+
+
+def sanitize_config_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = str(key).lower()
+            if any(token in normalized for token in SENSITIVE_CONFIG_KEY_TOKENS):
+                out[str(key)] = "[REDACTED]"
+            else:
+                out[str(key)] = sanitize_config_value(item)
+        return out
+    if isinstance(value, list):
+        return [sanitize_config_value(item) for item in value]
+    return value
+
+
+def load_extra_body(raw: dict[str, Any], label: str) -> dict[str, Any]:
+    value = raw.get("extra_body") or {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{label}.extra_body must be a JSON object when provided")
+    try:
+        json.dumps(value, ensure_ascii=False)
+    except TypeError as exc:
+        raise ValueError(f"{label}.extra_body must be JSON serializable") from exc
+    return dict(value)
+
+
 def load_model_config(raw: dict[str, Any], label: str) -> ModelConfig:
     protocol = str(raw.get("protocol") or "").strip()
     if protocol not in ALLOWED_PROTOCOLS:
@@ -202,6 +233,7 @@ def load_model_config(raw: dict[str, Any], label: str) -> ModelConfig:
         auth_type=auth_type,
         provider_channel=str(raw.get("provider_channel") or "gateway"),
         provider_display_name=str(raw.get("provider_display_name") or raw["provider_id"]),
+        extra_body=load_extra_body(raw, label),
     )
 
 
@@ -231,6 +263,7 @@ MODEL_OVERRIDE_FIELDS = (
     "protocol",
     "auth_type",
     "display_name",
+    "reasoning_effort",
 )
 
 
@@ -253,13 +286,21 @@ def apply_model_overrides(models: dict[str, ModelConfig], args: argparse.Namespa
         protocol = _optional_arg(args, f"{prefix}_protocol")
         auth_type = _optional_arg(args, f"{prefix}_auth_type")
         display_name = _optional_arg(args, f"{prefix}_display_name")
+        reasoning_effort = _optional_arg(args, f"{prefix}_reasoning_effort")
 
         if protocol and protocol not in ALLOWED_PROTOCOLS:
             raise ValueError(f"--{prefix}-protocol must be one of: {', '.join(sorted(ALLOWED_PROTOCOLS))}")
         if auth_type and auth_type not in ALLOWED_AUTH_TYPES:
             raise ValueError(f"--{prefix}-auth-type must be one of: {', '.join(sorted(ALLOWED_AUTH_TYPES))}")
+        if reasoning_effort and reasoning_effort not in {"default", "none", "low", "medium", "high", "xhigh"}:
+            raise ValueError(f"--{prefix}-reasoning-effort must be one of: default, none, low, medium, high, xhigh")
 
-        if any([provider_id, base_url, model_name, api_key_env, protocol, auth_type, display_name]):
+        if any([provider_id, base_url, model_name, api_key_env, protocol, auth_type, display_name, reasoning_effort]):
+            extra_body = dict(current.extra_body)
+            if reasoning_effort == "default":
+                extra_body.pop("reasoning_effort", None)
+            elif reasoning_effort:
+                extra_body["reasoning_effort"] = reasoning_effort
             out[label] = replace(
                 current,
                 provider_id=provider_id or current.provider_id,
@@ -269,6 +310,7 @@ def apply_model_overrides(models: dict[str, ModelConfig], args: argparse.Namespa
                 protocol=protocol or current.protocol,
                 auth_type=auth_type or current.auth_type,
                 provider_display_name=display_name or provider_id or current.provider_display_name,
+                extra_body=extra_body,
             )
     return out
 
@@ -285,6 +327,8 @@ def sanitized_models(models: dict[str, ModelConfig]) -> dict[str, Any]:
             "protocol": model.protocol,
             "auth_type": model.auth_type,
         }
+        if model.extra_body:
+            out[label]["extra_body"] = sanitize_config_value(model.extra_body)
     return out
 
 
@@ -296,7 +340,7 @@ def key_fingerprint(env_name: str) -> str | None:
 
 
 def campaign_model_identity(model: ModelConfig, *, include_key_fingerprint: bool = False) -> dict[str, Any]:
-    return {
+    identity = {
         "provider_id": model.provider_id,
         "base_url_host": base_url_host(model.base_url),
         "model": model.model,
@@ -307,6 +351,9 @@ def campaign_model_identity(model: ModelConfig, *, include_key_fingerprint: bool
         "provider_channel": model.provider_channel,
         "provider_display_name": model.provider_display_name or model.provider_id,
     }
+    if model.extra_body:
+        identity["extra_body"] = sanitize_config_value(model.extra_body)
+    return identity
 
 
 def git_commit() -> str | None:
@@ -439,6 +486,13 @@ def response_request_id(headers: Any) -> str | None:
     return None
 
 
+def apply_extra_body(payload: dict[str, Any], model: ModelConfig) -> None:
+    for key, value in model.extra_body.items():
+        if key in payload:
+            raise ValueError(f"{model.provider_id}.extra_body cannot override core request field: {key}")
+        payload[key] = value
+
+
 def dry_completion(model: ModelConfig, messages: list[dict[str, str]], max_tokens: int) -> Completion:
     user_text = " ".join(message.get("content", "") for message in messages if message.get("role") == "user")
     if model.provider_id.startswith("judge"):
@@ -497,6 +551,7 @@ def call_model(
         payload = {"model": model.model, "messages": messages, "max_tokens": max_tokens}
         if temperature is not None:
             payload["temperature"] = temperature
+        apply_extra_body(payload, model)
     elif model.protocol == "anthropic_messages":
         url = f"{model.base_url}/v1/messages"
         headers = {
@@ -511,6 +566,7 @@ def call_model(
             payload["system"] = "\n\n".join(system_messages)
         if temperature is not None:
             payload["temperature"] = temperature
+        apply_extra_body(payload, model)
     else:
         raise ValueError(f"unsupported protocol: {model.protocol}")
 
@@ -524,6 +580,7 @@ def call_model(
             "auth_type": model.auth_type,
             "model": model.model,
             "url_path": url.replace(model.base_url, ""),
+            "extra_body_keys": sorted(model.extra_body),
         },
     )
     started = time.perf_counter()
@@ -854,6 +911,7 @@ def run_record(
         "model": tested_model.model,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "extra_body": sanitize_config_value(tested_model.extra_body),
         "prompt_hash": text_hash(str(task.get("prompt") or "")),
         "messages_count": 1,
     }
@@ -896,6 +954,7 @@ def run_record(
             "request_hash": stable_json_hash(request_fingerprint),
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "extra_body": sanitize_config_value(tested_model.extra_body),
             "system_present": False,
             "messages_count": 1,
             "prompt_hash": request_fingerprint["prompt_hash"],
@@ -1546,6 +1605,8 @@ def run_campaign(args: argparse.Namespace) -> int:
                     "total_runs": summary["metrics"]["total_runs"],
                     "total_cases": summary["metrics"]["total_cases"],
                     "overall_decision": summary["decisions"]["overall_decision"],
+                    "overall_outcome": summary.get("outcomes", {}).get("overall_outcome"),
+                    "next_action": summary.get("outcomes", {}).get("next_action"),
                     "skipped_completed_rounds": skipped_rounds,
                 },
             },
@@ -1578,6 +1639,7 @@ def campaign_status(args: argparse.Namespace) -> int:
         "repeat": campaign_doc.get("repeat"),
         "metrics": summary.get("metrics"),
         "decisions": summary.get("decisions"),
+        "outcomes": outcomes_from_summary(summary),
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
@@ -1604,6 +1666,75 @@ def campaign_export(args: argparse.Namespace) -> int:
     zip_path = export_campaign(out_dir, runs_dir, include_raw=bool(getattr(args, "include_raw", False)))
     print(json.dumps({"campaign_id": args.campaign_id, "artifact": str(zip_path)}, ensure_ascii=False, indent=2))
     return 0
+
+
+def campaign_retest(args: argparse.Namespace) -> int:
+    campaigns_dir, runs_dir = campaign_paths(args)
+    source_id = safe_campaign_id(args.campaign_id)
+    source_dir = campaign_dir(campaigns_dir, source_id)
+    if not source_dir.exists():
+        raise FileNotFoundError(f"campaign not found: {source_id}")
+    source_campaign = load_campaign(source_dir)
+    source_summary = load_summary(source_dir) or summarize_campaign(source_dir, runs_dir)
+    outcomes = outcomes_from_summary(source_summary)
+    overall_outcome = str(outcomes.get("overall_outcome") or "PENDING")
+    if overall_outcome != "RETEST" and not bool(getattr(args, "force", False)):
+        print(
+            json.dumps(
+                {
+                    "campaign_id": source_id,
+                    "status": "skipped",
+                    "overall_outcome": overall_outcome,
+                    "reason": "campaign-retest only reruns RETEST campaigns unless --force is provided",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    new_campaign_id = safe_campaign_id(
+        args.new_campaign_id or f"{source_id}-RETEST-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    )
+    retest_repeat = int(args.repeat or 1)
+    if retest_repeat < 1:
+        raise ValueError("--repeat must be >= 1")
+    live = bool(args.live or (source_campaign.get("live_provider") is True and not bool(getattr(args, "dry_run", False))))
+    child_args = argparse.Namespace(
+        job=args.job or source_campaign.get("job") or DEFAULT_JOB,
+        providers=args.providers,
+        runs_dir=runs_dir,
+        campaigns_dir=campaigns_dir,
+        campaign_id=new_campaign_id,
+        repeat=retest_repeat,
+        resume=False,
+        live=live,
+        timeout=args.timeout,
+        tested_max_tokens=args.tested_max_tokens,
+        judge_max_tokens=args.judge_max_tokens,
+        max_concurrency=getattr(args, "max_concurrency", None) or 1,
+        retries=getattr(args, "retries", None),
+        retry_backoff=getattr(args, "retry_backoff", None),
+        require_go=False,
+        skip_trace_evaluation=getattr(args, "skip_trace_evaluation", False),
+        **model_override_kwargs(args),
+    )
+    print(
+        json.dumps(
+            {
+                "source_campaign_id": source_id,
+                "retest_campaign_id": new_campaign_id,
+                "source_overall_outcome": overall_outcome,
+                "source_next_action": outcomes.get("next_action"),
+                "source_next_action_reason": outcomes.get("next_action_reason"),
+                "live_provider": live,
+                "repeat": retest_repeat,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return run_campaign(child_args)
 
 
 def baseline_campaign_path(args: argparse.Namespace, campaigns_dir: Path) -> Path | None:
@@ -1900,6 +2031,11 @@ def add_model_override_args(parser: argparse.ArgumentParser) -> None:
         parser.add_argument(f"--{prefix}-protocol", choices=sorted(ALLOWED_PROTOCOLS), help=f"override {label} protocol")
         parser.add_argument(f"--{prefix}-auth-type", choices=sorted(ALLOWED_AUTH_TYPES), help=f"override {label} auth type")
         parser.add_argument(f"--{prefix}-display-name", help=f"override {label} display name for this run")
+        parser.add_argument(
+            f"--{prefix}-reasoning-effort",
+            choices=["default", "none", "low", "medium", "high", "xhigh"],
+            help=f"override {label} reasoning_effort extra body field",
+        )
 
 
 def main() -> int:
@@ -1987,6 +2123,27 @@ def main() -> int:
     campaign_export_parser.add_argument("--runs-dir", type=Path)
     campaign_export_parser.add_argument("--include-raw", action="store_true", help="include raw responses, judge responses, and event logs")
     campaign_export_parser.set_defaults(func=campaign_export)
+
+    campaign_retest_parser = sub.add_parser("campaign-retest", help="create an explicit retest campaign for a RETEST outcome")
+    campaign_retest_parser.add_argument("--campaign-id", required=True, help="source campaign id")
+    campaign_retest_parser.add_argument("--new-campaign-id", help="explicit retest campaign id")
+    campaign_retest_parser.add_argument("--job", help="override job name or path; defaults to source campaign job")
+    campaign_retest_parser.add_argument("--providers", type=Path, help="providers config path")
+    campaign_retest_parser.add_argument("--runs-dir", type=Path, help="runs directory")
+    campaign_retest_parser.add_argument("--campaigns-dir", type=Path, help="campaigns directory")
+    campaign_retest_parser.add_argument("--repeat", type=int, default=1, help="number of retest child runs")
+    campaign_retest_parser.add_argument("--live", action="store_true", help="force live provider calls")
+    campaign_retest_parser.add_argument("--dry-run", action="store_true", help="force dry-run retest even if the source campaign was live")
+    campaign_retest_parser.add_argument("--force", action="store_true", help="allow retesting PASS or FAIL campaigns")
+    campaign_retest_parser.add_argument("--timeout", type=float, help="per-request timeout seconds")
+    campaign_retest_parser.add_argument("--tested-max-tokens", type=int)
+    campaign_retest_parser.add_argument("--judge-max-tokens", type=int)
+    campaign_retest_parser.add_argument("--max-concurrency", type=int, help="bounded task-level concurrency for each child run; defaults to 1")
+    campaign_retest_parser.add_argument("--retries", type=int, help="retry transient live provider failures this many times")
+    campaign_retest_parser.add_argument("--retry-backoff", type=float, help="initial retry backoff seconds for live provider failures")
+    campaign_retest_parser.add_argument("--skip-trace-evaluation", action="store_true", help="skip the default post-run trace evidence pass for child runs")
+    add_model_override_args(campaign_retest_parser)
+    campaign_retest_parser.set_defaults(func=campaign_retest)
 
     authenticity_parser = sub.add_parser("authenticity", help="run or refresh provider authenticity evidence for a campaign")
     authenticity_parser.add_argument("--job", default=DEFAULT_JOB, help="job name or path")
