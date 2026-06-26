@@ -2199,7 +2199,7 @@ def needle(args: argparse.Namespace) -> int:
 
     http_status = 200
     observed_input_tokens = None
-    recall = {"score": None, "details": "dry-run: no live response"}
+    recall = {"score": None, "details": "not measured"}
     if not live:
         result = {
             "probe": "needle_recall",
@@ -2226,15 +2226,21 @@ def needle(args: argparse.Namespace) -> int:
         err = str(completion.metrics.error or "")
         m = re.search(r"HTTP\s+(\d+)", err)
         http_status = int(m.group(1)) if m else 0
+        recall = {"score": None, "details": f"request failed (HTTP {http_status}); not measured"}
     else:
         obs = _raw_protocol_observation(completion, model)
         observed_input_tokens = obs["input_tokens"]
         recall = score_needle_recall(canary, completion.text)
 
+    def _num(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
     truncation = evaluate_silent_truncation(
         sent_estimate_tokens=sent_estimate_tokens,
-        observed_input_tokens=numeric(observed_input_tokens) if observed_input_tokens is not None else None,
-        prefix_tokens=numeric(prefix_tokens) if prefix_tokens is not None else None,
+        observed_input_tokens=_num(observed_input_tokens),
+        prefix_tokens=_num(prefix_tokens),
         http_status=http_status,
     )
     verdict = "fake_1m_silent_truncation" if truncation.get("silent_truncation") else (
