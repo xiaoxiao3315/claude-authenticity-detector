@@ -88,14 +88,18 @@ def make_sample(
     probe_id: str | None = None,
     expected_input_tokens: Any = None,
     live: bool = False,
+    ok: bool = True,
 ) -> dict[str, Any]:
     """Build one collection sample from RAW observed values.
 
     raw_stop_reason / raw_usage_keys must come from the upstream response as-is,
     not from CallMetrics (which applies a "stop" / model fallback).
+    ok=False marks a failed request (HTTP error / timeout) — distinguishes
+    "request failed" from "succeeded but field missing".
     """
     return {
         "protocol": protocol,
+        "ok": bool(ok),
         "raw_stop_reason": None if raw_stop_reason is None else str(raw_stop_reason),
         "raw_usage_keys": sorted(raw_usage_keys or []),
         "usage_naming_dialect": usage_naming_dialect(raw_usage_keys or []),
@@ -147,12 +151,15 @@ def build_baseline_from_samples(
     usage_dialects: Counter[str] = Counter()
     anthropic_req_id = 0
     anthropic_headers = 0
+    failed_requests = 0
     input_token_values: list[float] = []
     latency_values: list[float] = []
     # per-probe input_tokens, for tokenizer expected windows
     probe_tokens: dict[str, list[float]] = {}
 
     for sample in samples:
+        if sample.get("ok") is False:
+            failed_requests += 1
         sr = sample.get("raw_stop_reason")
         if sr is not None:
             stop_counter[str(sr)] += 1
@@ -180,6 +187,8 @@ def build_baseline_from_samples(
         "baseline_id": baseline_id,
         "evidence_status": "live_observed" if live else "dry_run_reference_only",
         "sample_count": total,
+        "failed_request_count": failed_requests,
+        "request_failure_rate": _rate(failed_requests, total),
         "collected_window": collected_window or {},
         "source": {
             "provider_id": source.get("provider_id"),
@@ -273,6 +282,28 @@ def compare_to_baseline(
 
     base_fp = baseline.get("protocol_fingerprint") or {}
     obs_fp = observed.get("protocol_fingerprint") or {}
+
+    # If most observed requests FAILED (HTTP error / 429 / timeout), we cannot
+    # fingerprint the endpoint at all — that is "insufficient: requests failed",
+    # NOT a suspicious empty fingerprint. Distinguishes a rate-limited/broken key
+    # from a real wrapper that returns empty fields on successful calls.
+    obs_fail_rate = numeric(observed.get("request_failure_rate"))
+    obs_success = obs_fp.get("stop_reason_counts") or {}
+    if (obs_fail_rate is not None and obs_fail_rate >= 0.5) or (
+        not obs_success and (observed.get("failed_request_count") or 0) > 0
+    ):
+        return {
+            "schema_version": BASELINE_COMPARISON_RESULT_VERSION,
+            "baseline_id": baseline.get("baseline_id"),
+            "verdict": VERDICT_INSUFFICIENT,
+            "confidence": 0.0,
+            "reasons": ["observed_requests_failed", f"failure_rate:{obs_fail_rate}"],
+            "evidence_chain": [
+                {"check": "request_failure_rate", "baseline": baseline.get("request_failure_rate"), "observed": obs_fail_rate},
+                {"check": "failed_request_count", "observed": observed.get("failed_request_count")},
+            ],
+            "note": "endpoint mostly returned errors (e.g. 429 rate-limit/quota); cannot fingerprint — retry with a healthy key",
+        }
 
     hard_fail = False
 
@@ -755,6 +786,17 @@ def _self_test() -> None:
         "sse": {"sse_family": "openai_sse", "is_claude_shaped": False},
     })
     assert sse_fail["verdict"] == VERDICT_WRAPPER, sse_fail
+
+    # mostly-failed requests (e.g. 429) -> insufficient, NOT a suspicious empty fingerprint
+    failed_samples = [make_sample(
+        protocol="anthropic_messages", raw_stop_reason=None, raw_usage_keys=[],
+        input_tokens=None, output_tokens=None, total_ms=None, probe_id="canary_mixed",
+        live=True, ok=False,
+    ) for _ in range(6)]
+    failed_obs = build_baseline_from_samples(failed_samples, source, baseline_id="failed", live=True)
+    assert failed_obs["request_failure_rate"] == 1.0, failed_obs
+    failed_cmp = compare_to_baseline(failed_obs, baseline)
+    assert failed_cmp["verdict"] == VERDICT_INSUFFICIENT and "observed_requests_failed" in failed_cmp["reasons"], failed_cmp
 
     wrapper = compare_to_baseline(_fake_wrapper_observed(), baseline)
     assert wrapper["verdict"] == VERDICT_WRAPPER, wrapper

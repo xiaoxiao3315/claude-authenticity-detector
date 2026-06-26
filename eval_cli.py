@@ -256,10 +256,18 @@ def load_two_model_config(path: Path) -> dict[str, ModelConfig]:
     data = read_json(path)
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a JSON object")
-    return {
+    models = {
         "tested_model": load_model_config(data["tested_model"], "tested_model"),
         "judge_model": load_model_config(data["judge_model"], "judge_model"),
     }
+    # also load any extra provider roles (e.g. suspect_model, official_baseline)
+    # so authenticity verification can target arbitrary endpoints.
+    for label, raw in data.items():
+        if label in models or not isinstance(raw, dict):
+            continue
+        if "base_url" in raw and "model" in raw and "api_key_env" in raw:
+            models[label] = load_model_config(raw, label)
+    return models
 
 
 def _optional_arg(args: argparse.Namespace, name: str) -> str | None:
@@ -1854,12 +1862,19 @@ def _collect_baseline_samples(
     samples_per_probe: int,
     live: bool,
     events_file: Path,
+    request_delay: float = 0.0,
+    retries: int = 1,
+    retry_backoff: float = 0.5,
 ) -> list[dict[str, Any]]:
     collected: list[dict[str, Any]] = []
     timeout = httpx.Timeout(120.0)
+    first = True
     with httpx.Client(timeout=timeout) as client:
         for probe in BASELINE_CANARY_PROBES:
             for _ in range(max(1, samples_per_probe)):
+                if request_delay > 0 and not first:
+                    time.sleep(request_delay)
+                first = False
                 messages = [{"role": "user", "content": probe["text"]}]
                 completion = call_model_with_retries(
                     client=client,
@@ -1869,8 +1884,8 @@ def _collect_baseline_samples(
                     temperature=0,
                     live=live,
                     events_file=events_file,
-                    retries=1,
-                    retry_backoff=0.5,
+                    retries=retries,
+                    retry_backoff=retry_backoff,
                 )
                 obs = _raw_protocol_observation(completion, model)
                 collected.append(make_sample(
@@ -1884,6 +1899,7 @@ def _collect_baseline_samples(
                     has_anthropic_headers=False,
                     probe_id=probe["id"],
                     live=live,
+                    ok=bool(completion.metrics.ok),
                 ))
     return collected
 
@@ -2014,6 +2030,9 @@ def verify_endpoint(args: argparse.Namespace) -> int:
     samples = _collect_baseline_samples(
         model, samples_per_probe=max(1, int(getattr(args, "samples", 3) or 3)),
         live=live, events_file=events_file,
+        request_delay=float(getattr(args, "request_delay", 0.0) or 0.0),
+        retries=int(getattr(args, "retries", 1) or 1),
+        retry_backoff=float(getattr(args, "retry_backoff", 0.5) or 0.5),
     )
     observed = build_baseline_from_samples(
         samples,
@@ -2738,6 +2757,9 @@ def main() -> int:
     verify_parser.add_argument("--live", action="store_true", help="REAL API calls to the suspect (cost)")
     verify_parser.add_argument("--json", action="store_true", help="also print raw JSON verdict")
     verify_parser.add_argument("--with-sse", action="store_true", help="also run the SSE event-order probe (extra live request)")
+    verify_parser.add_argument("--request-delay", type=float, default=0.0, help="seconds to wait between probe requests (avoid upstream rate limits)")
+    verify_parser.add_argument("--retries", type=int, default=1, help="retries per request on transient failure (429/5xx)")
+    verify_parser.add_argument("--retry-backoff", type=float, default=0.5, help="base backoff seconds between retries")
     verify_parser.set_defaults(func=verify_endpoint)
 
     error_env_parser = sub.add_parser("error-envelope", help="#8 probe: send malformed requests, classify error-body dialect (anthropic/openai/generic)")
