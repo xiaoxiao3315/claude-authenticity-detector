@@ -726,6 +726,15 @@ def evaluate_policy(
     else:
         passed_rules.append("model_identity_ok")
 
+    # Fake-1M / silent-truncation: needle probe reported HTTP 200 but input_tokens
+    # far below sent. Hard blocker. Absent (no needle evidence) -> 0 -> no-op.
+    silent_truncation_count = metrics.get("silent_truncation_count", 0) or 0
+    silent_truncation_no_go = numeric(thresholds.get("silent_truncation_no_go"), 0)
+    if silent_truncation_count > silent_truncation_no_go:
+        blockers.append(issue("silent_truncation_blocks", "needle", "silent_truncation_count", silent_truncation_count, silent_truncation_no_go, "endpoint silently truncated a long-context request (suspected fake 1M)"))
+    elif metrics.get("needle_found"):
+        passed_rules.append("needle_context_ok")
+
     success_rate = metrics.get("success_rate")
     success_no_go = numeric(thresholds.get("success_rate_no_go"), 0.95)
     success_review = numeric(thresholds.get("success_rate_review"), 0.98)
@@ -1383,6 +1392,24 @@ def self_test() -> None:
         trace_strict_items = trace_strict_result["records"][0]["review_items"]
         assert any(item["rule_id"] == "trace_evaluation_incomplete_requires_review" for item in trace_strict_items)
         assert any(item["rule_id"] == "trace_evaluation_coverage_low" for item in trace_strict_items)
+
+        # silent_truncation (fake-1M) is a hard blocker; absent metric is a no-op
+        st_policy = {"thresholds": {"silent_truncation_no_go": 0}}
+        base_metrics = {"sample_count": 5, "success_rate": 1.0, "compatibility_found": True, "compatibility_suite_status": "PASS"}
+        empty = {}
+        d_block, blockers, _, _ = evaluate_policy(
+            policy=st_policy, source_run_id="r", provider_id="p",
+            metrics={**base_metrics, "silent_truncation_count": 1, "needle_found": True},
+            compatibility=empty, trace_evaluation=empty, rescore=empty, require_rescore=False,
+        )
+        assert d_block == NO_GO and any(b["rule_id"] == "silent_truncation_blocks" for b in blockers)
+        _, blockers_none, _, passed = evaluate_policy(
+            policy=st_policy, source_run_id="r", provider_id="p",
+            metrics={**base_metrics, "silent_truncation_count": 0, "needle_found": True},
+            compatibility=empty, trace_evaluation=empty, rescore=empty, require_rescore=False,
+        )
+        assert not any(b["rule_id"] == "silent_truncation_blocks" for b in blockers_none)
+        assert "needle_context_ok" in passed
 
     print("quality gate self-test ok")
 

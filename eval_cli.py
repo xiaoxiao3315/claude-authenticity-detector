@@ -48,6 +48,7 @@ from baseline_registry import (
     DEFAULT_BASELINES_DIR,
     build_baseline_from_samples,
     compare_to_baseline,
+    derive_token_windows,
     evaluate_silent_truncation,
     key_fingerprint,
     load_baseline,
@@ -1933,6 +1934,25 @@ def baseline_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def baseline_derive_windows(args: argparse.Namespace) -> int:
+    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+    doc = load_baseline(baselines_dir, args.baseline_id)
+    if doc is None:
+        raise ValueError(f"baseline not found: {args.baseline_id}")
+    derived = derive_token_windows(
+        doc,
+        long_probe=str(getattr(args, "long_probe", None) or "canary_mixed"),
+        short_probe=str(getattr(args, "short_probe", None) or "canary_zh"),
+    )
+    if derived.get("ok") and getattr(args, "write", False):
+        out_path = baselines_dir / args.baseline_id.replace("/", "_").replace("\\", "_") / "token_probe_windows.json"
+        from baseline_registry import write_json as _wj
+        _wj(out_path, derived)
+        derived["written_to"] = str(out_path)
+    print(json.dumps(derived, ensure_ascii=False, indent=2))
+    return 0 if derived.get("ok") else 1
+
+
 def baseline_compare(args: argparse.Namespace) -> int:
     baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
     baseline = load_baseline(baselines_dir, args.baseline_id)
@@ -2495,6 +2515,14 @@ def main() -> int:
     baseline_inspect_parser.add_argument("--baseline-id", required=True)
     baseline_inspect_parser.add_argument("--baselines-dir", type=Path)
     baseline_inspect_parser.set_defaults(func=baseline_inspect)
+
+    baseline_derive_parser = sub.add_parser("baseline-derive-windows", help="derive token_count_check windows from a trusted live baseline (no offline tokenizer needed)")
+    baseline_derive_parser.add_argument("--baseline-id", required=True)
+    baseline_derive_parser.add_argument("--baselines-dir", type=Path)
+    baseline_derive_parser.add_argument("--long-probe", default="canary_mixed")
+    baseline_derive_parser.add_argument("--short-probe", default="canary_zh")
+    baseline_derive_parser.add_argument("--write", action="store_true", help="write token_probe_windows.json into the baseline dir")
+    baseline_derive_parser.set_defaults(func=baseline_derive_windows)
 
     baseline_compare_parser = sub.add_parser("baseline-compare", help="compare a suspect provider against a trusted baseline")
     baseline_compare_parser.add_argument("--baseline-id", required=True)

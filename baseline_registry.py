@@ -438,6 +438,58 @@ def evaluate_silent_truncation(
     }
 
 
+def derive_token_windows(
+    baseline: dict[str, Any],
+    *,
+    long_probe: str = "canary_mixed",
+    short_probe: str = "canary_zh",
+    tolerance: float = 0.05,
+    abs_floor: float = 8.0,
+) -> dict[str, Any]:
+    """Derive token_count_check windows from a TRUSTED live baseline's observed
+    per-probe input_tokens (no offline tokenizer needed).
+
+    For each probe: claude_window = mean ± max(tolerance*mean, abs_floor).
+    Also derives the prefix-free claude_delta_window between long and short probes
+    (their observed-token difference cancels the shared injected prefix).
+    """
+    if baseline.get("evidence_status") != "live_observed":
+        return {"ok": False, "error": "baseline is not live_observed; cannot derive real windows"}
+    windows = (baseline.get("behavior") or {}).get("tokenizer_probe_windows") or {}
+
+    def _win(mean: float | None) -> list[float] | None:
+        if mean is None:
+            return None
+        tol = max(tolerance * mean, abs_floor)
+        return [round(mean - tol, 1), round(mean + tol, 1)]
+
+    per_probe: dict[str, Any] = {}
+    means: dict[str, float] = {}
+    for probe_id, dist in windows.items():
+        if isinstance(dist, dict) and dist.get("mean") is not None:
+            m = float(dist["mean"])
+            means[probe_id] = m
+            per_probe[probe_id] = {"observed_mean": m, "claude_window": _win(m)}
+
+    delta_window = None
+    if long_probe in means and short_probe in means:
+        delta = means[long_probe] - means[short_probe]
+        tol = max(tolerance * abs(delta), abs_floor)
+        delta_window = [round(delta - tol, 1), round(delta + tol, 1)]
+
+    return {
+        "ok": True,
+        "schema_version": "token_probe_windows_v1",
+        "source_baseline_id": baseline.get("baseline_id"),
+        "source_model": (baseline.get("source") or {}).get("model"),
+        "derived_from": "live_baseline_observation",
+        "diff_pair": {"long": long_probe, "short": short_probe},
+        "claude_delta_window": delta_window,
+        "per_probe": per_probe,
+        "note": "windows derived from trusted live baseline (no offline tokenizer); recalibrate if the gateway prefix changes",
+    }
+
+
 def _fake_official_samples(n: int = 6) -> list[dict[str, Any]]:
     """Synthetic samples that look like genuine official Claude (for self-test)."""
     samples = []
@@ -559,6 +611,13 @@ def _self_test() -> None:
         sent_estimate_tokens=210000, observed_input_tokens=None, prefix_tokens=4166, http_status=413,
     )
     assert http_err["silent_truncation"] is False, http_err
+
+    # 8. derive token windows from a live baseline
+    derived = derive_token_windows(baseline, long_probe="canary_mixed", short_probe="canary_zh")
+    assert derived["ok"] is True, derived
+    assert derived["claude_delta_window"] is None or len(derived["claude_delta_window"]) == 2
+    # dry baseline must refuse
+    assert derive_token_windows(dry)["ok"] is False
 
     print("baseline_registry self-test ok")
 
