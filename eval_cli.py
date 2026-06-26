@@ -2007,7 +2007,7 @@ def verify_endpoint(args: argparse.Namespace) -> int:
         load_local_env()
     models = apply_model_overrides(load_two_model_config(models_path), args)
     if role not in models:
-        raise ValueError("--provider must be tested_model or judge_model")
+        raise ValueError(f"--provider '{role}' not found in providers config (available: {', '.join(sorted(models))})")
     model = models[role]
     out_dir = baselines_dir / "_verify" / role
     events_file = out_dir / "verify_events.jsonl"
@@ -2021,7 +2021,51 @@ def verify_endpoint(args: argparse.Namespace) -> int:
          "base_url_host": base_url_host(model.base_url), "model": model.model, "protocol": model.protocol},
         baseline_id=f"verify_{role}", live=live,
     )
-    verdict = compare_to_baseline(observed, baseline)
+
+    # gather behavior signals (the hard-to-fake layer) when live
+    behavior: dict[str, Any] = {}
+    if live:
+        # tokenizer delta from observed probe windows vs baseline delta window
+        bwin = (baseline.get("behavior") or {}).get("tokenizer_probe_windows") or {}
+        owin = (observed.get("behavior") or {}).get("tokenizer_probe_windows") or {}
+        def _mean(w, p):
+            d = w.get(p)
+            return d.get("mean") if isinstance(d, dict) else None
+        b_long, b_short = _mean(bwin, "canary_mixed"), _mean(bwin, "canary_zh")
+        o_long, o_short = _mean(owin, "canary_mixed"), _mean(owin, "canary_zh")
+        def _std(w, p):
+            d = w.get(p)
+            return d.get("stdev") if isinstance(d, dict) else None
+        if None not in (b_long, b_short, o_long, o_short):
+            base_delta = b_long - b_short
+            obs_delta = o_long - o_short
+            # dynamic tolerance: absorb the actual per-probe noise on BOTH sides
+            # (short canaries have a few-token jitter that differencing amplifies),
+            # floored generously so small samples don't false-positive.
+            noise = sum(filter(None, [_std(bwin, "canary_mixed"), _std(bwin, "canary_zh"),
+                                      _std(owin, "canary_mixed"), _std(owin, "canary_zh")]))
+            tol = max(0.15 * abs(base_delta), 3.0 * (noise or 1.0), 25.0)
+            score = 10.0 if abs(obs_delta - base_delta) <= tol else 0.0
+            behavior["tokenizer"] = {
+                "score": score,
+                "observed": {"obs_delta": round(obs_delta, 1), "base_delta": round(base_delta, 1), "tol": round(tol, 1)},
+                "details": "tokenizer delta within baseline window (corroborating)" if score else "tokenizer delta off baseline (noisy / corroborating only)",
+                "suspected_tokenizer": None if score else "unknown",
+            }
+        # SSE event-order probe
+        if getattr(args, "with_sse", False):
+            try:
+                sse_args = argparse.Namespace(providers=args.providers, provider=role, live=True)
+                # reuse the classifier by collecting one stream inline
+                import io, contextlib
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    sse_fingerprint(sse_args)
+                behavior["sse"] = json.loads(buf.getvalue())
+            except Exception:
+                pass
+
+    verdict = compare_to_baseline(observed, baseline, behavior_signals=behavior or None)
     print(render_verdict_report(verdict, baseline=baseline))
     if getattr(args, "json", False):
         print(json.dumps(verdict, ensure_ascii=False, indent=2))
@@ -2690,9 +2734,10 @@ def main() -> int:
     verify_parser.add_argument("--providers", type=Path)
     verify_parser.add_argument("--provider", default="tested_model", help="suspect role to verify")
     verify_parser.add_argument("--baselines-dir", type=Path)
-    verify_parser.add_argument("--samples", type=int, default=3)
+    verify_parser.add_argument("--samples", type=int, default=5)
     verify_parser.add_argument("--live", action="store_true", help="REAL API calls to the suspect (cost)")
     verify_parser.add_argument("--json", action="store_true", help="also print raw JSON verdict")
+    verify_parser.add_argument("--with-sse", action="store_true", help="also run the SSE event-order probe (extra live request)")
     verify_parser.set_defaults(func=verify_endpoint)
 
     error_env_parser = sub.add_parser("error-envelope", help="#8 probe: send malformed requests, classify error-body dialect (anthropic/openai/generic)")

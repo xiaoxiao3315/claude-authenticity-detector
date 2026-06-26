@@ -240,10 +240,17 @@ def list_baselines(baselines_dir: Path) -> list[str]:
     return out
 
 
-def compare_to_baseline(observed: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+def compare_to_baseline(
+    observed: dict[str, Any],
+    baseline: dict[str, Any],
+    *,
+    behavior_signals: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Compare a suspect endpoint's observed fingerprint against the baseline.
 
-    Framework stage: protocol-layer comparison only (behavior layer is P1).
+    Protocol layer always runs. Optional behavior_signals (tokenizer / sse /
+    error_envelope, gathered live by verify_endpoint) are folded in: matching
+    behavior raises confidence; a behavior mismatch hard-fails to wrapper.
     Returns a verdict with confidence + reasons + evidence_chain.
     """
     reasons: list[str] = []
@@ -308,21 +315,72 @@ def compare_to_baseline(observed: dict[str, Any], baseline: dict[str, Any]) -> d
             reasons.append(f"{field}_below_baseline")
         evidence.append({"check": field, "baseline": base_rate, "observed": obs_rate})
 
-    # Verdict logic (protocol layer only at this stage).
+    # 5. behavior signals (tokenizer / SSE / error envelope) — hard-to-fake layer.
+    # Each can hard-fail (mismatch) or add a positive vote (match).
+    sig = behavior_signals or {}
+    behavior_votes = 0          # positive matches
+    behavior_checked = 0
+    behavior_soft_misses = 0    # behavior probes that disagree but must NOT solely convict
+
+    tok = sig.get("tokenizer")
+    if isinstance(tok, dict) and tok.get("score") is not None:
+        behavior_checked += 1
+        if tok.get("score") == 0.0:
+            # tokenizer is corroborating ONLY — never sole grounds for wrapper.
+            # (self-reported token counts + short-canary differencing are noisy.)
+            behavior_soft_misses += 1
+            reasons.append(f"tokenizer_delta_off_baseline:{tok.get('suspected_tokenizer','unknown')}")
+        elif tok.get("score") == 10.0:
+            behavior_votes += 1
+        evidence.append({"check": "tokenizer_delta", "observed": tok.get("observed"), "result": tok.get("details")})
+
+    sse = sig.get("sse")
+    if isinstance(sse, dict) and sse.get("sse_family"):
+        behavior_checked += 1
+        if sse.get("sse_family") == "openai_sse":
+            hard_fail = True  # OpenAI SSE frames on an anthropic endpoint IS a strong wrapper signal
+            reasons.append("sse_openai_family")
+        elif sse.get("is_claude_shaped"):
+            behavior_votes += 1
+        evidence.append({"check": "sse_event_order", "observed": sse.get("sse_family"), "order_ok": sse.get("claude_event_order_ok")})
+
+    env = sig.get("error_envelope")
+    if isinstance(env, dict) and env.get("error_envelope_dialect"):
+        d = env.get("error_envelope_dialect")
+        if d in ("openai", "gateway_generic"):
+            # generic on a tolerant gateway is weak (it 200s bad requests); soft only
+            reasons.append(f"error_envelope_{d}")
+        elif d == "anthropic":
+            behavior_votes += 1
+            behavior_checked += 1
+        evidence.append({"check": "error_envelope", "observed": d})
+
+    # Verdict logic. hard_fail = a STRONG protocol/SSE signal (openai stop_reason,
+    # openai usage naming, openai SSE frames). Tokenizer/header are corroborating only.
     if hard_fail:
         verdict = VERDICT_WRAPPER
-        confidence = 0.85
+        confidence = 0.9 if behavior_checked else 0.85
     elif not model_match:
         verdict = VERDICT_DOWNGRADE
         confidence = 0.6
         reasons.append("model_id_mismatch")
-    elif soft_misses >= 2:
+    elif soft_misses >= 2 or behavior_soft_misses >= 2:
+        # multiple soft signals disagree -> needs human review, not an outright verdict
         verdict = VERDICT_DOWNGRADE
         confidence = 0.5
     else:
         verdict = VERDICT_MATCHES
-        confidence = 0.7  # protocol-only match; behavior probes (P1) would raise this
-        reasons.append("protocol_layer_match_only_behavior_probes_pending")
+        # protocol match baseline 0.7; each matching behavior probe raises confidence.
+        # a single soft miss (e.g. noisy tokenizer delta) nudges confidence down but
+        # does not flip the verdict.
+        confidence = min(0.97, 0.7 + 0.08 * behavior_votes - 0.1 * behavior_soft_misses)
+        confidence = max(0.4, confidence)
+        if behavior_soft_misses:
+            reasons.append("protocol_match_with_noisy_behavior_signal")
+        elif behavior_votes:
+            reasons.append(f"protocol_plus_{behavior_votes}_behavior_probes_matched")
+        else:
+            reasons.append("protocol_layer_match_only_behavior_probes_pending")
 
     return {
         "schema_version": BASELINE_COMPARISON_RESULT_VERSION,
@@ -331,7 +389,8 @@ def compare_to_baseline(observed: dict[str, Any], baseline: dict[str, Any]) -> d
         "confidence": round(confidence, 3),
         "reasons": reasons,
         "evidence_chain": evidence,
-        "note": "framework stage: protocol-layer comparison only; tokenizer/needle/capability behavior probes are P1",
+        "behavior_probes_checked": behavior_checked,
+        "note": "protocol + behavior comparison" if behavior_checked else "protocol-layer only (no behavior signals supplied)",
     }
 
 
@@ -678,6 +737,24 @@ def _self_test() -> None:
     )
     good = compare_to_baseline(genuine_observed, baseline)
     assert good["verdict"] == VERDICT_MATCHES, good
+
+    # behavior signals raise confidence on a match, and hard-fail on tokenizer mismatch
+    good_beh = compare_to_baseline(genuine_observed, baseline, behavior_signals={
+        "tokenizer": {"score": 10.0, "observed": {"delta": 80}},
+        "sse": {"sse_family": "claude_sse", "is_claude_shaped": True, "claude_event_order_ok": True},
+        "error_envelope": {"error_envelope_dialect": "anthropic"},
+    })
+    assert good_beh["verdict"] == VERDICT_MATCHES and good_beh["confidence"] > good["confidence"], good_beh
+    # a single noisy tokenizer miss must NOT flip the verdict to wrapper (corroborating only)
+    bad_beh = compare_to_baseline(genuine_observed, baseline, behavior_signals={
+        "tokenizer": {"score": 0.0, "suspected_tokenizer": "cl100k", "observed": {"delta": 55}},
+    })
+    assert bad_beh["verdict"] == VERDICT_MATCHES and bad_beh["confidence"] < good["confidence"], bad_beh
+    # but OpenAI SSE frames (a strong signal) DO hard-fail to wrapper
+    sse_fail = compare_to_baseline(genuine_observed, baseline, behavior_signals={
+        "sse": {"sse_family": "openai_sse", "is_claude_shaped": False},
+    })
+    assert sse_fail["verdict"] == VERDICT_WRAPPER, sse_fail
 
     wrapper = compare_to_baseline(_fake_wrapper_observed(), baseline)
     assert wrapper["verdict"] == VERDICT_WRAPPER, wrapper
