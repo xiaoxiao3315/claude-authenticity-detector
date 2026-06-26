@@ -47,12 +47,15 @@ from authenticity import build_config_protocol_fingerprint, load_or_build_authen
 from baseline_registry import (
     DEFAULT_BASELINES_DIR,
     build_baseline_from_samples,
+    classify_error_envelope,
+    classify_sse_event_order,
     compare_to_baseline,
     derive_token_windows,
     evaluate_silent_truncation,
     key_fingerprint,
     load_baseline,
     make_sample,
+    render_verdict_report,
     score_needle_recall,
     write_baseline,
 )
@@ -1980,7 +1983,48 @@ def baseline_compare(args: argparse.Namespace) -> int:
         baseline_id=f"observed_{role}", live=live,
     )
     verdict = compare_to_baseline(observed, baseline)
-    print(json.dumps(verdict, ensure_ascii=False, indent=2))
+    if getattr(args, "report", False):
+        print(render_verdict_report(verdict, baseline=baseline))
+    else:
+        print(json.dumps(verdict, ensure_ascii=False, indent=2))
+    return 0
+
+
+def verify_endpoint(args: argparse.Namespace) -> int:
+    """One-shot: compare a suspect provider against a trusted baseline, print a report.
+
+    Loads the named baseline, collects the suspect's fingerprint, renders a
+    human-readable verdict. --live actually probes the suspect (cost).
+    """
+    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+    baseline = load_baseline(baselines_dir, args.baseline_id)
+    if baseline is None:
+        raise ValueError(f"baseline not found: {args.baseline_id} (build one first with `baseline --live`)")
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    role = str(args.provider or "tested_model")
+    live = bool(getattr(args, "live", False))
+    if live:
+        load_local_env()
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    if role not in models:
+        raise ValueError("--provider must be tested_model or judge_model")
+    model = models[role]
+    out_dir = baselines_dir / "_verify" / role
+    events_file = out_dir / "verify_events.jsonl"
+    samples = _collect_baseline_samples(
+        model, samples_per_probe=max(1, int(getattr(args, "samples", 3) or 3)),
+        live=live, events_file=events_file,
+    )
+    observed = build_baseline_from_samples(
+        samples,
+        {"provider_id": model.provider_id, "provider_label": role,
+         "base_url_host": base_url_host(model.base_url), "model": model.model, "protocol": model.protocol},
+        baseline_id=f"verify_{role}", live=live,
+    )
+    verdict = compare_to_baseline(observed, baseline)
+    print(render_verdict_report(verdict, baseline=baseline))
+    if getattr(args, "json", False):
+        print(json.dumps(verdict, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -2101,6 +2145,113 @@ def needle(args: argparse.Namespace) -> int:
         "verdict": verdict,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def error_envelope(args: argparse.Namespace) -> int:
+    """#8 error-envelope probe: send malformed requests, classify the error body's
+    dialect (anthropic / openai / gateway_generic). Independent of call_model.
+    """
+    live = bool(getattr(args, "live", False))
+    if live:
+        load_local_env()
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    role = str(args.provider or "tested_model")
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    if role not in models:
+        raise ValueError("--provider must be tested_model or judge_model")
+    model = models[role]
+
+    variants = {
+        "missing_max_tokens": {"model": model.model, "messages": [{"role": "user", "content": "hi"}]},
+        "bad_field": {"model": model.model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "temperature": 99, "not_a_real_field": True},
+        "oversized_max_tokens": {"model": model.model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 99999999},
+    }
+    if not live:
+        print(json.dumps({"probe": "error_envelope", "evidence_status": "dry_run_reference_only",
+                          "variants": list(variants), "note": "dry-run: no request sent. Use --live to probe."}, ensure_ascii=False, indent=2))
+        return 0
+
+    url = f"{model.base_url}/v1/messages" if model.protocol == "anthropic_messages" else f"{model.base_url}/v1/chat/completions"
+    secret = auth_value(model)
+    headers = {**auth_headers(model, secret), "content-type": "application/json"}
+    results = []
+    with httpx.Client(timeout=httpx.Timeout(30.0)) as client:
+        for name, payload in variants.items():
+            try:
+                resp = client.post(url, headers=headers, json=payload)
+                status = resp.status_code
+                body_text = resp.text[:2000]
+                cls = classify_error_envelope(body_text, safe_response_headers(resp.headers))
+            except Exception as exc:
+                status = 0
+                cls = {"error_envelope_dialect": "unknown", "error": redact_text(f"{type(exc).__name__}: {exc}", max_chars=200)}
+            results.append({"variant": name, "http_status": status, **cls,
+                            "body_preview": redact_text(body_text, max_chars=240) if status else None})
+    dialects = [r["error_envelope_dialect"] for r in results if r.get("http_status", 0) >= 400]
+    overall = "anthropic" if dialects and all(d == "anthropic" for d in dialects) else (
+        "suspect" if any(d in ("openai", "gateway_generic") for d in dialects) else "insufficient")
+    print(json.dumps({"probe": "error_envelope", "evidence_status": "live_observed",
+                      "overall": overall, "results": results}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def sse_fingerprint(args: argparse.Namespace) -> int:
+    """#9 SSE event-order fingerprint: open one streaming request, classify the
+    event sequence (claude_sse vs openai_sse). Independent of call_model.
+    """
+    live = bool(getattr(args, "live", False))
+    if live:
+        load_local_env()
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    role = str(args.provider or "tested_model")
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    if role not in models:
+        raise ValueError("--provider must be tested_model or judge_model")
+    model = models[role]
+    if not live:
+        print(json.dumps({"probe": "sse_event_order", "evidence_status": "dry_run_reference_only",
+                          "note": "dry-run: no stream opened. Use --live to probe."}, ensure_ascii=False, indent=2))
+        return 0
+
+    secret = auth_value(model)
+    event_types: list[str] = []
+    http_status = 200
+    if model.protocol == "anthropic_messages":
+        url = f"{model.base_url}/v1/messages"
+        payload = {"model": model.model, "messages": [{"role": "user", "content": "Say hi in one short sentence."}], "max_tokens": 32, "stream": True}
+    else:
+        url = f"{model.base_url}/v1/chat/completions"
+        payload = {"model": model.model, "messages": [{"role": "user", "content": "Say hi in one short sentence."}], "max_tokens": 32, "stream": True}
+    headers = {**auth_headers(model, secret), "content-type": "application/json", "accept": "text/event-stream"}
+    try:
+        with httpx.Client(timeout=httpx.Timeout(60.0)) as client:
+            with client.stream("POST", url, headers=headers, json=payload) as resp:
+                http_status = resp.status_code
+                if http_status == 200:
+                    for line in resp.iter_lines():
+                        line = line.strip()
+                        if line.startswith("event:"):
+                            event_types.append(line.split(":", 1)[1].strip())
+                        elif line.startswith("data:"):
+                            data = line.split(":", 1)[1].strip()
+                            if data == "[DONE]":
+                                event_types.append("[DONE]")
+                            else:
+                                try:
+                                    obj = json.loads(data)
+                                    t = obj.get("type") or obj.get("object")
+                                    if t:
+                                        event_types.append(str(t))
+                                except (ValueError, TypeError):
+                                    pass
+    except Exception as exc:
+        print(json.dumps({"probe": "sse_event_order", "evidence_status": "live_observed",
+                          "http_status": 0, "error": redact_text(f"{type(exc).__name__}: {exc}", max_chars=200)}, ensure_ascii=False, indent=2))
+        return 0
+    cls = classify_sse_event_order(event_types)
+    print(json.dumps({"probe": "sse_event_order", "evidence_status": "live_observed",
+                      "http_status": http_status, "event_sequence": event_types, **cls}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -2531,7 +2682,30 @@ def main() -> int:
     baseline_compare_parser.add_argument("--baselines-dir", type=Path)
     baseline_compare_parser.add_argument("--samples", type=int, default=2)
     baseline_compare_parser.add_argument("--live", action="store_true", help="REAL API calls to the suspect provider (cost)")
+    baseline_compare_parser.add_argument("--report", action="store_true", help="print a human-readable Chinese report instead of JSON")
     baseline_compare_parser.set_defaults(func=baseline_compare)
+
+    verify_parser = sub.add_parser("verify-endpoint", help="one-shot: verify a suspect provider against a trusted baseline, print a human-readable verdict")
+    verify_parser.add_argument("--baseline-id", required=True, help="trusted baseline to compare against")
+    verify_parser.add_argument("--providers", type=Path)
+    verify_parser.add_argument("--provider", default="tested_model", help="suspect role to verify")
+    verify_parser.add_argument("--baselines-dir", type=Path)
+    verify_parser.add_argument("--samples", type=int, default=3)
+    verify_parser.add_argument("--live", action="store_true", help="REAL API calls to the suspect (cost)")
+    verify_parser.add_argument("--json", action="store_true", help="also print raw JSON verdict")
+    verify_parser.set_defaults(func=verify_endpoint)
+
+    error_env_parser = sub.add_parser("error-envelope", help="#8 probe: send malformed requests, classify error-body dialect (anthropic/openai/generic)")
+    error_env_parser.add_argument("--providers", type=Path)
+    error_env_parser.add_argument("--provider", default="tested_model")
+    error_env_parser.add_argument("--live", action="store_true", help="REAL malformed requests (small cost). Default off = dry-run")
+    error_env_parser.set_defaults(func=error_envelope)
+
+    sse_parser = sub.add_parser("sse-fingerprint", help="#9 probe: open one streaming request, classify SSE event-order (claude_sse vs openai_sse)")
+    sse_parser.add_argument("--providers", type=Path)
+    sse_parser.add_argument("--provider", default="tested_model")
+    sse_parser.add_argument("--live", action="store_true", help="REAL streaming request (small cost). Default off = dry-run")
+    sse_parser.set_defaults(func=sse_fingerprint)
 
     needle_parser = sub.add_parser("needle", help="fake-1M context probe: plant a needle in a >200K prompt, check recall + silent truncation (--live, expensive)")
     needle_parser.add_argument("--providers", type=Path)

@@ -490,6 +490,119 @@ def derive_token_windows(
     }
 
 
+def classify_error_envelope(body_text: str | None, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    """Classify an error response body's dialect: anthropic vs openai vs generic.
+
+    Anthropic: {"type":"error","error":{"type":"invalid_request_error",...}}
+    OpenAI:    {"error":{"message":...,"type":"invalid_request_error","code":...}}
+    A wrapper that proxies 200s but generates its own errors usually looks generic.
+    Pure parser — no network. headers optional (anthropic-* / request-id hints).
+    """
+    headers = headers or {}
+    parsed: Any = None
+    try:
+        parsed = json.loads(body_text) if body_text else None
+    except (ValueError, TypeError):
+        parsed = None
+
+    dialect = "unknown"
+    if isinstance(parsed, dict):
+        err = parsed.get("error")
+        if parsed.get("type") == "error" and isinstance(err, dict) and "type" in err:
+            dialect = "anthropic"
+        elif isinstance(err, dict) and ("message" in err or "code" in err) and parsed.get("type") != "error":
+            dialect = "openai"
+        else:
+            # any other JSON object (FastAPI {"detail":...}, bare {"message":...},
+            # {"code":...,"msg":...}, etc.) is a non-Anthropic generic gateway error
+            dialect = "gateway_generic"
+
+    lowered = {str(k).lower(): v for k, v in headers.items()}
+    has_anthropic_header = any(k.startswith("anthropic-") for k in lowered)
+    req_id = lowered.get("anthropic-request-id") or lowered.get("request-id") or ""
+    anthropic_req_format = bool(str(req_id).startswith("req_"))
+
+    return {
+        "error_envelope_dialect": dialect,
+        "has_anthropic_header": has_anthropic_header,
+        "anthropic_request_id_format": anthropic_req_format,
+        "is_claude_shaped": dialect == "anthropic",
+    }
+
+
+def classify_sse_event_order(event_types: list[str]) -> dict[str, Any]:
+    """Check whether an observed SSE event sequence matches Claude's messages stream.
+
+    Claude order: message_start → content_block_start → content_block_delta →
+    content_block_stop → message_delta → message_stop (ping interspersed).
+    OpenAI: repeated chat.completion.chunk deltas then [DONE]. Pure — no network.
+    """
+    claude_markers = ["message_start", "content_block_start", "content_block_delta", "message_stop"]
+    openai_markers = {"chat.completion.chunk", "[DONE]", "completion"}
+    seen = [e for e in event_types if e]
+    seen_set = set(seen)
+
+    if seen_set & openai_markers:
+        family = "openai_sse"
+    elif any(m in seen_set for m in ("message_start", "content_block_delta", "message_stop")):
+        family = "claude_sse"
+    else:
+        family = "unknown"
+
+    # ordered subsequence check for the 4 key claude markers
+    idx = 0
+    for ev in seen:
+        if idx < len(claude_markers) and ev == claude_markers[idx]:
+            idx += 1
+    order_ok = idx == len(claude_markers)
+
+    return {
+        "sse_family": family,
+        "claude_event_order_ok": bool(order_ok and family == "claude_sse"),
+        "event_types_seen": sorted(seen_set),
+        "is_claude_shaped": family == "claude_sse" and order_ok,
+    }
+
+
+VERDICT_LABELS_ZH = {
+    VERDICT_MATCHES: "✅ 真·官方 Claude",
+    VERDICT_DOWNGRADE: "⚠️ 疑似降级（可能换了更小/更弱的模型）",
+    VERDICT_WRAPPER: "❌ 疑似套壳（可能是别家模型伪装）",
+    VERDICT_INSUFFICIENT: "❔ 证据不足（无法判定，需更多 live 采集）",
+}
+
+
+def render_verdict_report(verdict: dict[str, Any], *, baseline: dict[str, Any] | None = None) -> str:
+    """Render a compare_to_baseline verdict into a human-readable Chinese report."""
+    v = verdict.get("verdict", VERDICT_INSUFFICIENT)
+    lines: list[str] = []
+    lines.append("=" * 48)
+    lines.append("  Claude 真伪检测报告")
+    lines.append("=" * 48)
+    if baseline:
+        src = baseline.get("source") or {}
+        lines.append(f"对照基线: {baseline.get('baseline_id')} (model={src.get('model')}, host={src.get('base_url_host')})")
+    lines.append(f"结论: {VERDICT_LABELS_ZH.get(v, v)}")
+    conf = verdict.get("confidence")
+    if conf is not None:
+        lines.append(f"置信度: {conf}")
+    reasons = verdict.get("reasons") or []
+    if reasons:
+        lines.append("理由:")
+        for r in reasons:
+            lines.append(f"  - {r}")
+    chain = verdict.get("evidence_chain") or []
+    if chain:
+        lines.append("证据链:")
+        for e in chain:
+            lines.append(f"  · {e.get('check')}: baseline={e.get('baseline')} | observed={e.get('observed')}")
+    note = verdict.get("note")
+    if note:
+        lines.append(f"备注: {note}")
+    lines.append("=" * 48)
+    return "\n".join(lines)
+
+
 def _fake_official_samples(n: int = 6) -> list[dict[str, Any]]:
     """Synthetic samples that look like genuine official Claude (for self-test)."""
     samples = []
@@ -618,6 +731,29 @@ def _self_test() -> None:
     assert derived["claude_delta_window"] is None or len(derived["claude_delta_window"]) == 2
     # dry baseline must refuse
     assert derive_token_windows(dry)["ok"] is False
+
+    # 9. human-readable report renders for every verdict
+    rep = render_verdict_report(wrapper, baseline=baseline)
+    assert "套壳" in rep and "Claude 真伪检测报告" in rep, rep
+    assert "真·官方" in render_verdict_report(good, baseline=baseline)
+
+    # 10. error envelope dialect (top-level type:error is the discriminator,
+    #     NOT error.type — both Anthropic & OpenAI use invalid_request_error)
+    assert classify_error_envelope(
+        '{"type":"error","error":{"type":"invalid_request_error","message":"x"}}',
+        {"anthropic-request-id": "req_011AbC"},
+    )["error_envelope_dialect"] == "anthropic"
+    assert classify_error_envelope(
+        '{"error":{"message":"x","type":"invalid_request_error","code":null}}', {},
+    )["error_envelope_dialect"] == "openai"
+    assert classify_error_envelope('{"detail":"Unprocessable"}', {})["error_envelope_dialect"] == "gateway_generic"
+    assert classify_error_envelope(None, {})["error_envelope_dialect"] == "unknown"
+
+    # 11. SSE event-order fingerprint
+    claude_seq = ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
+    assert classify_sse_event_order(claude_seq)["is_claude_shaped"] is True
+    assert classify_sse_event_order(["chat.completion.chunk", "chat.completion.chunk", "[DONE]"])["sse_family"] == "openai_sse"
+    assert classify_sse_event_order(["message_stop", "message_start"])["claude_event_order_ok"] is False
 
     print("baseline_registry self-test ok")
 

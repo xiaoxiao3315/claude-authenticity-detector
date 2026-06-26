@@ -7988,10 +7988,151 @@
       ],
       "dimension_weight_group": "技术方案设计",
       "scoring_confidence": 0.55
+    },
+    {
+      "id": "tok_prefix_baseline",
+      "category": "provider_trust",
+      "enterprise_dimension": "API 行为与 Provider 可信度",
+      "difficulty": "easy",
+      "prompt": ".",
+      "scoring_type": "token_count_check",
+      "point_value": 1,
+      "scoring_confidence": "high",
+      "risk_tags": [
+        "tokenizer_fingerprint"
+      ],
+      "mode_eligible": [
+        "authenticity"
+      ],
+      "benchmark_roles": [
+        "tested_model"
+      ],
+      "suite_tags": [
+        "authenticity",
+        "tokenizer"
+      ],
+      "recommended_max_tokens": 16,
+      "expected_key_points": [],
+      "common_failure_modes": [],
+      "scoring_rubric": "token_count_check: scored from observed input_tokens vs Claude-derived windows; text reply is irrelevant.",
+      "dimension_weight_group": "provider_trust",
+      "token_probe": {
+        "role": "prefix_baseline"
+      }
+    },
+    {
+      "id": "tok_canary_code",
+      "category": "provider_trust",
+      "enterprise_dimension": "API 行为与 Provider 可信度",
+      "difficulty": "easy",
+      "prompt": "```python\nfor i in range(10):\n    print(i, i**2)\n```",
+      "scoring_type": "token_count_check",
+      "point_value": 1,
+      "scoring_confidence": "high",
+      "risk_tags": [
+        "tokenizer_fingerprint"
+      ],
+      "mode_eligible": [
+        "authenticity"
+      ],
+      "benchmark_roles": [
+        "tested_model"
+      ],
+      "suite_tags": [
+        "authenticity",
+        "tokenizer"
+      ],
+      "recommended_max_tokens": 16,
+      "expected_key_points": [],
+      "common_failure_modes": [],
+      "scoring_rubric": "token_count_check: scored from observed input_tokens vs Claude-derived windows; text reply is irrelevant.",
+      "dimension_weight_group": "provider_trust",
+      "token_probe": {
+        "role": "canary",
+        "claude_window": [
+          3957.7,
+          4374.3
+        ]
+      }
+    },
+    {
+      "id": "tok_canary_zh",
+      "category": "provider_trust",
+      "enterprise_dimension": "API 行为与 Provider 可信度",
+      "difficulty": "easy",
+      "prompt": "请用一句话总结：人工智能正在改变软件开发的方式。",
+      "scoring_type": "token_count_check",
+      "point_value": 1,
+      "scoring_confidence": "high",
+      "risk_tags": [
+        "tokenizer_fingerprint"
+      ],
+      "mode_eligible": [
+        "authenticity"
+      ],
+      "benchmark_roles": [
+        "tested_model"
+      ],
+      "suite_tags": [
+        "authenticity",
+        "tokenizer"
+      ],
+      "recommended_max_tokens": 16,
+      "expected_key_points": [],
+      "common_failure_modes": [],
+      "scoring_rubric": "token_count_check: scored from observed input_tokens vs Claude-derived windows; text reply is irrelevant.",
+      "dimension_weight_group": "provider_trust",
+      "token_probe": {
+        "role": "canary",
+        "claude_window": [
+          3948.0,
+          4363.6
+        ]
+      }
+    },
+    {
+      "id": "tok_canary_mixed",
+      "category": "provider_trust",
+      "enterprise_dimension": "API 行为与 Provider 可信度",
+      "difficulty": "easy",
+      "prompt": "Hello 世界 🌍 def f(x): return x*2 — café naïve Ω≈3.14",
+      "scoring_type": "token_count_check",
+      "point_value": 1,
+      "scoring_confidence": "high",
+      "risk_tags": [
+        "tokenizer_fingerprint"
+      ],
+      "mode_eligible": [
+        "authenticity"
+      ],
+      "benchmark_roles": [
+        "tested_model"
+      ],
+      "suite_tags": [
+        "authenticity",
+        "tokenizer"
+      ],
+      "recommended_max_tokens": 16,
+      "expected_key_points": [],
+      "common_failure_modes": [],
+      "scoring_rubric": "token_count_check: scored from observed input_tokens vs Claude-derived windows; text reply is irrelevant.",
+      "dimension_weight_group": "provider_trust",
+      "token_probe": {
+        "role": "canary",
+        "claude_window": [
+          4023.8,
+          4447.4
+        ],
+        "diff_partner_id": "tok_canary_zh",
+        "claude_delta_window": [
+          71.8,
+          87.8
+        ]
+      }
     }
   ],
   "score_formula_version": "score_formula_v1",
-  "benchmark_task_count": 30,
+  "benchmark_task_count": 134,
   "imported_sources": [
     {
       "id": "private_llm_eval_bank_100",
