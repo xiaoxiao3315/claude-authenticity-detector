@@ -518,28 +518,49 @@ def evaluate_silent_truncation(
     sent_estimate_tokens: float,
     observed_input_tokens: float | None,
     prefix_tokens: float | None,
-    shortfall_ratio: float = 0.9,
+    shortfall_ratio: float = 0.5,
     http_status: int = 200,
+    needle_recalled: bool | None = None,
 ) -> dict[str, Any]:
-    """Hard signal for fake-1M: HTTP 200 but reported input_tokens far below sent.
+    """Detect fake-1M silent truncation.
 
-    Only HTTP 200 + token shortfall counts as silent_truncation. HTTP 400/413 etc.
-    are legitimate errors, not fakery. Prefix is subtracted before comparing.
+    PRIMARY signal is needle recall: the canary is planted near the START of the
+    prompt, so if it was recalled, the context was NOT truncated — regardless of
+    token counts. Token shortfall is only a CORROBORATING signal, and unreliable
+    because our char->token send estimate varies a lot by filler text. So:
+      - recall succeeded  -> NOT truncated (hard).
+      - recall failed AND observed tokens are FAR below sent (gap > shortfall) ->
+        silent_truncation.
+      - non-200 -> legit error, not fakery.
     """
     if http_status != 200:
         return {"silent_truncation": False, "reason": f"non_200_status:{http_status}_legit_not_fakery"}
+    # needle recalled = context reached the planted code = NOT truncated.
+    if needle_recalled is True:
+        return {
+            "silent_truncation": False,
+            "reason": "needle_recalled_context_intact",
+            "observed_input_tokens": observed_input_tokens,
+        }
     if observed_input_tokens is None:
         return {"silent_truncation": False, "reason": "no_observed_input_tokens", "prefix_assumed": prefix_tokens is None}
     effective = observed_input_tokens - (prefix_tokens or 0.0)
     threshold = sent_estimate_tokens * shortfall_ratio
-    truncated = effective < threshold
+    # only suspect truncation when recall did NOT succeed AND tokens are far short.
+    # (send estimate is unreliable, so use a generous 0.5 ratio + require failed recall.)
+    truncated = (needle_recalled is False) and (effective < threshold)
     return {
         "silent_truncation": bool(truncated),
         "effective_text_tokens": round(effective, 1),
         "sent_estimate_tokens": round(sent_estimate_tokens, 1),
         "threshold": round(threshold, 1),
         "prefix_assumed": prefix_tokens is None,
-        "reason": "input_tokens_far_below_sent" if truncated else "input_tokens_consistent_with_sent",
+        "needle_recalled": needle_recalled,
+        "reason": (
+            "needle_missed_and_tokens_far_below_sent" if truncated
+            else "needle_recall_unknown_token_estimate_unreliable" if needle_recalled is None
+            else "tokens_short_but_needle_not_failed_or_estimate_noise"
+        ),
     }
 
 
@@ -863,15 +884,25 @@ def _self_test() -> None:
     assert score_needle_recall("AUTH_CANARY=ab12", "... AUTH_CANARY=ab12 ...")["score"] == 10.0
     assert score_needle_recall("AUTH_CANARY=ab12", "no code here")["score"] == 0.0
 
-    # 7. silent truncation
+    # 7. silent truncation — needle recall is the PRIMARY signal
+    # recall FAILED + tokens far short -> truncated
     trunc = evaluate_silent_truncation(
         sent_estimate_tokens=210000, observed_input_tokens=12000, prefix_tokens=4166,
+        needle_recalled=False,
     )
     assert trunc["silent_truncation"] is True, trunc
+    # recall SUCCEEDED -> NOT truncated even if token estimate looks short
+    recalled_short = evaluate_silent_truncation(
+        sent_estimate_tokens=126000, observed_input_tokens=78000, prefix_tokens=4166,
+        needle_recalled=True,
+    )
+    assert recalled_short["silent_truncation"] is False, recalled_short
+    # full tokens, recall unknown -> not truncated
     ok_full = evaluate_silent_truncation(
         sent_estimate_tokens=210000, observed_input_tokens=214166, prefix_tokens=4166,
     )
     assert ok_full["silent_truncation"] is False, ok_full
+    # non-200 -> legit error, not fakery
     http_err = evaluate_silent_truncation(
         sent_estimate_tokens=210000, observed_input_tokens=None, prefix_tokens=4166, http_status=413,
     )

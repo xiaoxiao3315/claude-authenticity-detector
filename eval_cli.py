@@ -2116,7 +2116,7 @@ def verify_endpoint(args: argparse.Namespace) -> int:
         if getattr(args, "with_needle", False):
             try:
                 nd_args = argparse.Namespace(providers=args.providers, provider=role, live=True,
-                                             target_tokens=int(getattr(args, "needle_tokens", 200000) or 200000),
+                                             target_tokens=int(getattr(args, "needle_tokens", 120000) or 120000),
                                              seed=7, baseline_id=args.baseline_id,
                                              baselines_dir=getattr(args, "baselines_dir", None), timeout=300.0)
                 import io, contextlib
@@ -2136,19 +2136,23 @@ def verify_endpoint(args: argparse.Namespace) -> int:
 
 
 # Fake-1M needle probe. The huge prompt is assembled at run time from a seed
-# (NEVER stored in the 495KB task file). Approx 3.2 chars/token, conservative.
-NEEDLE_CHARS_PER_TOKEN = 3.2
+# (NEVER stored in the 495KB task file).
+# Empirically (drhknode opus-4-6 ladder test 2026-06-26): ~2.5 chars/token for
+# this English filler (400K chars -> 160031 input_tokens). The upstream rejects
+# single requests above ~160K-220K tokens (429/timeout), so keep target modest.
+NEEDLE_CHARS_PER_TOKEN = 2.5
 
 
 def _assemble_needle_prompt(target_tokens: int, seed: int, depth: float = 0.01) -> tuple[str, str]:
-    """Build a >target_tokens filler prompt with a planted AUTH_CANARY at `depth`.
+    """Build a ~target_tokens filler prompt with a planted AUTH_CANARY at `depth`.
 
     Reproducible from (target_tokens, seed). Returns (prompt, canary_code).
     """
     rng_state = (seed * 2654435761) & 0xFFFFFFFF
     canary_code = f"AUTH_CANARY={rng_state:08x}"
-    # over-generate ~30% to be safe that real tokens exceed target
-    target_chars = int(target_tokens * NEEDLE_CHARS_PER_TOKEN * 1.3)
+    # small 5% headroom so real tokens just clear target without overshooting
+    # into the upstream's large-request rejection band.
+    target_chars = int(target_tokens * NEEDLE_CHARS_PER_TOKEN * 1.05)
     sentence = (
         f"Filler line {seed}: the quick brown fox jumps over the lazy dog, "
         "padding context to stress the model's long-context handling. "
@@ -2167,7 +2171,7 @@ def _assemble_needle_prompt(target_tokens: int, seed: int, depth: float = 0.01) 
 
 
 def needle(args: argparse.Namespace) -> int:
-    target_tokens = int(getattr(args, "target_tokens", 200000) or 200000)
+    target_tokens = int(getattr(args, "target_tokens", 120000) or 120000)
     seed = int(getattr(args, "seed", 1) or 1)
     live = bool(getattr(args, "live", False))
     if live:
@@ -2237,11 +2241,13 @@ def needle(args: argparse.Namespace) -> int:
             return float(v) if v is not None else None
         except (TypeError, ValueError):
             return None
+    recalled = recall.get("score") == 10.0 if recall.get("score") is not None else None
     truncation = evaluate_silent_truncation(
         sent_estimate_tokens=sent_estimate_tokens,
         observed_input_tokens=_num(observed_input_tokens),
         prefix_tokens=_num(prefix_tokens),
         http_status=http_status,
+        needle_recalled=recalled,
     )
     verdict = "fake_1m_silent_truncation" if truncation.get("silent_truncation") else (
         "context_ok" if recall.get("score") == 10.0 else "insufficient_or_legit_error"
@@ -2809,7 +2815,7 @@ def main() -> int:
     verify_parser.add_argument("--with-sse", action="store_true", help="also run the SSE event-order probe (extra live request)")
     verify_parser.add_argument("--with-error-envelope", action="store_true", help="also run the error-envelope probe (malformed requests)")
     verify_parser.add_argument("--with-needle", action="store_true", help="also run the fake-1M needle probe (>200K request, slow/expensive)")
-    verify_parser.add_argument("--needle-tokens", type=int, default=200000, help="needle target prompt size in tokens")
+    verify_parser.add_argument("--needle-tokens", type=int, default=120000, help="needle target prompt size in tokens")
     verify_parser.add_argument("--request-delay", type=float, default=0.0, help="seconds to wait between probe requests (avoid upstream rate limits)")
     verify_parser.add_argument("--retries", type=int, default=1, help="retries per request on transient failure (429/5xx)")
     verify_parser.add_argument("--retry-backoff", type=float, default=0.5, help="base backoff seconds between retries")
@@ -2830,7 +2836,7 @@ def main() -> int:
     needle_parser = sub.add_parser("needle", help="fake-1M context probe: plant a needle in a >200K prompt, check recall + silent truncation (--live, expensive)")
     needle_parser.add_argument("--providers", type=Path)
     needle_parser.add_argument("--provider", default="tested_model", help="endpoint to probe")
-    needle_parser.add_argument("--target-tokens", type=int, default=200000, help="approx prompt size in tokens")
+    needle_parser.add_argument("--target-tokens", type=int, default=120000, help="approx prompt size in tokens")
     needle_parser.add_argument("--seed", type=int, default=1, help="reproducible prompt seed")
     needle_parser.add_argument("--baseline-id", help="baseline to read this link's prefix from (for token shortfall)")
     needle_parser.add_argument("--baselines-dir", type=Path)
