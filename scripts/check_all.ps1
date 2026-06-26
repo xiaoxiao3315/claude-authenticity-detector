@@ -29,6 +29,7 @@ try {
     python .\trace_evaluation.py --self-test
     python .\audit_export.py --self-test
     python .\authenticity.py --self-test
+    python .\baseline_registry.py --self-test
 
     if (-not $SkipDryRun) {
         $campaignId = "CMP-CHECK-" + (Get-Date -Format "yyyyMMddHHmmss")

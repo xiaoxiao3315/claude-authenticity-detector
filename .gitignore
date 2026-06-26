@@ -12,6 +12,7 @@ runs/
 campaigns/
 archives/
 imports/
+baselines/
 *.log
 *.tmp
 _shot*.png

@@ -44,6 +44,15 @@ from campaigns import (
     write_json as write_campaign_json,
 )
 from authenticity import build_config_protocol_fingerprint, load_or_build_authenticity, write_authenticity_evidence
+from baseline_registry import (
+    DEFAULT_BASELINES_DIR,
+    build_baseline_from_samples,
+    compare_to_baseline,
+    key_fingerprint,
+    load_baseline,
+    make_sample,
+    write_baseline,
+)
 from local_env import load_local_env
 from quality_gate import run_quality_gate
 from run_records import extract_raw_event_types, stable_json_hash, text_hash
@@ -1803,6 +1812,156 @@ def authenticity(args: argparse.Namespace) -> int:
     return exit_code
 
 
+BASELINE_CANARY_PROBES = [
+    {"id": "canary_mixed", "text": "Hello 世界 🌍 def f(x): return x*2 — café naïve Ω≈3.14"},
+    {"id": "canary_zh", "text": "请用一句话总结：人工智能正在改变软件开发的方式。"},
+    {"id": "canary_code", "text": "```python\nfor i in range(10):\n    print(i, i**2)\n```"},
+]
+
+
+def _raw_protocol_observation(completion: Completion, model: ModelConfig) -> dict[str, Any]:
+    """Extract RAW protocol values from the upstream response body.
+
+    Reads completion.raw (set in call_model BEFORE the L639/640 stop/model
+    fallback would rewrite them), so the baseline captures the source's true
+    shape, not the normalized CallMetrics.
+    """
+    data = completion.raw if isinstance(completion.raw, dict) else {}
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    raw_usage_keys = list(usage.keys())
+    if model.protocol == "openai_chat":
+        choices = data.get("choices") or []
+        raw_stop = (choices[0].get("finish_reason") if choices else None)
+    else:
+        raw_stop = data.get("stop_reason")
+    return {
+        "raw_stop_reason": raw_stop,
+        "raw_usage_keys": raw_usage_keys,
+        "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens")),
+        "output_tokens": usage.get("output_tokens", usage.get("completion_tokens")),
+    }
+
+
+def _collect_baseline_samples(
+    model: ModelConfig,
+    *,
+    samples_per_probe: int,
+    live: bool,
+    events_file: Path,
+) -> list[dict[str, Any]]:
+    collected: list[dict[str, Any]] = []
+    timeout = httpx.Timeout(120.0)
+    with httpx.Client(timeout=timeout) as client:
+        for probe in BASELINE_CANARY_PROBES:
+            for _ in range(max(1, samples_per_probe)):
+                messages = [{"role": "user", "content": probe["text"]}]
+                completion = call_model_with_retries(
+                    client=client,
+                    model=model,
+                    messages=messages,
+                    max_tokens=64,
+                    temperature=0,
+                    live=live,
+                    events_file=events_file,
+                    retries=1,
+                    retry_backoff=0.5,
+                )
+                obs = _raw_protocol_observation(completion, model)
+                collected.append(make_sample(
+                    protocol=model.protocol,
+                    raw_stop_reason=obs["raw_stop_reason"],
+                    raw_usage_keys=obs["raw_usage_keys"],
+                    input_tokens=obs["input_tokens"],
+                    output_tokens=obs["output_tokens"],
+                    total_ms=completion.metrics.total_ms,
+                    has_anthropic_request_id=False,
+                    has_anthropic_headers=False,
+                    probe_id=probe["id"],
+                    live=live,
+                ))
+    return collected
+
+
+def baseline_build(args: argparse.Namespace) -> int:
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    role = str(args.provider or "tested_model")
+    live = bool(getattr(args, "live", False))
+    if live:
+        load_local_env()
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    if role not in models:
+        raise ValueError("--provider must be tested_model or judge_model")
+    model = models[role]
+    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+    baseline_id = str(getattr(args, "baseline_id", None) or utcish_job_id("BASE"))
+    samples_per_probe = max(1, int(getattr(args, "samples", 2) or 2))
+
+    out_dir = baselines_dir / baseline_id.replace("/", "_").replace("\\", "_")
+    events_file = out_dir / "collection_events.jsonl"
+    samples = _collect_baseline_samples(
+        model,
+        samples_per_probe=samples_per_probe,
+        live=live,
+        events_file=events_file,
+    )
+    secret = auth_value(model) if live else None
+    source = {
+        "provider_id": model.provider_id,
+        "provider_label": role,
+        "base_url_host": base_url_host(model.base_url),
+        "model": model.model,
+        "protocol": model.protocol,
+        "key_fingerprint": key_fingerprint(secret) if secret else None,
+    }
+    doc = build_baseline_from_samples(
+        samples, source, baseline_id=baseline_id, live=live,
+        collected_window={"samples_per_probe": samples_per_probe, "probe_count": len(BASELINE_CANARY_PROBES)},
+    )
+    path = write_baseline(baselines_dir, baseline_id, doc)
+    print(json.dumps({"baseline_id": baseline_id, "path": str(path), "evidence_status": doc["evidence_status"], "sample_count": doc["sample_count"]}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def baseline_inspect(args: argparse.Namespace) -> int:
+    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+    doc = load_baseline(baselines_dir, args.baseline_id)
+    if doc is None:
+        raise ValueError(f"baseline not found: {args.baseline_id}")
+    print(json.dumps(doc, ensure_ascii=False, indent=2))
+    return 0
+
+
+def baseline_compare(args: argparse.Namespace) -> int:
+    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+    baseline = load_baseline(baselines_dir, args.baseline_id)
+    if baseline is None:
+        raise ValueError(f"baseline not found: {args.baseline_id}")
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    role = str(args.provider or "tested_model")
+    live = bool(getattr(args, "live", False))
+    if live:
+        load_local_env()
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    if role not in models:
+        raise ValueError("--provider must be tested_model or judge_model")
+    model = models[role]
+    out_dir = baselines_dir / "_compare" / role
+    events_file = out_dir / "compare_events.jsonl"
+    samples = _collect_baseline_samples(
+        model, samples_per_probe=max(1, int(getattr(args, "samples", 2) or 2)),
+        live=live, events_file=events_file,
+    )
+    observed = build_baseline_from_samples(
+        samples,
+        {"provider_id": model.provider_id, "provider_label": role,
+         "base_url_host": base_url_host(model.base_url), "model": model.model, "protocol": model.protocol},
+        baseline_id=f"observed_{role}", live=live,
+    )
+    verdict = compare_to_baseline(observed, baseline)
+    print(json.dumps(verdict, ensure_ascii=False, indent=2))
+    return 0
+
+
 def fingerprint(args: argparse.Namespace) -> int:
     models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
     models = apply_model_overrides(load_two_model_config(models_path), args)
@@ -2200,6 +2359,29 @@ def main() -> int:
     probe_parser.add_argument("--failure-sample", type=int, default=12)
     probe_parser.add_argument("--stop-after-success", action="store_true")
     probe_parser.set_defaults(func=probe)
+
+    baseline_build_parser = sub.add_parser("baseline", help="build a trusted official Claude fingerprint baseline (dry-run by default; --live needs authorization)")
+    baseline_build_parser.add_argument("--providers", type=Path, help="providers config path")
+    baseline_build_parser.add_argument("--provider", default="tested_model", help="trusted-source role: tested_model or judge_model")
+    baseline_build_parser.add_argument("--baseline-id", help="baseline id (default: timestamped BASE-...)")
+    baseline_build_parser.add_argument("--baselines-dir", type=Path, help="baselines output dir")
+    baseline_build_parser.add_argument("--samples", type=int, default=2, help="samples per canary probe")
+    baseline_build_parser.add_argument("--live", action="store_true", help="REAL API calls to the trusted source (cost). Default off = dry-run placeholder")
+    baseline_build_parser.set_defaults(func=baseline_build)
+
+    baseline_inspect_parser = sub.add_parser("baseline-inspect", help="inspect a stored baseline")
+    baseline_inspect_parser.add_argument("--baseline-id", required=True)
+    baseline_inspect_parser.add_argument("--baselines-dir", type=Path)
+    baseline_inspect_parser.set_defaults(func=baseline_inspect)
+
+    baseline_compare_parser = sub.add_parser("baseline-compare", help="compare a suspect provider against a trusted baseline")
+    baseline_compare_parser.add_argument("--baseline-id", required=True)
+    baseline_compare_parser.add_argument("--providers", type=Path, help="providers config path")
+    baseline_compare_parser.add_argument("--provider", default="tested_model", help="suspect role to verify")
+    baseline_compare_parser.add_argument("--baselines-dir", type=Path)
+    baseline_compare_parser.add_argument("--samples", type=int, default=2)
+    baseline_compare_parser.add_argument("--live", action="store_true", help="REAL API calls to the suspect provider (cost)")
+    baseline_compare_parser.set_defaults(func=baseline_compare)
 
     args = parser.parse_args()
     if args.command in {"inspect", "export"} and not args.latest and not args.job_id:
