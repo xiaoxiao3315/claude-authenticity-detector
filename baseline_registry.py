@@ -364,6 +364,9 @@ def compare_to_baseline(
         elif tok.get("score") == 10.0:
             behavior_votes += 1
         evidence.append({"check": "tokenizer_delta", "observed": tok.get("observed"), "result": tok.get("details")})
+    elif isinstance(tok, dict):
+        # advisory only (e.g. too few samples) — show but do not vote/penalize
+        evidence.append({"check": "tokenizer_delta", "observed": tok.get("observed"), "result": tok.get("details"), "advisory": True})
 
     sse = sig.get("sse")
     if isinstance(sse, dict) and sse.get("sse_family"):
@@ -385,6 +388,18 @@ def compare_to_baseline(
             behavior_votes += 1
             behavior_checked += 1
         evidence.append({"check": "error_envelope", "observed": d})
+
+    nd = sig.get("needle")
+    if isinstance(nd, dict) and nd.get("evidence_status") == "live_observed":
+        behavior_checked += 1
+        trunc = nd.get("silent_truncation") or {}
+        if trunc.get("silent_truncation") is True:
+            hard_fail = True  # fake-1M: claimed long context but silently truncated
+            reasons.append("needle_silent_truncation")
+        elif (nd.get("needle_recall") or {}).get("score") == 10.0:
+            behavior_votes += 1
+        evidence.append({"check": "needle_fake_1m", "observed": nd.get("verdict"),
+                         "silent_truncation": trunc.get("silent_truncation")})
 
     # Verdict logic. hard_fail = a STRONG protocol/SSE signal (openai stop_reason,
     # openai usage naming, openai SSE frames). Tokenizer/header are corroborating only.
@@ -683,9 +698,27 @@ def render_verdict_report(verdict: dict[str, Any], *, baseline: dict[str, Any] |
             lines.append(f"  - {r}")
     chain = verdict.get("evidence_chain") or []
     if chain:
-        lines.append("证据链:")
-        for e in chain:
-            lines.append(f"  · {e.get('check')}: baseline={e.get('baseline')} | observed={e.get('observed')}")
+        # #5: group evidence by strength so users see what's definitive vs advisory.
+        STRONG = {"stop_reason_enum", "usage_naming_dialect", "model_id",
+                  "sse_event_order", "error_envelope", "needle_fake_1m", "request_failure_rate"}
+        strong = [e for e in chain if e.get("check") in STRONG and not e.get("advisory")]
+        corro = [e for e in chain if e.get("check") not in STRONG and not e.get("advisory")]
+        advisory = [e for e in chain if e.get("advisory")]
+        def _fmt(e):
+            extra = "".join(f" {k}={e[k]}" for k in ("order_ok", "silent_truncation", "result") if k in e and e[k] is not None)
+            return f"  · {e.get('check')}: baseline={e.get('baseline')} | observed={e.get('observed')}{extra}"
+        if strong:
+            lines.append("强证据（定罪级）:")
+            for e in strong:
+                lines.append(_fmt(e))
+        if corro:
+            lines.append("佐证（参考，单独不定罪）:")
+            for e in corro:
+                lines.append(_fmt(e))
+        if advisory:
+            lines.append("仅参考（样本不足/不计票）:")
+            for e in advisory:
+                lines.append(_fmt(e))
     note = verdict.get("note")
     if note:
         lines.append(f"备注: {note}")

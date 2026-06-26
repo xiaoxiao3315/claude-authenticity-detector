@@ -2064,12 +2064,25 @@ def verify_endpoint(args: argparse.Namespace) -> int:
             noise = sum(filter(None, [_std(bwin, "canary_mixed"), _std(bwin, "canary_zh"),
                                       _std(owin, "canary_mixed"), _std(owin, "canary_zh")]))
             tol = max(0.15 * abs(base_delta), 3.0 * (noise or 1.0), 25.0)
-            score = 10.0 if abs(obs_delta - base_delta) <= tol else 0.0
+            # #4: tokenizer differencing is noisy at small N -> demote to advisory
+            # (score None: shown in evidence, but does NOT vote or penalize the verdict)
+            def _n(w, p):
+                d = w.get(p)
+                return d.get("count") if isinstance(d, dict) else None
+            min_n = min(filter(lambda x: x is not None,
+                               [_n(owin, "canary_mixed"), _n(owin, "canary_zh")] or [None]), default=0)
+            within = abs(obs_delta - base_delta) <= tol
+            if min_n is not None and min_n < 3:
+                score = None  # advisory only — too few samples to trust the delta
+                detail = f"tokenizer delta advisory (only {min_n} samples/probe; need >=3 to vote)"
+            else:
+                score = 10.0 if within else 0.0
+                detail = "tokenizer delta within baseline window (corroborating)" if within else "tokenizer delta off baseline (noisy / corroborating only)"
             behavior["tokenizer"] = {
                 "score": score,
-                "observed": {"obs_delta": round(obs_delta, 1), "base_delta": round(base_delta, 1), "tol": round(tol, 1)},
-                "details": "tokenizer delta within baseline window (corroborating)" if score else "tokenizer delta off baseline (noisy / corroborating only)",
-                "suspected_tokenizer": None if score else "unknown",
+                "observed": {"obs_delta": round(obs_delta, 1), "base_delta": round(base_delta, 1), "tol": round(tol, 1), "min_samples": min_n},
+                "details": detail,
+                "suspected_tokenizer": None if score in (10.0, None) else "unknown",
             }
         # SSE event-order probe
         if getattr(args, "with_sse", False):
@@ -2081,6 +2094,37 @@ def verify_endpoint(args: argparse.Namespace) -> int:
                 with contextlib.redirect_stdout(buf):
                     sse_fingerprint(sse_args)
                 behavior["sse"] = json.loads(buf.getvalue())
+            except Exception:
+                pass
+        # error-envelope probe (#2): malformed request -> classify error dialect
+        if getattr(args, "with_error_envelope", False):
+            try:
+                ee_args = argparse.Namespace(providers=args.providers, provider=role, live=True)
+                import io, contextlib
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    error_envelope(ee_args)
+                ee = json.loads(buf.getvalue())
+                results = ee.get("results") or []
+                # pick a dialect from any 4xx variant
+                dialects = [r.get("error_envelope_dialect") for r in results if (r.get("http_status") or 0) >= 400]
+                if dialects:
+                    behavior["error_envelope"] = {"error_envelope_dialect": dialects[0]}
+            except Exception:
+                pass
+        # needle fake-1M probe (#1): >200K context, recall + silent-truncation
+        if getattr(args, "with_needle", False):
+            try:
+                nd_args = argparse.Namespace(providers=args.providers, provider=role, live=True,
+                                             target_tokens=int(getattr(args, "needle_tokens", 200000) or 200000),
+                                             seed=7, baseline_id=args.baseline_id,
+                                             baselines_dir=getattr(args, "baselines_dir", None), timeout=300.0)
+                import io, contextlib
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    needle(nd_args)
+                nd = json.loads(buf.getvalue())
+                behavior["needle"] = nd
             except Exception:
                 pass
 
@@ -2757,6 +2801,9 @@ def main() -> int:
     verify_parser.add_argument("--live", action="store_true", help="REAL API calls to the suspect (cost)")
     verify_parser.add_argument("--json", action="store_true", help="also print raw JSON verdict")
     verify_parser.add_argument("--with-sse", action="store_true", help="also run the SSE event-order probe (extra live request)")
+    verify_parser.add_argument("--with-error-envelope", action="store_true", help="also run the error-envelope probe (malformed requests)")
+    verify_parser.add_argument("--with-needle", action="store_true", help="also run the fake-1M needle probe (>200K request, slow/expensive)")
+    verify_parser.add_argument("--needle-tokens", type=int, default=200000, help="needle target prompt size in tokens")
     verify_parser.add_argument("--request-delay", type=float, default=0.0, help="seconds to wait between probe requests (avoid upstream rate limits)")
     verify_parser.add_argument("--retries", type=int, default=1, help="retries per request on transient failure (429/5xx)")
     verify_parser.add_argument("--retry-backoff", type=float, default=0.5, help="base backoff seconds between retries")
