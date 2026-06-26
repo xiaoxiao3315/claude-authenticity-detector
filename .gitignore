@@ -27,3 +27,6 @@ venv/
 
 # Accidental Windows test output
 %SystemDrive%/
+
+# Atlas cross-session memory note (not project source)
+ATLAS_PROJECT_MEMORY.md
