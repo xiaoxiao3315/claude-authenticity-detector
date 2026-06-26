@@ -335,6 +335,109 @@ def compare_to_baseline(observed: dict[str, Any], baseline: dict[str, Any]) -> d
     }
 
 
+def score_token_count(
+    *,
+    delta: float | None,
+    text_tokens: float | None,
+    claude_delta_window: list[float] | None,
+    claude_window: list[float] | None,
+    competitor_windows: dict[str, list[float]] | None = None,
+) -> dict[str, Any]:
+    """Score a tokenizer probe.
+
+    delta = input_tokens(self) - input_tokens(diff_partner): prefix-cancelled,
+    the PRIMARY signal. text_tokens = input_tokens(self) - prefix_baseline:
+    secondary cross-check. Returns 10.0 if both land in the Claude window(s),
+    0.0 + suspected_tokenizer if either lands in a competitor window, None if
+    there is not enough evidence (missing tokens / no windows / all out-of-range).
+    """
+    competitor_windows = competitor_windows or {}
+
+    def _in(value: float | None, window: list[float] | None) -> bool | None:
+        if value is None or not window or len(window) != 2:
+            return None
+        return window[0] <= value <= window[1]
+
+    delta_claude = _in(delta, claude_delta_window)
+    text_claude = _in(text_tokens, claude_window)
+
+    # competitor match on either metric = hard fail
+    for label, win in competitor_windows.items():
+        if _in(delta, win) is True or _in(text_tokens, win) is True:
+            return {
+                "score": 0.0,
+                "format_ok": False,
+                "details": f"token count matches competitor tokenizer window: {label}",
+                "suspected_tokenizer": label,
+                "observed": {"delta": delta, "text_tokens": text_tokens},
+            }
+
+    # primary: delta must be in claude delta window; text is cross-check if present
+    if delta_claude is True and text_claude is not False:
+        return {
+            "score": 10.0,
+            "format_ok": True,
+            "details": "token count matches Claude tokenizer (prefix-free delta)",
+            "observed": {"delta": delta, "text_tokens": text_tokens},
+        }
+    if delta_claude is False or text_claude is False:
+        return {
+            "score": 0.0,
+            "format_ok": False,
+            "details": "token count outside Claude window (no competitor match)",
+            "suspected_tokenizer": "unknown",
+            "observed": {"delta": delta, "text_tokens": text_tokens},
+        }
+    return {
+        "score": None,
+        "format_ok": None,
+        "details": "insufficient token evidence (missing tokens or no calibrated windows)",
+        "observed": {"delta": delta, "text_tokens": text_tokens},
+    }
+
+
+def score_needle_recall(canary_code: str | None, response_text: str) -> dict[str, Any]:
+    """Score a needle probe: did the response echo the planted AUTH_CANARY code?"""
+    if not canary_code:
+        return {"score": None, "format_ok": None, "details": "missing canary code"}
+    hit = canary_code in (response_text or "")
+    return {
+        "score": 10.0 if hit else 0.0,
+        "format_ok": hit,
+        "details": "needle recalled" if hit else "needle missed (corroborating only)",
+    }
+
+
+def evaluate_silent_truncation(
+    *,
+    sent_estimate_tokens: float,
+    observed_input_tokens: float | None,
+    prefix_tokens: float | None,
+    shortfall_ratio: float = 0.9,
+    http_status: int = 200,
+) -> dict[str, Any]:
+    """Hard signal for fake-1M: HTTP 200 but reported input_tokens far below sent.
+
+    Only HTTP 200 + token shortfall counts as silent_truncation. HTTP 400/413 etc.
+    are legitimate errors, not fakery. Prefix is subtracted before comparing.
+    """
+    if http_status != 200:
+        return {"silent_truncation": False, "reason": f"non_200_status:{http_status}_legit_not_fakery"}
+    if observed_input_tokens is None:
+        return {"silent_truncation": False, "reason": "no_observed_input_tokens", "prefix_assumed": prefix_tokens is None}
+    effective = observed_input_tokens - (prefix_tokens or 0.0)
+    threshold = sent_estimate_tokens * shortfall_ratio
+    truncated = effective < threshold
+    return {
+        "silent_truncation": bool(truncated),
+        "effective_text_tokens": round(effective, 1),
+        "sent_estimate_tokens": round(sent_estimate_tokens, 1),
+        "threshold": round(threshold, 1),
+        "prefix_assumed": prefix_tokens is None,
+        "reason": "input_tokens_far_below_sent" if truncated else "input_tokens_consistent_with_sent",
+    }
+
+
 def _fake_official_samples(n: int = 6) -> list[dict[str, Any]]:
     """Synthetic samples that look like genuine official Claude (for self-test)."""
     samples = []
@@ -420,6 +523,42 @@ def _self_test() -> None:
     )
     assert dry["evidence_status"] == "dry_run_reference_only"
     assert compare_to_baseline(genuine_observed, dry)["verdict"] == VERDICT_INSUFFICIENT
+
+    # 5. tokenizer probe scoring
+    tok_match = score_token_count(
+        delta=42.0, text_tokens=18.0,
+        claude_delta_window=[38.0, 46.0], claude_window=[14.0, 22.0],
+        competitor_windows={"cl100k": [50.0, 60.0]},
+    )
+    assert tok_match["score"] == 10.0, tok_match
+    tok_comp = score_token_count(
+        delta=55.0, text_tokens=18.0,
+        claude_delta_window=[38.0, 46.0], claude_window=[14.0, 22.0],
+        competitor_windows={"cl100k": [50.0, 60.0]},
+    )
+    assert tok_comp["score"] == 0.0 and tok_comp["suspected_tokenizer"] == "cl100k", tok_comp
+    tok_insufficient = score_token_count(
+        delta=None, text_tokens=None, claude_delta_window=None, claude_window=None,
+    )
+    assert tok_insufficient["score"] is None, tok_insufficient
+
+    # 6. needle recall scoring
+    assert score_needle_recall("AUTH_CANARY=ab12", "... AUTH_CANARY=ab12 ...")["score"] == 10.0
+    assert score_needle_recall("AUTH_CANARY=ab12", "no code here")["score"] == 0.0
+
+    # 7. silent truncation
+    trunc = evaluate_silent_truncation(
+        sent_estimate_tokens=210000, observed_input_tokens=12000, prefix_tokens=4166,
+    )
+    assert trunc["silent_truncation"] is True, trunc
+    ok_full = evaluate_silent_truncation(
+        sent_estimate_tokens=210000, observed_input_tokens=214166, prefix_tokens=4166,
+    )
+    assert ok_full["silent_truncation"] is False, ok_full
+    http_err = evaluate_silent_truncation(
+        sent_estimate_tokens=210000, observed_input_tokens=None, prefix_tokens=4166, http_status=413,
+    )
+    assert http_err["silent_truncation"] is False, http_err
 
     print("baseline_registry self-test ok")
 

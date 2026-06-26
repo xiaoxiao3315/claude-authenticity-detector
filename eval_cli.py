@@ -48,9 +48,11 @@ from baseline_registry import (
     DEFAULT_BASELINES_DIR,
     build_baseline_from_samples,
     compare_to_baseline,
+    evaluate_silent_truncation,
     key_fingerprint,
     load_baseline,
     make_sample,
+    score_needle_recall,
     write_baseline,
 )
 from local_env import load_local_env
@@ -1962,6 +1964,126 @@ def baseline_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+# Fake-1M needle probe. The huge prompt is assembled at run time from a seed
+# (NEVER stored in the 495KB task file). Approx 3.2 chars/token, conservative.
+NEEDLE_CHARS_PER_TOKEN = 3.2
+
+
+def _assemble_needle_prompt(target_tokens: int, seed: int, depth: float = 0.01) -> tuple[str, str]:
+    """Build a >target_tokens filler prompt with a planted AUTH_CANARY at `depth`.
+
+    Reproducible from (target_tokens, seed). Returns (prompt, canary_code).
+    """
+    rng_state = (seed * 2654435761) & 0xFFFFFFFF
+    canary_code = f"AUTH_CANARY={rng_state:08x}"
+    # over-generate ~30% to be safe that real tokens exceed target
+    target_chars = int(target_tokens * NEEDLE_CHARS_PER_TOKEN * 1.3)
+    sentence = (
+        f"Filler line {seed}: the quick brown fox jumps over the lazy dog, "
+        "padding context to stress the model's long-context handling. "
+    )
+    reps = max(1, target_chars // len(sentence) + 1)
+    body = sentence * reps
+    insert_at = int(len(body) * depth)
+    needle_line = f"\n[IMPORTANT MEMO] Remember this exact code and echo it verbatim at the end: {canary_code}\n"
+    prompt = (
+        body[:insert_at]
+        + needle_line
+        + body[insert_at:]
+        + "\n\nTask: Output ONLY the exact AUTH_CANARY code that appeared in the [IMPORTANT MEMO] above, nothing else."
+    )
+    return prompt, canary_code
+
+
+def needle(args: argparse.Namespace) -> int:
+    target_tokens = int(getattr(args, "target_tokens", 200000) or 200000)
+    seed = int(getattr(args, "seed", 1) or 1)
+    live = bool(getattr(args, "live", False))
+    if live:
+        load_local_env()
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    role = str(args.provider or "tested_model")
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    if role not in models:
+        raise ValueError("--provider must be tested_model or judge_model")
+    model = models[role]
+
+    prompt, canary = _assemble_needle_prompt(target_tokens, seed)
+    sent_chars = len(prompt)
+    sent_estimate_tokens = sent_chars / NEEDLE_CHARS_PER_TOKEN
+
+    # prefix from the suspect's own baseline canary_code window if available
+    prefix_tokens = None
+    baseline_id = getattr(args, "baseline_id", None)
+    if baseline_id:
+        baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+        base = load_baseline(baselines_dir, baseline_id)
+        if base:
+            win = ((base.get("behavior") or {}).get("tokenizer_probe_windows") or {}).get("canary_code")
+            if isinstance(win, dict):
+                prefix_tokens = win.get("mean")
+
+    out_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR) / "_needle" / role
+    events_file = out_dir / "needle_events.jsonl"
+
+    http_status = 200
+    observed_input_tokens = None
+    recall = {"score": None, "details": "dry-run: no live response"}
+    if not live:
+        result = {
+            "probe": "needle_recall",
+            "evidence_status": "dry_run_reference_only",
+            "target_tokens": target_tokens,
+            "seed": seed,
+            "canary_sha256": hashlib.sha256(canary.encode()).hexdigest()[:16],
+            "sent_chars": sent_chars,
+            "sent_estimate_tokens": round(sent_estimate_tokens, 1),
+            "note": "dry-run: prompt assembled + canary planted; no API call. Use --live to actually probe.",
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    timeout = httpx.Timeout(float(getattr(args, "timeout", 300.0) or 300.0))
+    with httpx.Client(timeout=timeout) as client:
+        completion = call_model_with_retries(
+            client=client, model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=64, temperature=0, live=True,
+            events_file=events_file, retries=0, retry_backoff=0.0,
+        )
+    if not completion.metrics.ok:
+        err = str(completion.metrics.error or "")
+        m = re.search(r"HTTP\s+(\d+)", err)
+        http_status = int(m.group(1)) if m else 0
+    else:
+        obs = _raw_protocol_observation(completion, model)
+        observed_input_tokens = obs["input_tokens"]
+        recall = score_needle_recall(canary, completion.text)
+
+    truncation = evaluate_silent_truncation(
+        sent_estimate_tokens=sent_estimate_tokens,
+        observed_input_tokens=numeric(observed_input_tokens) if observed_input_tokens is not None else None,
+        prefix_tokens=numeric(prefix_tokens) if prefix_tokens is not None else None,
+        http_status=http_status,
+    )
+    verdict = "fake_1m_silent_truncation" if truncation.get("silent_truncation") else (
+        "context_ok" if recall.get("score") == 10.0 else "insufficient_or_legit_error"
+    )
+    result = {
+        "probe": "needle_recall",
+        "evidence_status": "live_observed",
+        "target_tokens": target_tokens,
+        "seed": seed,
+        "http_status": http_status,
+        "observed_input_tokens": observed_input_tokens,
+        "needle_recall": recall,
+        "silent_truncation": truncation,
+        "verdict": verdict,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def fingerprint(args: argparse.Namespace) -> int:
     models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
     models = apply_model_overrides(load_two_model_config(models_path), args)
@@ -2382,6 +2504,17 @@ def main() -> int:
     baseline_compare_parser.add_argument("--samples", type=int, default=2)
     baseline_compare_parser.add_argument("--live", action="store_true", help="REAL API calls to the suspect provider (cost)")
     baseline_compare_parser.set_defaults(func=baseline_compare)
+
+    needle_parser = sub.add_parser("needle", help="fake-1M context probe: plant a needle in a >200K prompt, check recall + silent truncation (--live, expensive)")
+    needle_parser.add_argument("--providers", type=Path)
+    needle_parser.add_argument("--provider", default="tested_model", help="endpoint to probe")
+    needle_parser.add_argument("--target-tokens", type=int, default=200000, help="approx prompt size in tokens")
+    needle_parser.add_argument("--seed", type=int, default=1, help="reproducible prompt seed")
+    needle_parser.add_argument("--baseline-id", help="baseline to read this link's prefix from (for token shortfall)")
+    needle_parser.add_argument("--baselines-dir", type=Path)
+    needle_parser.add_argument("--timeout", type=float, default=300.0, help="per-request timeout seconds (huge prompts are slow)")
+    needle_parser.add_argument("--live", action="store_true", help="REAL >200K-token API call (expensive). Default off = dry-run assembles prompt only")
+    needle_parser.set_defaults(func=needle)
 
     args = parser.parse_args()
     if args.command in {"inspect", "export"} and not args.latest and not args.job_id:

@@ -335,10 +335,16 @@ def run_rescore(
         judge_error = None
 
         if not rescore_error:
-            try:
-                new_rule_score = score_response(task, response_text)
-            except Exception as exc:
-                rescore_error = f"rule score failed: {type(exc).__name__}: {exc}"
+            # token_count_check needs this run's observed input_tokens (not re-derivable
+            # from text); needle_recall depends on the planted prompt. Skip rescoring
+            # these from text and preserve the original record score.
+            if task.get("scoring_type") in ("token_count_check", "needle_recall"):
+                new_rule_score = None
+            else:
+                try:
+                    new_rule_score = score_response(task, response_text)
+                except Exception as exc:
+                    rescore_error = f"rule score failed: {type(exc).__name__}: {exc}"
 
         if not rescore_error and judge_response:
             if progress_callback:

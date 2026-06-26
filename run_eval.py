@@ -297,12 +297,23 @@ def update_usage(metrics: RunMetrics, usage: dict[str, Any]) -> None:
                 pass
 
 
-def score_response(task: dict[str, Any], response_text: str) -> dict[str, Any]:
+def score_response(
+    task: dict[str, Any],
+    response_text: str,
+    *,
+    metrics: Any = None,
+    run_ctx: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     scoring_type = task.get("scoring_type")
     if scoring_type == "json_exact":
         return score_json_exact(task, response_text)
     if scoring_type == "keyword_check":
         return score_keyword_check(task, response_text)
+    if scoring_type == "token_count_check":
+        return score_token_count_check(task, metrics=metrics, run_ctx=run_ctx)
+    if scoring_type == "needle_recall":
+        from baseline_registry import score_needle_recall
+        return score_needle_recall(task.get("canary_code"), response_text)
     if scoring_type not in ("manual", "manual_rubric", "artifact_review"):
         return {
             "score": None,
@@ -314,6 +325,45 @@ def score_response(task: dict[str, Any], response_text: str) -> dict[str, Any]:
         "format_ok": None,
         "details": "manual scoring required",
     }
+
+
+def score_token_count_check(
+    task: dict[str, Any],
+    *,
+    metrics: Any = None,
+    run_ctx: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Tokenizer probe: needs this run's observed input_tokens + a diff partner.
+
+    run_ctx carries {prefix_baseline_tokens, probe_tokens_by_id}. Without that
+    context (e.g. scored standalone) it returns insufficient, never crashes.
+    """
+    from baseline_registry import score_token_count
+
+    probe = task.get("token_probe") if isinstance(task.get("token_probe"), dict) else {}
+    ctx = run_ctx or {}
+    probe_tokens = ctx.get("probe_tokens_by_id") if isinstance(ctx.get("probe_tokens_by_id"), dict) else {}
+    self_tokens = probe_tokens.get(task.get("id"))
+    if self_tokens is None and metrics is not None:
+        self_tokens = getattr(metrics, "input_tokens", None)
+    partner_id = probe.get("diff_partner_id")
+    partner_tokens = probe_tokens.get(partner_id) if partner_id else None
+    prefix = ctx.get("prefix_baseline_tokens")
+
+    delta = None
+    if self_tokens is not None and partner_tokens is not None:
+        delta = float(self_tokens) - float(partner_tokens)
+    text_tokens = None
+    if self_tokens is not None and prefix is not None:
+        text_tokens = float(self_tokens) - float(prefix)
+
+    return score_token_count(
+        delta=delta,
+        text_tokens=text_tokens,
+        claude_delta_window=probe.get("claude_delta_window"),
+        claude_window=probe.get("claude_window"),
+        competitor_windows=probe.get("competitor_windows"),
+    )
 
 
 def score_json_exact(task: dict[str, Any], response_text: str) -> dict[str, Any]:
