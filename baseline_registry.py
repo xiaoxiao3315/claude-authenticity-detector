@@ -249,6 +249,234 @@ def list_baselines(baselines_dir: Path) -> list[str]:
     return out
 
 
+# --------------------------------------------------------------------------
+# Versioning: keep a lineage of immutable historical snapshots per baseline_id.
+#
+# Layout (additive — never breaks existing single-file consumers):
+#   baselines/<id>/baseline.json            <- LATEST pointer (unchanged shape)
+#   baselines/<id>/versions.json            <- lineage manifest (sidecar)
+#   baselines/<id>/versions/<vNNNN>/baseline.json   <- immutable snapshot
+#
+# load_baseline / list_baselines keep reading baseline.json exactly as before,
+# so all current callers and self-tests are untouched.
+# --------------------------------------------------------------------------
+
+BASELINE_VERSIONS_SCHEMA_VERSION = "claude_baseline_versions_v1"
+
+# Fields that legitimately vary between rebuilds of the "same" baseline and so
+# must be excluded from the content fingerprint used for dedup. Everything else
+# (protocol_fingerprint, behavior) is genuine signal whose change = a new version.
+_CONTENT_HASH_EXCLUDE = {
+    "baseline_id",
+    "evidence_status",
+    "sample_count",
+    "failed_request_count",
+    "request_failure_rate",
+    "collected_window",
+}
+
+
+def content_fingerprint(doc: dict[str, Any]) -> str:
+    """Stable hash of a baseline's SIGNAL content (protocol + behavior + source
+    identity), excluding volatile metadata like sample_count. Two rebuilds that
+    observed the same fingerprint hash equal → no new version is created."""
+    core = {k: v for k, v in doc.items() if k not in _CONTENT_HASH_EXCLUDE}
+    blob = json.dumps(core, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def versions_manifest_path(baselines_dir: Path, baseline_id: str) -> Path:
+    return baseline_dir(baselines_dir, baseline_id) / "versions.json"
+
+
+def load_versions_manifest(baselines_dir: Path, baseline_id: str) -> dict[str, Any] | None:
+    path = versions_manifest_path(baselines_dir, baseline_id)
+    if not path.exists():
+        return None
+    return read_json(path)
+
+
+def list_baseline_versions(baselines_dir: Path, baseline_id: str) -> list[dict[str, Any]]:
+    """Return the lineage entries (oldest→newest) for a baseline_id, or []."""
+    manifest = load_versions_manifest(baselines_dir, baseline_id)
+    if not manifest:
+        return []
+    return list(manifest.get("versions") or [])
+
+
+def load_baseline_version(
+    baselines_dir: Path, baseline_id: str, version: str
+) -> dict[str, Any] | None:
+    """Load one immutable historical snapshot by its version label (e.g. v0003)."""
+    safe = str(version).replace("/", "_").replace("\\", "_")
+    path = baseline_dir(baselines_dir, baseline_id) / "versions" / safe / "baseline.json"
+    if not path.exists():
+        return None
+    return read_json(path)
+
+
+def write_baseline_version(
+    baselines_dir: Path,
+    baseline_id: str,
+    doc: dict[str, Any],
+    *,
+    now: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Commit a baseline as a new immutable version in its lineage.
+
+    - Updates baseline.json (the LATEST pointer) — same shape as write_baseline.
+    - If the content fingerprint equals the current latest version, NO new
+      snapshot is created (returns dedup=True); the pointer is still refreshed.
+    - Otherwise archives an immutable snapshot under versions/<vNNNN>/ and
+      appends an entry (with parent + drift summary) to versions.json.
+
+    `now` is an ISO-ish timestamp string injected by the caller (this module
+    never reads the clock, to stay deterministic / resume-safe).
+    """
+    manifest = load_versions_manifest(baselines_dir, baseline_id) or {
+        "schema_version": BASELINE_VERSIONS_SCHEMA_VERSION,
+        "baseline_id": baseline_id,
+        "versions": [],
+    }
+    versions: list[dict[str, Any]] = list(manifest.get("versions") or [])
+    new_hash = content_fingerprint(doc)
+    prev = versions[-1] if versions else None
+
+    # Always refresh the latest pointer so existing consumers see fresh metadata.
+    pointer_path = write_baseline(baselines_dir, baseline_id, doc)
+
+    # Dedup against the ENTIRE lineage, not just the latest — a fingerprint that
+    # regresses to an already-seen value re-observes that version rather than
+    # forging a spurious new one.
+    match = next((v for v in versions if v.get("content_hash") == new_hash), None)
+    if match is not None:
+        match["last_seen"] = now
+        match["observed_count"] = int(match.get("observed_count") or 1) + 1
+        regressed = match is not prev  # came back to an older version, not the tip
+        manifest["versions"] = versions
+        manifest["updated_at"] = now
+        write_json(versions_manifest_path(baselines_dir, baseline_id), manifest)
+        return {
+            "version": match.get("version"),
+            "dedup": True,
+            "regressed": regressed,
+            "content_hash": new_hash,
+            "pointer_path": str(pointer_path),
+            "drift": None,
+        }
+
+    seq = len(versions) + 1
+    version_label = f"v{seq:04d}"
+    snap_rel = f"versions/{version_label}/baseline.json"
+    snap_path = baseline_dir(baselines_dir, baseline_id) / "versions" / version_label / "baseline.json"
+    write_json(snap_path, doc)
+
+    drift = diff_baselines(load_baseline_version(baselines_dir, baseline_id, prev["version"]), doc) if prev else None
+
+    entry = {
+        "version": version_label,
+        "created_at": now,
+        "last_seen": now,
+        "observed_count": 1,
+        "content_hash": new_hash,
+        "parent": prev.get("version") if prev else None,
+        "evidence_status": doc.get("evidence_status"),
+        "sample_count": doc.get("sample_count"),
+        "model": (doc.get("source") or {}).get("model"),
+        "base_url_host": (doc.get("source") or {}).get("base_url_host"),
+        "note": note,
+        "drift_from_parent": drift,
+        "snapshot_path": snap_rel,  # relative to the baseline dir — portable
+    }
+    versions.append(entry)
+    manifest["versions"] = versions
+    manifest["updated_at"] = now
+    write_json(versions_manifest_path(baselines_dir, baseline_id), manifest)
+    return {
+        "version": version_label,
+        "dedup": False,
+        "content_hash": new_hash,
+        "pointer_path": str(pointer_path),
+        "drift": drift,
+    }
+
+
+def _band_shift(old_dist: dict[str, Any] | None, new_dist: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Relative mean shift between two _distribution() dicts, if both present."""
+    if not old_dist or not new_dist:
+        return None
+    om, nm = numeric(old_dist.get("mean")), numeric(new_dist.get("mean"))
+    if om is None or nm is None:
+        return None
+    abs_delta = round(nm - om, 3)
+    rel = round(abs_delta / om, 4) if om else None
+    return {"old_mean": om, "new_mean": nm, "abs_delta": abs_delta, "rel_delta": rel}
+
+
+def diff_baselines(old: dict[str, Any] | None, new: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Drift summary between two baseline docs (old→new). Surfaces protocol-layer
+    changes (stop_reason enum / usage dialect / model id) and behavior-layer
+    distribution shifts (input_tokens, latency, per-probe tokenizer windows).
+
+    `changed` is True when any protocol field flipped or a tracked mean moved
+    by more than `TOKEN_DRIFT_REL` (tokens/probes) / `LATENCY_DRIFT_REL` (latency).
+    Pure function — used both for lineage records and the diff CLI."""
+    if old is None or new is None:
+        return None
+    TOKEN_DRIFT_REL = 0.02   # >2% mean token shift is worth flagging
+    LATENCY_DRIFT_REL = 0.50  # latency is noisy; only flag big (>50%) moves
+
+    old_proto = old.get("protocol_fingerprint") or {}
+    new_proto = new.get("protocol_fingerprint") or {}
+    old_beh = old.get("behavior") or {}
+    new_beh = new.get("behavior") or {}
+    old_src = old.get("source") or {}
+    new_src = new.get("source") or {}
+
+    protocol_changes: dict[str, Any] = {}
+    for field in ("stop_reason_in_claude_enum",):
+        if old_proto.get(field) != new_proto.get(field):
+            protocol_changes[field] = {"old": old_proto.get(field), "new": new_proto.get(field)}
+    for field in ("stop_reason_counts", "usage_naming_dialect_counts"):
+        if old_proto.get(field) != new_proto.get(field):
+            protocol_changes[field] = {"old": old_proto.get(field), "new": new_proto.get(field)}
+    for field in ("model", "base_url_host", "protocol"):
+        if old_src.get(field) != new_src.get(field):
+            protocol_changes[f"source.{field}"] = {"old": old_src.get(field), "new": new_src.get(field)}
+
+    behavior_changes: dict[str, Any] = {}
+    it_shift = _band_shift(old_beh.get("input_tokens_distribution"), new_beh.get("input_tokens_distribution"))
+    if it_shift and it_shift.get("rel_delta") is not None and abs(it_shift["rel_delta"]) > TOKEN_DRIFT_REL:
+        behavior_changes["input_tokens"] = it_shift
+    lat_shift = _band_shift(old_beh.get("latency_ms_distribution"), new_beh.get("latency_ms_distribution"))
+    if lat_shift and lat_shift.get("rel_delta") is not None and abs(lat_shift["rel_delta"]) > LATENCY_DRIFT_REL:
+        behavior_changes["latency_ms"] = lat_shift
+
+    old_probes = old_beh.get("tokenizer_probe_windows") or {}
+    new_probes = new_beh.get("tokenizer_probe_windows") or {}
+    probe_changes: dict[str, Any] = {}
+    for probe_id in sorted(set(old_probes) | set(new_probes)):
+        if probe_id not in old_probes:
+            probe_changes[probe_id] = {"status": "added"}
+            continue
+        if probe_id not in new_probes:
+            probe_changes[probe_id] = {"status": "removed"}
+            continue
+        shift = _band_shift(old_probes[probe_id], new_probes[probe_id])
+        if shift and shift.get("rel_delta") is not None and abs(shift["rel_delta"]) > TOKEN_DRIFT_REL:
+            probe_changes[probe_id] = shift
+    if probe_changes:
+        behavior_changes["tokenizer_probe_windows"] = probe_changes
+
+    changed = bool(protocol_changes or behavior_changes)
+    return {
+        "changed": changed,
+        "protocol_changes": protocol_changes,
+        "behavior_changes": behavior_changes,
+    }
+
+
 def compare_to_baseline(
     observed: dict[str, Any],
     baseline: dict[str, Any],
@@ -401,11 +629,35 @@ def compare_to_baseline(
         evidence.append({"check": "needle_fake_1m", "observed": nd.get("verdict"),
                          "silent_truncation": trunc.get("silent_truncation")})
 
+    # capability anchors: the dedicated DOWNGRADE detector. A model that keeps
+    # Claude's protocol/tokenizer but solves far fewer hard anchors than baseline
+    # is a silent downgrade (opus -> haiku). This is the one signal that convicts
+    # downgrade on its own (unlike model_id, which is a trivially-forged string).
+    cap = sig.get("capability")
+    capability_downgrade = False
+    if isinstance(cap, dict) and cap.get("score") is not None:
+        behavior_checked += 1
+        if cap.get("score") == 0.0:
+            capability_downgrade = True
+            reasons.append(f"capability_pass_rate_below_baseline:gap={cap.get('gap')}")
+        elif cap.get("score") == 10.0:
+            behavior_votes += 1
+        evidence.append({"check": "capability_anchor", "baseline": cap.get("baseline"),
+                         "observed": cap.get("observed"), "result": cap.get("detail")})
+    elif isinstance(cap, dict):
+        evidence.append({"check": "capability_anchor", "observed": cap.get("observed"),
+                         "result": cap.get("detail"), "advisory": True})
+
     # Verdict logic. hard_fail = a STRONG protocol/SSE signal (openai stop_reason,
     # openai usage naming, openai SSE frames). Tokenizer/header are corroborating only.
     if hard_fail:
         verdict = VERDICT_WRAPPER
         confidence = 0.9 if behavior_checked else 0.85
+    elif capability_downgrade:
+        # genuine-protocol but under-performing -> the textbook silent downgrade
+        verdict = VERDICT_DOWNGRADE
+        confidence = 0.8
+        reasons.append("capability_downgrade_detected")
     elif not model_match:
         verdict = VERDICT_DOWNGRADE
         confidence = 0.6
@@ -499,6 +751,94 @@ def score_token_count(
         "details": "insufficient token evidence (missing tokens or no calibrated windows)",
         "observed": {"delta": delta, "text_tokens": text_tokens},
     }
+
+
+def score_capability_item(item: dict[str, Any], response_text: str) -> dict[str, Any]:
+    """Objectively score one capability-anchor item against a model's answer.
+
+    Capability anchors are graded WITHOUT a judge model (a judge could itself be
+    swapped/unreliable — that's calibrated separately). Grading is deterministic:
+      - check="exact":    normalized answer must equal one of expected_any
+      - check="contains": answer must contain ALL of expected_all (case-insensitive)
+      - check="regex":    answer must match the pattern
+    Returns {passed: bool, detail: str}.
+    """
+    text = (response_text or "").strip()
+    check = str(item.get("check") or "contains").lower()
+
+    if check == "exact":
+        expected = [str(e).strip() for e in (item.get("expected_any") or [])]
+        norm = text.strip().strip(".。").strip()
+        passed = any(norm == e or text == e for e in expected)
+        return {"passed": passed, "detail": ("exact match" if passed else "no exact match")}
+
+    if check == "regex":
+        import re as _re
+        pat = item.get("pattern")
+        try:
+            passed = bool(pat) and _re.search(str(pat), text) is not None
+        except _re.error as exc:
+            return {"passed": False, "detail": f"bad regex: {exc}"}
+        return {"passed": passed, "detail": ("regex matched" if passed else "regex no match")}
+
+    # default: contains ALL expected_all (case-insensitive substring)
+    needles = [str(e).strip() for e in (item.get("expected_all") or [])]
+    low = text.lower()
+    missing = [n for n in needles if n.lower() not in low]
+    passed = bool(needles) and not missing
+    detail = "all key points present" if passed else f"missing: {missing}"
+    return {"passed": passed, "detail": detail}
+
+
+def aggregate_capability(item_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-item capability results into a pass-rate fingerprint.
+
+    item_results: [{id, passed, ok}]. ok=False (call failed) is EXCLUDED from the
+    rate denominator — a 429 is not a wrong answer. Returns pass_rate over the
+    items that actually returned, plus counts."""
+    answered = [r for r in item_results if r.get("ok", True)]
+    failed = [r for r in item_results if not r.get("ok", True)]
+    passed = [r for r in answered if r.get("passed")]
+    n = len(answered)
+    return {
+        "capability_anchor_pass_rate": round(len(passed) / n, 4) if n else None,
+        "answered_count": n,
+        "passed_count": len(passed),
+        "failed_request_count": len(failed),
+        "total_items": len(item_results),
+    }
+
+
+def score_capability_vs_baseline(
+    observed_pass_rate: float | None,
+    baseline_pass_rate: float | None,
+    *,
+    answered_count: int = 0,
+    min_items: int = 5,
+    downgrade_margin: float = 0.25,
+) -> dict[str, Any]:
+    """Compare an observed capability pass-rate against the baseline's.
+
+    A genuine same-tier model tracks the baseline; a silently-downgraded model
+    (opus -> haiku) solves far fewer hard anchors while protocol/tokenizer look
+    identical — capability is the signal that catches it. Returns a graded
+    result feeding compare_to_baseline's behavior layer:
+      score 10 = at/above baseline (match vote)
+      score 0  = pass-rate >= downgrade_margin BELOW baseline (downgrade signal)
+      score None = insufficient (too few answered, or no baseline rate)
+    """
+    if baseline_pass_rate is None or observed_pass_rate is None:
+        return {"score": None, "detail": "no baseline or observed pass-rate", "observed": observed_pass_rate}
+    if answered_count < min_items:
+        return {"score": None, "detail": f"only {answered_count} answered (< {min_items}); advisory",
+                "observed": observed_pass_rate, "advisory": True}
+    gap = round(baseline_pass_rate - observed_pass_rate, 4)
+    if gap >= downgrade_margin:
+        return {"score": 0.0, "suspected_downgrade": True, "gap": gap,
+                "observed": observed_pass_rate, "baseline": baseline_pass_rate,
+                "detail": f"pass-rate {observed_pass_rate} is {gap} below baseline {baseline_pass_rate}"}
+    return {"score": 10.0, "gap": gap, "observed": observed_pass_rate, "baseline": baseline_pass_rate,
+            "detail": f"pass-rate {observed_pass_rate} tracks baseline {baseline_pass_rate}"}
 
 
 def score_needle_recall(canary_code: str | None, response_text: str) -> dict[str, Any]:
@@ -937,6 +1277,94 @@ def _self_test() -> None:
     assert classify_sse_event_order(claude_seq)["is_claude_shaped"] is True
     assert classify_sse_event_order(["chat.completion.chunk", "chat.completion.chunk", "[DONE]"])["sse_family"] == "openai_sse"
     assert classify_sse_event_order(["message_stop", "message_start"])["claude_event_order_ok"] is False
+
+    # 12. baseline versioning — lineage, dedup, drift detection
+    with tempfile.TemporaryDirectory() as tmp:
+        vdir = Path(tmp) / "baselines"
+        bid = "selftest_versioned"
+        v1 = build_baseline_from_samples(_fake_official_samples(), source, baseline_id=bid, live=True)
+        r1 = write_baseline_version(vdir, bid, v1, now="2026-06-27T00:00:00Z", note="first")
+        assert r1["dedup"] is False and r1["version"] == "v0001", r1
+        # latest pointer is readable by the OLD single-file API
+        assert load_baseline(vdir, bid) == v1
+        # identical rebuild -> dedup, no new version, observed_count bumps
+        r2 = write_baseline_version(vdir, bid, v1, now="2026-06-27T01:00:00Z")
+        assert r2["dedup"] is True and r2["version"] == "v0001", r2
+        assert len(list_baseline_versions(vdir, bid)) == 1
+        assert list_baseline_versions(vdir, bid)[0]["observed_count"] == 2
+        # a genuinely different fingerprint -> new version + drift summary
+        shifted = [make_sample(
+            protocol="anthropic_messages", raw_stop_reason="end_turn",
+            raw_usage_keys=["input_tokens", "output_tokens"],
+            input_tokens=500 + i, output_tokens=40 + i, total_ms=900 + i * 10,
+            probe_id="canary_mixed", live=True,
+        ) for i in range(6)]
+        v2 = build_baseline_from_samples(shifted, source, baseline_id=bid, live=True)
+        r3 = write_baseline_version(vdir, bid, v2, now="2026-06-27T02:00:00Z", note="changed")
+        assert r3["dedup"] is False and r3["version"] == "v0002", r3
+        assert r3["drift"] and r3["drift"]["changed"] is True, r3
+        assert len(list_baseline_versions(vdir, bid)) == 2
+        # historical snapshot is immutable & retrievable
+        assert load_baseline_version(vdir, bid, "v0001") == v1
+        assert load_baseline_version(vdir, bid, "v0002") == v2
+        # snapshot_path in the manifest is RELATIVE (portable across machines)
+        man = load_versions_manifest(vdir, bid)
+        assert man["versions"][0]["snapshot_path"] == "versions/v0001/baseline.json", man["versions"][0]
+        # latest pointer reflects v2 (the most recent distinct write)
+        assert load_baseline(vdir, bid) == v2
+        # regressing to an earlier fingerprint re-observes v0001, does NOT forge v0003
+        r4 = write_baseline_version(vdir, bid, v1, now="2026-06-27T03:00:00Z")
+        assert r4["dedup"] is True and r4["version"] == "v0001" and r4.get("regressed") is True, r4
+        assert len(list_baseline_versions(vdir, bid)) == 2  # still just v1, v2
+        # diff of identical docs -> no change
+        assert diff_baselines(v1, v1)["changed"] is False
+        # content fingerprint is stable & excludes volatile metadata
+        v1b = dict(v1)
+        v1b["sample_count"] = 999  # volatile field must not affect the hash
+        assert content_fingerprint(v1b) == content_fingerprint(v1)
+
+    # 13. capability anchors — item scoring, aggregation, downgrade detection
+    # item scoring: exact / contains / regex
+    assert score_capability_item({"check": "exact", "expected_any": ["391"]}, "391")["passed"] is True
+    assert score_capability_item({"check": "exact", "expected_any": ["391"]}, "392")["passed"] is False
+    assert score_capability_item({"check": "exact", "expected_any": ["391"]}, "391.")["passed"] is True  # trailing punct normalized
+    assert score_capability_item({"check": "contains", "expected_all": ["SYN", "ACK"]}, "SYN then SYN-ACK and ACK")["passed"] is True
+    assert score_capability_item({"check": "contains", "expected_all": ["SYN", "ACK"]}, "only SYN here")["passed"] is False
+    assert score_capability_item({"check": "regex", "pattern": r"\b42\b"}, "the answer is 42 ok")["passed"] is True
+    assert score_capability_item({"check": "regex", "pattern": "["}, "x")["passed"] is False  # bad regex -> fail, no crash
+
+    # aggregation: failed calls excluded from denominator
+    agg = aggregate_capability([
+        {"id": "a", "passed": True, "ok": True}, {"id": "b", "passed": True, "ok": True},
+        {"id": "c", "passed": False, "ok": True}, {"id": "d", "passed": None, "ok": False},
+    ])
+    assert agg["answered_count"] == 3 and agg["passed_count"] == 2, agg
+    assert agg["capability_anchor_pass_rate"] == round(2 / 3, 4), agg
+    assert agg["failed_request_count"] == 1, agg
+
+    # vs-baseline: tracks -> match vote; far below -> downgrade; small-N -> advisory
+    near = score_capability_vs_baseline(0.9, 0.95, answered_count=10)
+    assert near["score"] == 10.0, near
+    down = score_capability_vs_baseline(0.5, 0.95, answered_count=10)
+    assert down["score"] == 0.0 and down["suspected_downgrade"] is True, down
+    thin = score_capability_vs_baseline(0.4, 0.95, answered_count=2)
+    assert thin["score"] is None and thin.get("advisory") is True, thin
+
+    # compare_to_baseline: a capability downgrade signal flips a protocol-match to DOWNGRADE
+    cap_src = {"provider_id": "t", "provider_label": "t", "base_url_host": "h",
+               "model": "claude-opus-4-6", "protocol": "anthropic_messages", "key_fingerprint": None}
+    cap_base = build_baseline_from_samples(_fake_official_samples(), cap_src, baseline_id="cap", live=True)
+    cap_obs = build_baseline_from_samples(_fake_official_samples(), cap_src, baseline_id="cap_obs", live=True)
+    cap_down = compare_to_baseline(cap_obs, cap_base, behavior_signals={
+        "capability": {"score": 0.0, "suspected_downgrade": True, "gap": 0.45,
+                       "observed": 0.5, "baseline": 0.95},
+    })
+    assert cap_down["verdict"] == VERDICT_DOWNGRADE and "capability_downgrade_detected" in cap_down["reasons"], cap_down
+    # a matching capability signal is a positive vote, verdict stays match
+    cap_ok = compare_to_baseline(cap_obs, cap_base, behavior_signals={
+        "capability": {"score": 10.0, "gap": 0.02, "observed": 0.93, "baseline": 0.95},
+    })
+    assert cap_ok["verdict"] == VERDICT_MATCHES, cap_ok
 
     print("baseline_registry self-test ok")
 
