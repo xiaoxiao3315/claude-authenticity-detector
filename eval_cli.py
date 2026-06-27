@@ -43,23 +43,37 @@ from campaigns import (
     summarize_campaign,
     write_json as write_campaign_json,
 )
-from authenticity import build_config_protocol_fingerprint, load_or_build_authenticity, write_authenticity_evidence
+from authenticity import build_config_protocol_fingerprint, load_or_build_authenticity, write_authenticity_evidence, numeric
 from baseline_registry import (
     DEFAULT_BASELINES_DIR,
+    aggregate_capability,
     build_baseline_from_samples,
     classify_error_envelope,
     classify_sse_event_order,
     compare_to_baseline,
     derive_token_windows,
+    diff_baselines,
     evaluate_silent_truncation,
     key_fingerprint,
     load_baseline,
+    load_baseline_version,
+    list_baseline_versions,
     make_sample,
     render_verdict_report,
+    score_capability_item,
+    score_capability_vs_baseline,
     score_needle_recall,
     write_baseline,
+    write_baseline_version,
 )
 from local_env import load_local_env
+from judge_calibration import (
+    classify_judge,
+    compute_calibration,
+    load_golden_set,
+    normalize_decision,
+    render_calibration_report,
+)
 from quality_gate import run_quality_gate
 from run_records import extract_raw_event_types, stable_json_hash, text_hash
 from trace_evaluation import run_trace_evaluation
@@ -1939,8 +1953,28 @@ def baseline_build(args: argparse.Namespace) -> int:
         samples, source, baseline_id=baseline_id, live=live,
         collected_window={"samples_per_probe": samples_per_probe, "probe_count": len(BASELINE_CANARY_PROBES)},
     )
-    path = write_baseline(baselines_dir, baseline_id, doc)
-    print(json.dumps({"baseline_id": baseline_id, "path": str(path), "evidence_status": doc["evidence_status"], "sample_count": doc["sample_count"]}, ensure_ascii=False, indent=2))
+    if getattr(args, "no_version", False):
+        path = write_baseline(baselines_dir, baseline_id, doc)
+        print(json.dumps({"baseline_id": baseline_id, "path": str(path), "evidence_status": doc["evidence_status"], "sample_count": doc["sample_count"], "versioned": False}, ensure_ascii=False, indent=2))
+        return 0
+    result = write_baseline_version(
+        baselines_dir, baseline_id, doc,
+        now=now_iso(), note=getattr(args, "note", None),
+    )
+    summary = {
+        "baseline_id": baseline_id,
+        "version": result["version"],
+        "dedup": result["dedup"],
+        "evidence_status": doc["evidence_status"],
+        "sample_count": doc["sample_count"],
+        "pointer_path": result["pointer_path"],
+    }
+    if result.get("regressed"):
+        # fingerprint matched an OLDER version, not the tip — worth surfacing.
+        summary["regressed_to_prior_version"] = True
+    if result.get("drift") and result["drift"].get("changed"):
+        summary["drift_from_parent"] = result["drift"]
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1950,6 +1984,66 @@ def baseline_inspect(args: argparse.Namespace) -> int:
     if doc is None:
         raise ValueError(f"baseline not found: {args.baseline_id}")
     print(json.dumps(doc, ensure_ascii=False, indent=2))
+    return 0
+
+
+def baseline_versions(args: argparse.Namespace) -> int:
+    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+    versions = list_baseline_versions(baselines_dir, args.baseline_id)
+    if not versions:
+        # An un-versioned (legacy) baseline still exists as a single file.
+        if load_baseline(baselines_dir, args.baseline_id) is not None:
+            print(json.dumps({"baseline_id": args.baseline_id, "versions": [], "note": "legacy single-file baseline (no lineage yet); rebuild to start versioning"}, ensure_ascii=False, indent=2))
+            return 0
+        raise ValueError(f"baseline not found: {args.baseline_id}")
+    rows = [
+        {
+            "version": v.get("version"),
+            "created_at": v.get("created_at"),
+            "last_seen": v.get("last_seen"),
+            "observed_count": v.get("observed_count"),
+            "evidence_status": v.get("evidence_status"),
+            "sample_count": v.get("sample_count"),
+            "model": v.get("model"),
+            "content_hash": v.get("content_hash"),
+            "drift_changed": bool((v.get("drift_from_parent") or {}).get("changed")),
+            "note": v.get("note"),
+        }
+        for v in versions
+    ]
+    print(json.dumps({"baseline_id": args.baseline_id, "version_count": len(rows), "versions": rows}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def baseline_diff(args: argparse.Namespace) -> int:
+    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+
+    def _resolve(ref: str) -> dict[str, Any] | None:
+        # "latest" / None -> the current pointer; otherwise a version label (v0003).
+        if ref in (None, "", "latest"):
+            return load_baseline(baselines_dir, args.baseline_id)
+        return load_baseline_version(baselines_dir, args.baseline_id, ref)
+
+    versions = list_baseline_versions(baselines_dir, args.baseline_id)
+    from_ref = getattr(args, "from_version", None)
+    to_ref = getattr(args, "to_version", None) or "latest"
+    if from_ref is None:
+        # default: diff the previous version against the latest
+        if len(versions) >= 2:
+            from_ref = versions[-2]["version"]
+        elif len(versions) == 1:
+            from_ref = versions[-1]["version"]
+        else:
+            raise ValueError("no version lineage to diff; rebuild the baseline first")
+
+    old = _resolve(from_ref)
+    new = _resolve(to_ref)
+    if old is None:
+        raise ValueError(f"version not found: {from_ref}")
+    if new is None:
+        raise ValueError(f"version not found: {to_ref}")
+    drift = diff_baselines(old, new)
+    print(json.dumps({"baseline_id": args.baseline_id, "from": from_ref, "to": to_ref, "drift": drift}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -2003,6 +2097,173 @@ def baseline_compare(args: argparse.Namespace) -> int:
         print(render_verdict_report(verdict, baseline=baseline))
     else:
         print(json.dumps(verdict, ensure_ascii=False, indent=2))
+    return 0
+
+
+def judge_calibrate(args: argparse.Namespace) -> int:
+    """Calibrate the judge model against an authored golden-set.
+
+    For each golden case, send (task, candidate_answer) to the judge model,
+    parse its JSON verdict, and feed the observed decision/score into the
+    offline calibration metrics. --live makes REAL judge calls (cost). Without
+    --live it runs dry (stub judge), useful only to smoke the wiring.
+    """
+    golden_path = resolve_path(args.golden_set)
+    golden = load_golden_set(golden_path)
+    cases = golden["cases"]
+
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    role = str(args.provider or "judge_model")
+    live = bool(getattr(args, "live", False))
+    if live:
+        load_local_env()
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    if role not in models:
+        raise ValueError(f"--provider role '{role}' not found in providers config")
+    judge_model = models[role]
+    judge_max_tokens = int(getattr(args, "judge_max_tokens", None) or 512)
+    retries = int(getattr(args, "retries", 0) or 0)
+    retry_backoff = float(getattr(args, "retry_backoff", 0.0) or 0.0)
+    request_delay = float(getattr(args, "request_delay", 0.0) or 0.0)
+
+    out_dir = resolve_path(getattr(args, "out_dir", None) or (DEFAULT_BASELINES_DIR / "_judge_calibration"))
+    events_file = out_dir / "judge_events.jsonl"
+    client_timeout = httpx.Timeout(float(getattr(args, "timeout", 120.0) or 120.0))
+
+    observations: list[dict[str, Any]] = []
+    with httpx.Client(timeout=client_timeout, follow_redirects=True) as client:
+        for i, case in enumerate(cases):
+            if live and request_delay and i > 0:
+                time.sleep(request_delay)
+            task = case.get("task") or {}
+            candidate = str(case.get("candidate_answer") or "")
+            completion = call_model_with_retries(
+                client=client,
+                model=judge_model,
+                messages=judge_messages(task, candidate),
+                max_tokens=judge_max_tokens,
+                temperature=0,
+                live=live,
+                events_file=events_file,
+                retries=retries,
+                retry_backoff=retry_backoff,
+            )
+            if not completion.metrics.ok:
+                observations.append({"id": case["id"], "observed_decision": None, "ok": False,
+                                     "error": redact_text(completion.metrics.error, max_chars=300)})
+                continue
+            payload, parse_error = parse_judge_json(completion.text)
+            if payload is None:
+                observations.append({"id": case["id"], "observed_decision": None, "ok": False,
+                                     "error": redact_text(parse_error or "judge JSON parse failed", max_chars=300)})
+                continue
+            observations.append({
+                "id": case["id"],
+                "observed_decision": normalize_decision(payload.get("decision")),
+                "observed_score": payload.get("score_0_10"),
+                "ok": True,
+            })
+
+    result = compute_calibration(cases, observations)
+    result["judge_provider"] = judge_model.provider_id
+    result["judge_model_requested"] = judge_model.model
+    result["live"] = live
+    verdict = classify_judge(result, min_scored=int(getattr(args, "min_scored", 4) or 4))
+
+    if getattr(args, "write", False):
+        from baseline_registry import write_json as _wj
+        _wj(out_dir / "last_calibration.json", {"result": result, "verdict": verdict})
+
+    if getattr(args, "report", False):
+        print(render_calibration_report(result, verdict))
+    else:
+        print(json.dumps({"verdict": verdict, "result": result}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _run_capability_items(
+    items: list[dict[str, Any]], model: ModelConfig, *,
+    live: bool, events_file: Path, request_delay: float, retries: int,
+    retry_backoff: float, max_tokens: int, timeout: float,
+) -> list[dict[str, Any]]:
+    """Send each capability item to the model and grade it deterministically."""
+    results: list[dict[str, Any]] = []
+    client_timeout = httpx.Timeout(float(timeout or 120.0))
+    with httpx.Client(timeout=client_timeout, follow_redirects=True) as client:
+        for i, item in enumerate(items):
+            if live and request_delay and i > 0:
+                time.sleep(request_delay)
+            completion = call_model_with_retries(
+                client=client, model=model,
+                messages=[{"role": "user", "content": str(item.get("prompt") or "")}],
+                max_tokens=max_tokens, temperature=0, live=live,
+                events_file=events_file, retries=retries, retry_backoff=retry_backoff,
+            )
+            if not completion.metrics.ok:
+                results.append({"id": item.get("id"), "passed": None, "ok": False,
+                                "detail": redact_text(completion.metrics.error, max_chars=200)})
+                continue
+            graded = score_capability_item(item, completion.text)
+            results.append({"id": item.get("id"), "passed": graded["passed"], "ok": True,
+                            "detail": graded["detail"]})
+    return results
+
+
+def capability_probe(args: argparse.Namespace) -> int:
+    """Probe a provider's capability pass-rate on hard anchors (downgrade detector).
+
+    Runs the objective anchor set, grades deterministically (no judge), and
+    writes capability_anchor.json into the baseline dir. With --baseline-id it
+    becomes the trusted baseline's pass-rate; for a suspect, compare via
+    verify-endpoint --with-capability. --live makes REAL calls (cost).
+    """
+    items_path = resolve_path(args.items)
+    items_doc = read_json(items_path)
+    items = items_doc.get("items") if isinstance(items_doc, dict) else items_doc
+    if not isinstance(items, list) or not items:
+        raise ValueError(f"capability item set has no 'items': {items_path}")
+
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    role = str(args.provider or "tested_model")
+    live = bool(getattr(args, "live", False))
+    if live:
+        load_local_env()
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    if role not in models:
+        raise ValueError(f"--provider role '{role}' not found in providers config")
+    model = models[role]
+
+    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+    out_id = getattr(args, "baseline_id", None)
+    out_dir = (baselines_dir / out_id.replace("/", "_").replace("\\", "_")) if out_id else (baselines_dir / "_capability" / role)
+    events_file = out_dir / "capability_events.jsonl"
+
+    results = _run_capability_items(
+        items, model, live=live, events_file=events_file,
+        request_delay=float(getattr(args, "request_delay", 0.0) or 0.0),
+        retries=int(getattr(args, "retries", 1) or 0),
+        retry_backoff=float(getattr(args, "retry_backoff", 0.5) or 0.0),
+        max_tokens=int(getattr(args, "max_tokens", 256) or 256),
+        timeout=float(getattr(args, "timeout", 120.0) or 120.0),
+    )
+    agg = aggregate_capability(results)
+    doc = {
+        "schema_version": "capability_anchor_v1",
+        "evidence_status": "live_observed" if live else "dry_run_reference_only",
+        "provider_id": model.provider_id,
+        "model": model.model,
+        "items_source": str(items_path.name),
+        **agg,
+        "per_item": results,
+    }
+    from baseline_registry import write_json as _wj
+    _wj(out_dir / "capability_anchor.json", doc)
+
+    summary = {k: doc[k] for k in ("capability_anchor_pass_rate", "answered_count",
+                                   "passed_count", "failed_request_count", "total_items",
+                                   "evidence_status")}
+    summary["written_to"] = str(out_dir / "capability_anchor.json")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -2125,6 +2386,36 @@ def verify_endpoint(args: argparse.Namespace) -> int:
                     needle(nd_args)
                 nd = json.loads(buf.getvalue())
                 behavior["needle"] = nd
+            except Exception:
+                pass
+        # capability-anchor probe: the dedicated silent-DOWNGRADE detector.
+        # Runs the hard anchors against the suspect, compares pass-rate to the
+        # baseline's stored capability_anchor.json (built earlier via capability-probe).
+        if getattr(args, "with_capability", False):
+            try:
+                cap_items_path = resolve_path(getattr(args, "capability_items", None)
+                                              or (ROOT / "judge_golden" / "capability_anchors_v1.json"))
+                cap_items_doc = read_json(cap_items_path)
+                cap_items = cap_items_doc.get("items") if isinstance(cap_items_doc, dict) else cap_items_doc
+                base_cap_path = baselines_dir / str(args.baseline_id).replace("/", "_").replace("\\", "_") / "capability_anchor.json"
+                base_rate = None
+                if base_cap_path.exists():
+                    base_rate = numeric(read_json(base_cap_path).get("capability_anchor_pass_rate"))
+                cap_results = _run_capability_items(
+                    cap_items, model, live=True,
+                    events_file=out_dir / "capability_events.jsonl",
+                    request_delay=float(getattr(args, "request_delay", 0.0) or 0.0),
+                    retries=int(getattr(args, "retries", 1) or 1),
+                    retry_backoff=float(getattr(args, "retry_backoff", 0.5) or 0.5),
+                    max_tokens=256, timeout=120.0,
+                )
+                cap_agg = aggregate_capability(cap_results)
+                cap_score = score_capability_vs_baseline(
+                    cap_agg.get("capability_anchor_pass_rate"), base_rate,
+                    answered_count=cap_agg.get("answered_count", 0),
+                )
+                behavior["capability"] = {**cap_score, "answered": cap_agg.get("answered_count"),
+                                          "passed": cap_agg.get("passed_count")}
             except Exception:
                 pass
 
@@ -2779,12 +3070,42 @@ def main() -> int:
     baseline_build_parser.add_argument("--baselines-dir", type=Path, help="baselines output dir")
     baseline_build_parser.add_argument("--samples", type=int, default=2, help="samples per canary probe")
     baseline_build_parser.add_argument("--live", action="store_true", help="REAL API calls to the trusted source (cost). Default off = dry-run placeholder")
+    baseline_build_parser.add_argument("--note", help="optional note recorded with this baseline version")
+    baseline_build_parser.add_argument("--no-version", action="store_true", help="legacy mode: overwrite baseline.json without keeping a version lineage")
     baseline_build_parser.set_defaults(func=baseline_build)
 
     baseline_inspect_parser = sub.add_parser("baseline-inspect", help="inspect a stored baseline")
     baseline_inspect_parser.add_argument("--baseline-id", required=True)
     baseline_inspect_parser.add_argument("--baselines-dir", type=Path)
     baseline_inspect_parser.set_defaults(func=baseline_inspect)
+
+    baseline_versions_parser = sub.add_parser("baseline-versions", help="list the version lineage of a baseline (timestamps, drift, dedup count)")
+    baseline_versions_parser.add_argument("--baseline-id", required=True)
+    baseline_versions_parser.add_argument("--baselines-dir", type=Path)
+    baseline_versions_parser.set_defaults(func=baseline_versions)
+
+    baseline_diff_parser = sub.add_parser("baseline-diff", help="diff two baseline versions (protocol + behavior drift). Defaults to prev→latest")
+    baseline_diff_parser.add_argument("--baseline-id", required=True)
+    baseline_diff_parser.add_argument("--baselines-dir", type=Path)
+    baseline_diff_parser.add_argument("--from-version", help="older version label (e.g. v0001); default = the previous version")
+    baseline_diff_parser.add_argument("--to-version", help="newer version label or 'latest' (default)")
+    baseline_diff_parser.set_defaults(func=baseline_diff)
+
+    judge_calib_parser = sub.add_parser("judge-calibrate", help="calibrate the judge model against an authored golden-set (--live makes real judge calls)")
+    judge_calib_parser.add_argument("--golden-set", required=True, type=Path, help="path to a judge golden-set JSON (see judge_calibration --emit-sample)")
+    judge_calib_parser.add_argument("--providers", type=Path, help="providers config path")
+    judge_calib_parser.add_argument("--provider", default="judge_model", help="role to use as the judge (default judge_model)")
+    judge_calib_parser.add_argument("--judge-max-tokens", type=int, default=512)
+    judge_calib_parser.add_argument("--min-scored", type=int, default=4, help="minimum scored cases before a non-insufficient verdict")
+    judge_calib_parser.add_argument("--retries", type=int, default=0)
+    judge_calib_parser.add_argument("--retry-backoff", type=float, default=0.0)
+    judge_calib_parser.add_argument("--request-delay", type=float, default=0.0, help="seconds between judge calls (avoid rate limits)")
+    judge_calib_parser.add_argument("--timeout", type=float, default=120.0)
+    judge_calib_parser.add_argument("--out-dir", type=Path, help="where to write events + last_calibration.json")
+    judge_calib_parser.add_argument("--live", action="store_true", help="REAL judge API calls (cost). Default off = dry-run wiring smoke")
+    judge_calib_parser.add_argument("--report", action="store_true", help="print a human-readable Chinese report instead of JSON")
+    judge_calib_parser.add_argument("--write", action="store_true", help="persist last_calibration.json to out-dir")
+    judge_calib_parser.set_defaults(func=judge_calibrate)
 
     baseline_derive_parser = sub.add_parser("baseline-derive-windows", help="derive token_count_check windows from a trusted live baseline (no offline tokenizer needed)")
     baseline_derive_parser.add_argument("--baseline-id", required=True)
@@ -2816,10 +3137,26 @@ def main() -> int:
     verify_parser.add_argument("--with-error-envelope", action="store_true", help="also run the error-envelope probe (malformed requests)")
     verify_parser.add_argument("--with-needle", action="store_true", help="also run the fake-1M needle probe (>200K request, slow/expensive)")
     verify_parser.add_argument("--needle-tokens", type=int, default=120000, help="needle target prompt size in tokens")
+    verify_parser.add_argument("--with-capability", action="store_true", help="also run the capability-anchor probe (silent-downgrade detector; needs a baseline capability_anchor.json)")
+    verify_parser.add_argument("--capability-items", type=Path, help="capability anchor item set (default judge_golden/capability_anchors_v1.json)")
     verify_parser.add_argument("--request-delay", type=float, default=0.0, help="seconds to wait between probe requests (avoid upstream rate limits)")
     verify_parser.add_argument("--retries", type=int, default=1, help="retries per request on transient failure (429/5xx)")
     verify_parser.add_argument("--retry-backoff", type=float, default=0.5, help="base backoff seconds between retries")
     verify_parser.set_defaults(func=verify_endpoint)
+
+    capability_parser = sub.add_parser("capability-probe", help="probe a provider's capability pass-rate on hard anchors (silent-downgrade detector); writes capability_anchor.json")
+    capability_parser.add_argument("--items", type=Path, default=ROOT / "judge_golden" / "capability_anchors_v1.json", help="capability anchor item set")
+    capability_parser.add_argument("--providers", type=Path)
+    capability_parser.add_argument("--provider", default="tested_model", help="role to probe (trusted source for baseline; suspect otherwise)")
+    capability_parser.add_argument("--baseline-id", help="write the result into this baseline dir (its capability_anchor.json becomes the reference rate)")
+    capability_parser.add_argument("--baselines-dir", type=Path)
+    capability_parser.add_argument("--max-tokens", type=int, default=256)
+    capability_parser.add_argument("--request-delay", type=float, default=0.0)
+    capability_parser.add_argument("--retries", type=int, default=1)
+    capability_parser.add_argument("--retry-backoff", type=float, default=0.5)
+    capability_parser.add_argument("--timeout", type=float, default=120.0)
+    capability_parser.add_argument("--live", action="store_true", help="REAL API calls (cost). Default off = dry-run wiring smoke")
+    capability_parser.set_defaults(func=capability_probe)
 
     error_env_parser = sub.add_parser("error-envelope", help="#8 probe: send malformed requests, classify error-body dialect (anthropic/openai/generic)")
     error_env_parser.add_argument("--providers", type=Path)
