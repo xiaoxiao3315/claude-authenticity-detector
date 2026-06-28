@@ -655,6 +655,7 @@ def compare_to_baseline(
     # downgrade on its own (unlike model_id, which is a trivially-forged string).
     cap = sig.get("capability")
     capability_downgrade = False
+    capability_borderline = False
     if not _probe_failed("capability", cap):
       if isinstance(cap, dict) and cap.get("score") is not None:
         behavior_checked += 1
@@ -663,11 +664,21 @@ def compare_to_baseline(
             reasons.append(f"capability_pass_rate_below_baseline:gap={cap.get('gap')}")
         elif cap.get("score") == 10.0:
             behavior_votes += 1
+        elif cap.get("score") == 5.0:
+            # borderline gap or large-gap-on-too-few-samples: corroborating
+            # REVIEW signal, NOT a stand-alone downgrade conviction.
+            capability_borderline = True
+            reasons.append(f"capability_pass_rate_borderline:gap={cap.get('gap')}")
         evidence.append({"check": "capability_anchor", "baseline": cap.get("baseline"),
                          "observed": cap.get("observed"), "result": cap.get("detail")})
       elif isinstance(cap, dict):
         evidence.append({"check": "capability_anchor", "observed": cap.get("observed"),
                          "result": cap.get("detail"), "advisory": True})
+
+    # A borderline capability gap is a soft signal: it lowers confidence and, with
+    # one more soft miss, routes to REVIEW — but never convicts downgrade alone.
+    if capability_borderline:
+        behavior_soft_misses += 1
 
     # Verdict logic. hard_fail = a STRONG protocol/SSE signal (openai stop_reason,
     # openai usage naming, openai SSE frames). Tokenizer/header are corroborating only.
@@ -851,15 +862,31 @@ def score_capability_vs_baseline(
     answered_count: int = 0,
     min_items: int = 5,
     downgrade_margin: float = 0.25,
+    review_margin: float = 0.12,
+    confident_items: int = 10,
 ) -> dict[str, Any]:
     """Compare an observed capability pass-rate against the baseline's.
 
     A genuine same-tier model tracks the baseline; a silently-downgraded model
     (opus -> haiku) solves far fewer hard anchors while protocol/tokenizer look
-    identical — capability is the signal that catches it. Returns a graded
-    result feeding compare_to_baseline's behavior layer:
-      score 10 = at/above baseline (match vote)
-      score 0  = pass-rate >= downgrade_margin BELOW baseline (downgrade signal)
+    identical — capability is the signal that catches it.
+
+    Threshold rationale (anchors are objectively-graded, single-interpretation,
+    temperature 0, so a same-tier model is near-deterministic at ~1.0):
+      - downgrade_margin 0.25: a real tier drop (opus->haiku on hard anchors)
+        moves pass-rate by far more than sampling noise on ~12 items; 0.25 is
+        a conservative floor that a same-tier jitter won't cross.
+      - review_margin 0.12: gaps in [0.12, 0.25) are suspicious but within the
+        range a small-N estimate could produce by noise -> REVIEW, not convict.
+      - confident_items 10: a hard downgrade conviction (score 0) needs enough
+        answered anchors to trust the point estimate. With min_items..confident_items
+        answered, even a >=downgrade_margin gap is only a borderline REVIEW (the
+        estimate is too noisy to convict on its own).
+
+    Returns a graded result feeding compare_to_baseline's behavior layer:
+      score 10  = at/near baseline (match vote)
+      score 0   = confident downgrade (gap >= downgrade_margin AND enough samples)
+      score 5   = borderline (review_margin <= gap, but not a confident convict)
       score None = insufficient (too few answered, or no baseline rate)
     """
     if baseline_pass_rate is None or observed_pass_rate is None:
@@ -868,10 +895,18 @@ def score_capability_vs_baseline(
         return {"score": None, "detail": f"only {answered_count} answered (< {min_items}); advisory",
                 "observed": observed_pass_rate, "advisory": True}
     gap = round(baseline_pass_rate - observed_pass_rate, 4)
-    if gap >= downgrade_margin:
+    if gap >= downgrade_margin and answered_count >= confident_items:
         return {"score": 0.0, "suspected_downgrade": True, "gap": gap,
                 "observed": observed_pass_rate, "baseline": baseline_pass_rate,
-                "detail": f"pass-rate {observed_pass_rate} is {gap} below baseline {baseline_pass_rate}"}
+                "detail": f"pass-rate {observed_pass_rate} is {gap} below baseline {baseline_pass_rate} "
+                          f"(confident: {answered_count} anchors)"}
+    if gap >= review_margin:
+        # either a mid-band gap, or a large gap on too few samples to convict
+        reason = ("borderline gap" if gap < downgrade_margin
+                  else f"large gap but only {answered_count} anchors (< {confident_items} to convict)")
+        return {"score": 5.0, "borderline": True, "gap": gap,
+                "observed": observed_pass_rate, "baseline": baseline_pass_rate,
+                "detail": f"pass-rate {observed_pass_rate} is {gap} below baseline {baseline_pass_rate} ({reason}); review"}
     return {"score": 10.0, "gap": gap, "observed": observed_pass_rate, "baseline": baseline_pass_rate,
             "detail": f"pass-rate {observed_pass_rate} tracks baseline {baseline_pass_rate}"}
 
@@ -1412,6 +1447,12 @@ def _self_test() -> None:
     assert down["score"] == 0.0 and down["suspected_downgrade"] is True, down
     thin = score_capability_vs_baseline(0.4, 0.95, answered_count=2)
     assert thin["score"] is None and thin.get("advisory") is True, thin
+    # borderline band: a mid-range gap (>=review_margin, <downgrade_margin) -> REVIEW (5.0)
+    border = score_capability_vs_baseline(0.80, 0.95, answered_count=12)  # gap 0.15
+    assert border["score"] == 5.0 and border.get("borderline") is True, border
+    # a large gap but too few answered to convict -> borderline REVIEW, not a hard 0.0
+    big_thin = score_capability_vs_baseline(0.5, 0.95, answered_count=6)  # gap 0.45, <confident_items
+    assert big_thin["score"] == 5.0 and big_thin.get("borderline") is True, big_thin
 
     # compare_to_baseline: a capability downgrade signal flips a protocol-match to DOWNGRADE
     cap_src = {"provider_id": "t", "provider_label": "t", "base_url_host": "h",
