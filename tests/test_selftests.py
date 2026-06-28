@@ -34,6 +34,7 @@ IMPORTABLE_SELFTESTS = {
     "baseline_registry": "_self_test",
     "judge_calibration": "_self_test",
     "logging_setup": "_self_test",
+    "redaction": "_self_test",
     "authenticity": "_self_test",
     "job_runtime": "_self_test",
     "quality_gate": "self_test",

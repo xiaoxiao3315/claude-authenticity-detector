@@ -41,6 +41,7 @@ SELFTEST_FLAG_MODULES = [
     "logging_setup",
     "model_client",
     "quality_gate",
+    "redaction",
     "rescore",
     "run_eval",
     "trace_evaluation",

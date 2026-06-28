@@ -29,6 +29,7 @@ STRICT_MODULES = [
     "rescore",
     "decisions",
     "logging_setup",
+    "redaction",
 ]
 
 
