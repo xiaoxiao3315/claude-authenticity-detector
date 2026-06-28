@@ -154,3 +154,43 @@ def test_campaign_list_after_run(tmp_path, capsys):
     flat = capsys.readouterr().out
     assert "camp_test" in flat
 
+
+# ---------------------------------------------------------------------------
+# export_campaign: run -> export -> the produced pack verifies (round-trip)
+# ---------------------------------------------------------------------------
+def test_export_campaign_verifies(tmp_path, capsys):
+    import campaigns as C
+    import acceptance_pack as AP
+    E.run_campaign(_campaign_ns(tmp_path))
+    capsys.readouterr()
+    camp_dir = tmp_path / "campaigns" / "camp_test"
+    runs_dir = tmp_path / "runs"
+    zip_path = C.export_campaign(camp_dir, runs_dir)
+    assert zip_path.exists() and zip_path.name == "acceptance_pack.zip"
+    result = AP.verify_acceptance_pack(zip_path)
+    assert result["verified"] is True, result
+
+
+def test_export_campaign_include_raw(tmp_path, capsys):
+    import campaigns as C
+    import acceptance_pack as AP
+    E.run_campaign(_campaign_ns(tmp_path))
+    capsys.readouterr()
+    camp_dir = tmp_path / "campaigns" / "camp_test"
+    zip_path = C.export_campaign(camp_dir, tmp_path / "runs", include_raw=True)
+    assert AP.verify_acceptance_pack(zip_path)["verified"] is True
+
+
+# ---------------------------------------------------------------------------
+# campaign_leaderboard over a produced campaign
+# ---------------------------------------------------------------------------
+def test_campaign_leaderboard_after_run(tmp_path, capsys):
+    import campaigns as C
+    E.run_campaign(_campaign_ns(tmp_path))
+    capsys.readouterr()
+    board = C.campaign_leaderboard(tmp_path / "campaigns", tmp_path / "runs",
+                                   include_dry_run=True, persist_refresh=False)
+    assert isinstance(board, dict)
+    # the produced campaign should surface somewhere in the payload
+    assert "camp_test" in json.dumps(board, ensure_ascii=False)
+
