@@ -74,6 +74,7 @@ from judge_calibration import (
     render_calibration_report,
 )
 from quality_gate import run_quality_gate
+from run_eval import iter_sse_events
 from run_records import extract_raw_event_types, stable_json_hash, text_hash
 from trace_evaluation import run_trace_evaluation
 from validate_run_records import validate_records
@@ -2260,22 +2261,25 @@ def sse_fingerprint(args: argparse.Namespace) -> int:
             with client.stream("POST", url, headers=headers, json=payload) as resp:
                 http_status = resp.status_code
                 if http_status == 200:
-                    for line in resp.iter_lines():
-                        line = line.strip()
-                        if line.startswith("event:"):
-                            event_types.append(line.split(":", 1)[1].strip())
-                        elif line.startswith("data:"):
-                            data = line.split(":", 1)[1].strip()
-                            if data == "[DONE]":
-                                event_types.append("[DONE]")
-                            else:
-                                try:
-                                    obj = json.loads(data)
-                                    t = obj.get("type") or obj.get("object")
-                                    if t:
-                                        event_types.append(str(t))
-                                except (ValueError, TypeError):
-                                    pass
+                    # Use the project's canonical SSE parser (buffer-based, handles
+                    # multi-line data: fields and CRLF framing) rather than a naive
+                    # per-line split — this probe's whole job is SSE-shape fidelity.
+                    for event_name, data_str in iter_sse_events(resp.iter_raw()):
+                        if data_str == "[DONE]":
+                            event_types.append("[DONE]")
+                            continue
+                        recorded = None
+                        if data_str:
+                            try:
+                                obj = json.loads(data_str)
+                                recorded = obj.get("type") or obj.get("object")
+                            except (ValueError, TypeError):
+                                recorded = None
+                        # fall back to the SSE `event:` name when the data has no type
+                        if not recorded and event_name and event_name != "message":
+                            recorded = event_name
+                        if recorded:
+                            event_types.append(str(recorded))
     except Exception as exc:
         print(json.dumps({"probe": "sse_event_order", "evidence_status": "live_observed",
                           "http_status": 0, "error": redact_text(f"{type(exc).__name__}: {exc}", max_chars=200)}, ensure_ascii=False, indent=2))

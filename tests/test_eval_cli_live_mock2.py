@@ -90,6 +90,38 @@ def test_sse_fingerprint_live(tmp_path, capsys, monkeypatch):
     assert "message_start" in out["event_sequence"]
 
 
+def test_sse_fingerprint_crlf_framing(tmp_path, capsys, monkeypatch):
+    # CRLF-framed stream with a comment line + chunked across boundaries — the
+    # canonical iter_sse_events parser must still recover the full event order
+    # (the old per-line split parser was fragile here).
+    body = (
+        b": ping comment\r\n"
+        b"event: message_start\r\ndata: {\"type\":\"message_start\"}\r\n\r\n"
+        b"event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\"}\r\n\r\n"
+        b"event: message_delta\r\ndata: {\"type\":\"message_delta\"}\r\n\r\n"
+        b"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n"
+    )
+
+    def handler(request):
+        def gen():
+            for i in range(0, len(body), 13):  # nasty chunk size across CRLF
+                yield body[i:i + 13]
+        return httpx.Response(200, content=gen(),
+                              headers={"content-type": "text/event-stream"})
+
+    _patch_client(monkeypatch, handler)
+    args = _ns(providers=str(_providers_file(tmp_path)), provider="tested_model", live=True,
+               baselines_dir=str(tmp_path / "b"))
+    rc = E.sse_fingerprint(args)
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    seq = out["event_sequence"]
+    assert seq[0] == "message_start"
+    assert "message_stop" in seq
+    assert "content_block_delta" in seq
+
+
+
 # ---------------------------------------------------------------------------
 # needle --live (echoes planted canary -> context_ok)
 # ---------------------------------------------------------------------------
