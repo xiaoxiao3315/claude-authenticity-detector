@@ -585,9 +585,21 @@ def compare_to_baseline(
     behavior_votes = 0          # positive matches
     behavior_checked = 0
     behavior_soft_misses = 0    # behavior probes that disagree but must NOT solely convict
+    probe_errors: list[str] = []  # requested probes that were supplied but crashed
+
+    def _probe_failed(name: str, val: Any) -> bool:
+        """A probe the caller ran but that errored out. We must surface this as an
+        INCOMPLETE check (not silently treat the signal as absent), otherwise a
+        crashed downgrade/wrapper probe would leave a falsely-clean verdict."""
+        if isinstance(val, dict) and val.get("probe_error"):
+            probe_errors.append(f"{name}:{val.get('probe_error')}")
+            evidence.append({"check": name, "probe_error": val.get("probe_error"), "incomplete": True})
+            return True
+        return False
 
     tok = sig.get("tokenizer")
-    if isinstance(tok, dict) and tok.get("score") is not None:
+    if not _probe_failed("tokenizer", tok):
+      if isinstance(tok, dict) and tok.get("score") is not None:
         behavior_checked += 1
         if tok.get("score") == 0.0:
             # tokenizer is corroborating ONLY — never sole grounds for wrapper.
@@ -597,12 +609,13 @@ def compare_to_baseline(
         elif tok.get("score") == 10.0:
             behavior_votes += 1
         evidence.append({"check": "tokenizer_delta", "observed": tok.get("observed"), "result": tok.get("details")})
-    elif isinstance(tok, dict):
+      elif isinstance(tok, dict):
         # advisory only (e.g. too few samples) — show but do not vote/penalize
         evidence.append({"check": "tokenizer_delta", "observed": tok.get("observed"), "result": tok.get("details"), "advisory": True})
 
     sse = sig.get("sse")
-    if isinstance(sse, dict) and sse.get("sse_family"):
+    if not _probe_failed("sse", sse):
+      if isinstance(sse, dict) and sse.get("sse_family"):
         behavior_checked += 1
         if sse.get("sse_family") == "openai_sse":
             hard_fail = True  # OpenAI SSE frames on an anthropic endpoint IS a strong wrapper signal
@@ -612,7 +625,8 @@ def compare_to_baseline(
         evidence.append({"check": "sse_event_order", "observed": sse.get("sse_family"), "order_ok": sse.get("claude_event_order_ok")})
 
     env = sig.get("error_envelope")
-    if isinstance(env, dict) and env.get("error_envelope_dialect"):
+    if not _probe_failed("error_envelope", env):
+      if isinstance(env, dict) and env.get("error_envelope_dialect"):
         d = env.get("error_envelope_dialect")
         if d in ("openai", "gateway_generic"):
             # generic on a tolerant gateway is weak (it 200s bad requests); soft only
@@ -623,7 +637,8 @@ def compare_to_baseline(
         evidence.append({"check": "error_envelope", "observed": d})
 
     nd = sig.get("needle")
-    if isinstance(nd, dict) and nd.get("evidence_status") == "live_observed":
+    if not _probe_failed("needle", nd):
+      if isinstance(nd, dict) and nd.get("evidence_status") == "live_observed":
         behavior_checked += 1
         trunc = nd.get("silent_truncation") or {}
         if trunc.get("silent_truncation") is True:
@@ -640,7 +655,8 @@ def compare_to_baseline(
     # downgrade on its own (unlike model_id, which is a trivially-forged string).
     cap = sig.get("capability")
     capability_downgrade = False
-    if isinstance(cap, dict) and cap.get("score") is not None:
+    if not _probe_failed("capability", cap):
+      if isinstance(cap, dict) and cap.get("score") is not None:
         behavior_checked += 1
         if cap.get("score") == 0.0:
             capability_downgrade = True
@@ -649,7 +665,7 @@ def compare_to_baseline(
             behavior_votes += 1
         evidence.append({"check": "capability_anchor", "baseline": cap.get("baseline"),
                          "observed": cap.get("observed"), "result": cap.get("detail")})
-    elif isinstance(cap, dict):
+      elif isinstance(cap, dict):
         evidence.append({"check": "capability_anchor", "observed": cap.get("observed"),
                          "result": cap.get("detail"), "advisory": True})
 
@@ -685,6 +701,19 @@ def compare_to_baseline(
         else:
             reasons.append("protocol_layer_match_only_behavior_probes_pending")
 
+    # A requested probe that crashed leaves a hole in the evidence. Never let that
+    # masquerade as a clean pass: cap confidence and flag the incomplete check so a
+    # MATCHES/insufficient verdict is visibly provisional, not authoritative.
+    if probe_errors:
+        for pe in probe_errors:
+            reasons.append(f"probe_failed:{pe.split(':')[0]}")
+        confidence = round(min(confidence, 0.5), 3)
+        reasons.append("verdict_incomplete_due_to_probe_error")
+
+    note = "protocol + behavior comparison" if behavior_checked else "protocol-layer only (no behavior signals supplied)"
+    if probe_errors:
+        note = f"INCOMPLETE — {len(probe_errors)} requested probe(s) errored: {note}"
+
     return {
         "schema_version": BASELINE_COMPARISON_RESULT_VERSION,
         "baseline_id": baseline.get("baseline_id"),
@@ -693,7 +722,8 @@ def compare_to_baseline(
         "reasons": reasons,
         "evidence_chain": evidence,
         "behavior_probes_checked": behavior_checked,
-        "note": "protocol + behavior comparison" if behavior_checked else "protocol-layer only (no behavior signals supplied)",
+        "probe_errors": probe_errors,
+        "note": note,
     }
 
 
@@ -1063,10 +1093,19 @@ def render_verdict_report(verdict: dict[str, Any], *, baseline: dict[str, Any] |
         for r in reasons:
             lines.append(f"  - {r}")
     chain = verdict.get("evidence_chain") or []
+    # Surface crashed probes FIRST and loudly — a requested probe that errored is a
+    # hole in the evidence, and the verdict below is only provisional because of it.
+    perr = verdict.get("probe_errors") or []
+    if perr:
+        lines.append("⚠ 探针未完成（结论不完整，请重跑）:")
+        for pe in perr:
+            lines.append(f"  ✗ {pe}")
     if chain:
         # #5: group evidence by strength so users see what's definitive vs advisory.
         STRONG = {"stop_reason_enum", "usage_naming_dialect", "model_id",
                   "sse_event_order", "error_envelope", "needle_fake_1m", "request_failure_rate"}
+        # crashed-probe rows are shown in the dedicated block above, not here.
+        chain = [e for e in chain if not e.get("probe_error")]
         strong = [e for e in chain if e.get("check") in STRONG and not e.get("advisory")]
         corro = [e for e in chain if e.get("check") not in STRONG and not e.get("advisory")]
         advisory = [e for e in chain if e.get("advisory")]
@@ -1185,6 +1224,25 @@ def _self_test() -> None:
         "sse": {"sse_family": "openai_sse", "is_claude_shaped": False},
     })
     assert sse_fail["verdict"] == VERDICT_WRAPPER, sse_fail
+
+    # a REQUESTED probe that crashed must surface as an incomplete check — never a
+    # silently-clean pass. confidence is capped and the failure is named.
+    probe_err = compare_to_baseline(genuine_observed, baseline, behavior_signals={
+        "capability": {"probe_error": "RuntimeError: upstream 500"},
+    })
+    assert probe_err["probe_errors"] and "capability" in probe_err["probe_errors"][0], probe_err
+    assert probe_err["confidence"] <= 0.5, probe_err
+    assert any(r.startswith("probe_failed:capability") for r in probe_err["reasons"]), probe_err
+    assert "INCOMPLETE" in probe_err["note"], probe_err
+    # the crashed probe must NOT count as a completed behavior check
+    assert probe_err["behavior_probes_checked"] == 0, probe_err
+    # a healthy capability vote alongside a different crashed probe still flags incomplete
+    mixed = compare_to_baseline(genuine_observed, baseline, behavior_signals={
+        "sse": {"sse_family": "claude_sse", "is_claude_shaped": True},
+        "needle": {"probe_error": "TimeoutError"},
+    })
+    assert mixed["probe_errors"] and mixed["confidence"] <= 0.5, mixed
+    assert mixed["behavior_probes_checked"] == 1, mixed  # sse counted, needle did not
 
     # mostly-failed requests (e.g. 429) -> insufficient, NOT a suspicious empty fingerprint
     failed_samples = [make_sample(

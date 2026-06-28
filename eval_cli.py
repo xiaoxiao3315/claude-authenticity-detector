@@ -2355,8 +2355,11 @@ def verify_endpoint(args: argparse.Namespace) -> int:
                 with contextlib.redirect_stdout(buf):
                     sse_fingerprint(sse_args)
                 behavior["sse"] = json.loads(buf.getvalue())
-            except Exception:
-                pass
+            except Exception as exc:
+                # A requested probe that crashed must NOT vanish silently — that
+                # would let a verify run look complete while a signal is missing.
+                # Record it so compare_to_baseline counts it as an incomplete check.
+                behavior["sse"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
         # error-envelope probe (#2): malformed request -> classify error dialect
         if getattr(args, "with_error_envelope", False):
             try:
@@ -2371,8 +2374,10 @@ def verify_endpoint(args: argparse.Namespace) -> int:
                 dialects = [r.get("error_envelope_dialect") for r in results if (r.get("http_status") or 0) >= 400]
                 if dialects:
                     behavior["error_envelope"] = {"error_envelope_dialect": dialects[0]}
-            except Exception:
-                pass
+                else:
+                    behavior["error_envelope"] = {"probe_error": "no 4xx response to classify"}
+            except Exception as exc:
+                behavior["error_envelope"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
         # needle fake-1M probe (#1): >200K context, recall + silent-truncation
         if getattr(args, "with_needle", False):
             try:
@@ -2386,8 +2391,8 @@ def verify_endpoint(args: argparse.Namespace) -> int:
                     needle(nd_args)
                 nd = json.loads(buf.getvalue())
                 behavior["needle"] = nd
-            except Exception:
-                pass
+            except Exception as exc:
+                behavior["needle"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
         # capability-anchor probe: the dedicated silent-DOWNGRADE detector.
         # Runs the hard anchors against the suspect, compares pass-rate to the
         # baseline's stored capability_anchor.json (built earlier via capability-probe).
@@ -2416,8 +2421,8 @@ def verify_endpoint(args: argparse.Namespace) -> int:
                 )
                 behavior["capability"] = {**cap_score, "answered": cap_agg.get("answered_count"),
                                           "passed": cap_agg.get("passed_count")}
-            except Exception:
-                pass
+            except Exception as exc:
+                behavior["capability"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
 
     verdict = compare_to_baseline(observed, baseline, behavior_signals=behavior or None)
     print(render_verdict_report(verdict, baseline=baseline))
