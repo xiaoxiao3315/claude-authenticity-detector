@@ -210,3 +210,32 @@ def test_sanitized_config_reads_and_redacts(tmp_path, monkeypatch):
     assert tested["extra_body"]["top_p"] == 0.9
     assert "should-be-hidden" not in json.dumps(out, ensure_ascii=False)
 
+
+# ---------------------------------------------------------------------------
+# probe_config_role — the no-network early returns
+# ---------------------------------------------------------------------------
+def test_probe_config_role_rejects_bad_role():
+    with pytest.raises(ValueError, match="role must be"):
+        S.probe_config_role("bogus")
+
+
+def test_probe_config_role_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "PROVIDERS_LOCAL", tmp_path / "nope.json")
+    monkeypatch.setattr(S, "load_local_env", lambda *a, **k: {}, raising=False)
+    with pytest.raises(FileNotFoundError):
+        S.probe_config_role("tested_model")
+
+
+def test_probe_config_role_no_key_returns_present_false(tmp_path, monkeypatch):
+    cfg = {"tested_model": {"provider_id": "tested", "base_url": "https://gw.x",
+                            "api_key_env": "TESTED_KEY", "auth_type": "x-api-key"},
+           "judge_model": {"provider_id": "judge", "api_key_env": "JUDGE_KEY"}}
+    p = tmp_path / "providers.local.json"
+    p.write_text(json.dumps(cfg), encoding="utf-8")
+    monkeypatch.setattr(S, "PROVIDERS_LOCAL", p)
+    monkeypatch.setattr(S, "load_local_env", lambda *a, **k: {}, raising=False)
+    monkeypatch.delenv("TESTED_KEY", raising=False)
+    out = S.probe_config_role("tested_model")
+    assert out["api_key_present"] is False
+    assert "missing environment variable" in out["error"]
+
