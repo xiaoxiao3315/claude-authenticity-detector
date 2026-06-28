@@ -11,11 +11,10 @@ import sys
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 try:
     import httpx
@@ -79,6 +78,32 @@ from run_records import extract_raw_event_types, stable_json_hash, text_hash
 from trace_evaluation import run_trace_evaluation
 from validate_run_records import validate_records
 from redaction import redact_raw_fragments, redact_text
+from model_client import (
+    CallMetrics,
+    Completion,
+    ModelConfig,
+    apply_extra_body,
+    auth_headers,
+    auth_value,
+    call_model,
+    call_model_with_retries,
+    dry_completion,
+    response_request_id,
+    retryable_call_failure,
+    safe_response_headers,
+)
+from cli_io import (
+    append_jsonl,
+    base_url_host,
+    now_iso,
+    read_json,
+    read_jsonl,
+    resolve_job,
+    resolve_path,
+    utcish_job_id,
+    write_json,
+    write_jsonl,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -87,134 +112,12 @@ DEFAULT_PROVIDERS = Path("configs/providers.local.json")
 DEFAULT_CAMPAIGNS_DIR = Path("campaigns")
 ALLOWED_PROTOCOLS = {"openai_chat", "anthropic_messages"}
 ALLOWED_AUTH_TYPES = {"bearer", "x-api-key"}
-SAFE_RESPONSE_HEADER_NAMES = {
-    "request-id",
-    "x-request-id",
-    "x-correlation-id",
-    "openai-request-id",
-    "anthropic-request-id",
-    "cf-ray",
-    "server",
-    "x-ratelimit-limit-requests",
-    "x-ratelimit-remaining-requests",
-    "x-ratelimit-reset-requests",
-    "x-ratelimit-limit-tokens",
-    "x-ratelimit-remaining-tokens",
-    "x-ratelimit-reset-tokens",
-}
 
 
-@dataclass
-class ModelConfig:
-    provider_id: str
-    base_url: str
-    model: str
-    api_key_env: str
-    protocol: str
-    auth_type: str = "bearer"
-    provider_channel: str = "gateway"
-    provider_display_name: str | None = None
-    extra_body: dict[str, Any] = field(default_factory=dict)
+# --- model dataclasses + HTTP call layer extracted to model_client (imported above) ---
 
 
-@dataclass
-class CallMetrics:
-    ok: bool
-    error: str | None = None
-    first_event_ms: float | None = None
-    first_content_token_ms: float | None = None
-    total_ms: float | None = None
-    event_count: int = 0
-    content_event_count: int = 0
-    content_chars: int = 0
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    cache_creation_input_tokens: int | None = None
-    cache_read_input_tokens: int | None = None
-    server_model: str | None = None
-    stop_reason: str | None = None
-    attempts: int = 1
-    retry_count: int = 0
-
-
-@dataclass
-class Completion:
-    text: str
-    metrics: CallMetrics
-    raw: dict[str, Any] | None = None
-
-
-def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
-
-
-def utcish_job_id(prefix: str) -> str:
-    return f"{prefix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-
-
-def read_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8-sig") as f:
-        return json.load(f)
-
-
-def write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def append_jsonl(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as f:
-        f.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
-        f.write("\n")
-
-
-def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
-            f.write("\n")
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            value = json.loads(line)
-            if isinstance(value, dict):
-                rows.append(value)
-    return rows
-
-
-def resolve_path(path_value: str | Path, *, base: Path = ROOT) -> Path:
-    path = Path(path_value)
-    return path if path.is_absolute() else base / path
-
-
-def resolve_job(job: str | Path) -> Path:
-    raw = Path(job)
-    candidates = []
-    if raw.suffix:
-        candidates.append(raw)
-    else:
-        candidates.append(Path("configs/jobs") / f"{raw}.json")
-        candidates.append(Path("configs/jobs") / str(raw))
-    for candidate in candidates:
-        path = resolve_path(candidate)
-        if path.exists():
-            return path
-    raise FileNotFoundError(f"job config not found: {job}")
-
-
-def base_url_host(base_url: str) -> str | None:
-    parsed = urlparse(base_url)
-    return parsed.netloc or parsed.path or None
+# --- low-level IO + path helpers extracted to cli_io (imported above) ---
 
 
 SENSITIVE_CONFIG_KEY_TOKENS = ("authorization", "credential", "key", "password", "secret", "token")
@@ -488,305 +391,6 @@ def select_tasks(job: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, A
     if max_tasks > 0:
         tasks = tasks[:max_tasks]
     return tasks, benchmark_config
-
-
-def auth_value(model: ModelConfig) -> str:
-    load_local_env()
-    value = os.environ.get(model.api_key_env)
-    if not value:
-        raise RuntimeError(f"missing environment variable {model.api_key_env!r} for {model.provider_id}")
-    return value
-
-
-def auth_headers(model: ModelConfig, secret: str) -> dict[str, str]:
-    if model.auth_type == "bearer":
-        return {"Authorization": f"Bearer {secret}"}
-    if model.auth_type == "x-api-key":
-        return {"x-api-key": secret}
-    raise ValueError(f"unsupported auth_type: {model.auth_type}")
-
-
-def safe_response_headers(headers: Any) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for key, value in dict(headers or {}).items():
-        normalized = str(key).lower()
-        if normalized in SAFE_RESPONSE_HEADER_NAMES:
-            out[normalized] = redact_text(str(value), max_chars=160)
-    return dict(sorted(out.items()))
-
-
-def response_request_id(headers: Any) -> str | None:
-    safe = safe_response_headers(headers)
-    for key in ("request-id", "x-request-id", "openai-request-id", "anthropic-request-id", "x-correlation-id", "cf-ray"):
-        if safe.get(key):
-            return safe[key]
-    return None
-
-
-def apply_extra_body(payload: dict[str, Any], model: ModelConfig) -> None:
-    for key, value in model.extra_body.items():
-        if key in payload:
-            raise ValueError(f"{model.provider_id}.extra_body cannot override core request field: {key}")
-        payload[key] = value
-
-
-def dry_completion(model: ModelConfig, messages: list[dict[str, str]], max_tokens: int) -> Completion:
-    user_text = " ".join(message.get("content", "") for message in messages if message.get("role") == "user")
-    if model.provider_id.startswith("judge"):
-        text = json.dumps(
-            {
-                "score_0_10": 8.0,
-                "format_ok": True,
-                "decision": "REVIEW",
-                "reason": "dry-run judge result",
-                "missing_key_points": [],
-            },
-            ensure_ascii=False,
-        )
-    else:
-        text = f"dry-run response for {user_text[:120]}"
-    metrics = CallMetrics(
-        ok=True,
-        first_event_ms=1,
-        first_content_token_ms=1,
-        total_ms=1,
-        event_count=1,
-        content_event_count=1,
-        content_chars=len(text),
-        input_tokens=max(1, len(user_text) // 4),
-        output_tokens=max(1, min(max_tokens, len(text) // 4)),
-        cache_creation_input_tokens=0,
-        cache_read_input_tokens=0,
-        server_model=model.model,
-        stop_reason="dry_run",
-    )
-    return Completion(text=text, metrics=metrics, raw={"dry_run": True})
-
-
-def call_model(
-    *,
-    client: httpx.Client,
-    model: ModelConfig,
-    messages: list[dict[str, str]],
-    max_tokens: int,
-    temperature: float | None,
-    live: bool,
-    events_file: Path,
-) -> Completion:
-    if not live:
-        result = dry_completion(model, messages, max_tokens)
-        append_jsonl(events_file, {"at": now_iso(), "type": "dry_completion", "provider_id": model.provider_id})
-        return result
-
-    secret = auth_value(model)
-    payload: dict[str, Any]
-    headers: dict[str, str]
-    url: str
-    if model.protocol == "openai_chat":
-        url = f"{model.base_url}/v1/chat/completions"
-        headers = {**auth_headers(model, secret), "content-type": "application/json"}
-        payload = {"model": model.model, "messages": messages, "max_tokens": max_tokens}
-        if temperature is not None:
-            payload["temperature"] = temperature
-        apply_extra_body(payload, model)
-    elif model.protocol == "anthropic_messages":
-        url = f"{model.base_url}/v1/messages"
-        headers = {
-            **auth_headers(model, secret),
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        system_messages = [message["content"] for message in messages if message.get("role") == "system"]
-        user_messages = [message for message in messages if message.get("role") != "system"]
-        payload = {"model": model.model, "messages": user_messages, "max_tokens": max_tokens}
-        if system_messages:
-            payload["system"] = "\n\n".join(system_messages)
-        if temperature is not None:
-            payload["temperature"] = temperature
-        apply_extra_body(payload, model)
-    else:
-        raise ValueError(f"unsupported protocol: {model.protocol}")
-
-    append_jsonl(
-        events_file,
-        {
-            "at": now_iso(),
-            "type": "request_started",
-            "provider_id": model.provider_id,
-            "protocol": model.protocol,
-            "auth_type": model.auth_type,
-            "model": model.model,
-            "url_path": url.replace(model.base_url, ""),
-            "extra_body_keys": sorted(model.extra_body),
-        },
-    )
-    started = time.perf_counter()
-    try:
-        response = client.post(url, headers=headers, json=payload)
-    except Exception as exc:
-        elapsed = round((time.perf_counter() - started) * 1000, 2)
-        metrics = CallMetrics(ok=False, error=redact_text(f"{type(exc).__name__}: {exc}", max_chars=500), total_ms=elapsed)
-        append_jsonl(events_file, {"at": now_iso(), "type": "request_failed", "error": metrics.error})
-        return Completion(text="", metrics=metrics)
-
-    elapsed = round((time.perf_counter() - started) * 1000, 2)
-    if response.status_code != 200:
-        body = response.text[:1000]
-        metrics = CallMetrics(ok=False, error=redact_text(f"HTTP {response.status_code}: {body}", max_chars=500), total_ms=elapsed)
-        append_jsonl(events_file, {"at": now_iso(), "type": "http_error", "status": response.status_code, "body_preview": body[:300]})
-        return Completion(text="", metrics=metrics)
-
-    try:
-        data = response.json()
-    except Exception as exc:
-        metrics = CallMetrics(ok=False, error=redact_text(f"{type(exc).__name__}: response JSON parse failed", max_chars=500), total_ms=elapsed)
-        append_jsonl(events_file, {"at": now_iso(), "type": "response_parse_failed", "error": metrics.error})
-        return Completion(text="", metrics=metrics)
-    text = ""
-    usage: dict[str, Any] = {}
-    stop_reason: str | None = None
-    returned_model = data.get("model") if isinstance(data, dict) else None
-    if model.protocol == "openai_chat":
-        choices = data.get("choices") or []
-        if choices:
-            first_choice = choices[0]
-            text = str((first_choice.get("message") or {}).get("content") or first_choice.get("text") or "")
-            stop_reason = first_choice.get("finish_reason")
-        usage = data.get("usage") or {}
-    else:
-        blocks = data.get("content") or []
-        text = "".join(str(block.get("text") or "") for block in blocks if isinstance(block, dict))
-        usage = data.get("usage") or {}
-        stop_reason = data.get("stop_reason")
-
-    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
-    output_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
-    metrics = CallMetrics(
-        ok=True,
-        first_event_ms=elapsed,
-        first_content_token_ms=elapsed if text else None,
-        total_ms=elapsed,
-        event_count=1,
-        content_event_count=1 if text else 0,
-        content_chars=len(text),
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cache_creation_input_tokens=usage.get("cache_creation_input_tokens", 0),
-        cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
-        server_model=str(returned_model or model.model),
-        stop_reason=str(stop_reason or "stop"),
-    )
-    append_jsonl(
-        events_file,
-        {
-            "at": now_iso(),
-            "type": "response_completed",
-            "provider_id": model.provider_id,
-            "status": response.status_code,
-            "request_id": response_request_id(response.headers),
-            "response_headers": safe_response_headers(response.headers),
-            "total_ms": elapsed,
-            "content_chars": len(text),
-            "model_returned": metrics.server_model,
-        },
-    )
-    return Completion(text=text, metrics=metrics, raw=data)
-
-
-RETRYABLE_HTTP_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
-
-
-def retryable_call_failure(metrics: CallMetrics) -> bool:
-    error = str(metrics.error or "")
-    if not error:
-        return False
-    match = re.search(r"HTTP\s+(\d+)", error)
-    if match:
-        return int(match.group(1)) in RETRYABLE_HTTP_STATUS
-    lowered = error.lower()
-    retryable_tokens = (
-        "timeout",
-        "timed out",
-        "connect",
-        "connection",
-        "readerror",
-        "read error",
-        "ssl",
-        "temporar",
-        "server disconnected",
-        "remote protocol",
-        "network",
-    )
-    return any(token in lowered for token in retryable_tokens)
-
-
-def call_model_with_retries(
-    *,
-    client: httpx.Client,
-    model: ModelConfig,
-    messages: list[dict[str, str]],
-    max_tokens: int,
-    temperature: float | None,
-    live: bool,
-    events_file: Path,
-    retries: int,
-    retry_backoff: float,
-) -> Completion:
-    if not live:
-        return call_model(
-            client=client,
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            live=live,
-            events_file=events_file,
-        )
-
-    retries = max(0, int(retries or 0))
-    retry_backoff = max(0.0, float(retry_backoff or 0.0))
-    total_attempts = retries + 1
-    overall_started = time.perf_counter()
-    for attempt in range(1, total_attempts + 1):
-        result = call_model(
-            client=client,
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            live=live,
-            events_file=events_file,
-        )
-        result.metrics.attempts = attempt
-        result.metrics.retry_count = attempt - 1
-        final_attempt = attempt >= total_attempts
-        if result.metrics.ok or final_attempt or not retryable_call_failure(result.metrics):
-            if attempt > 1:
-                elapsed = round((time.perf_counter() - overall_started) * 1000, 2)
-                result.metrics.total_ms = elapsed
-                result.metrics.first_event_ms = elapsed
-                if result.metrics.content_chars:
-                    result.metrics.first_content_token_ms = elapsed
-            return result
-
-        sleep_seconds = min(60.0, retry_backoff * (2 ** (attempt - 1)))
-        append_jsonl(
-            events_file,
-            {
-                "at": now_iso(),
-                "type": "request_retry",
-                "provider_id": model.provider_id,
-                "attempt": attempt,
-                "next_attempt": attempt + 1,
-                "max_attempts": total_attempts,
-                "sleep_seconds": round(sleep_seconds, 3),
-                "error": redact_text(result.metrics.error, max_chars=500),
-            },
-        )
-        if sleep_seconds:
-            time.sleep(sleep_seconds)
-
-    raise RuntimeError("unreachable retry loop state")
 
 
 def expected_context(task: dict[str, Any]) -> dict[str, Any]:
