@@ -9,6 +9,7 @@ import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from acceptance_pack import verify_acceptance_pack
@@ -55,6 +56,11 @@ TEXT_MODEL_HINTS = (
 def read_json(path: Path):
     with path.open("r", encoding="utf-8-sig") as f:
         return json.load(f)
+
+
+def _as_dict(value):
+    """Narrow Any -> dict (empty when not a dict) for the type checker."""
+    return value if isinstance(value, dict) else {}
 
 
 def write_json(path: Path, value) -> None:
@@ -155,7 +161,7 @@ def latest_quality_gate(run_dir: Path) -> dict | None:
 
 def score_value(record: dict) -> float | None:
     scoring = record.get("scoring") or {}
-    final_score = scoring.get("final_score") if isinstance(scoring.get("final_score"), dict) else {}
+    final_score = _as_dict(scoring.get("final_score"))
     value = final_score.get("score")
     try:
         return float(value)
@@ -186,7 +192,7 @@ def percentile(values: list[float], pct: float) -> float | None:
 def provider_records(records: list[dict], provider_id: str) -> list[dict]:
     selected = []
     for record in records:
-        provider = record.get("provider") if isinstance(record.get("provider"), dict) else {}
+        provider = _as_dict(record.get("provider"))
         if str(provider.get("id") or "") == provider_id:
             selected.append(record)
     return selected or records
@@ -197,7 +203,7 @@ def provider_model_name(state: dict, records: list[dict], provider_id: str) -> s
     if str(tested.get("provider_id") or "") == provider_id and tested.get("model"):
         return str(tested.get("model"))
     for record in records:
-        provider = record.get("provider") if isinstance(record.get("provider"), dict) else {}
+        provider = _as_dict(record.get("provider"))
         if str(provider.get("id") or "") != provider_id:
             continue
         for key in ("claimed_model", "model_requested", "model_returned"):
@@ -208,7 +214,7 @@ def provider_model_name(state: dict, records: list[dict], provider_id: str) -> s
 
 def provider_identity(records: list[dict], provider_id: str) -> dict:
     for record in records:
-        provider = record.get("provider") if isinstance(record.get("provider"), dict) else {}
+        provider = _as_dict(record.get("provider"))
         if str(provider.get("id") or "") != provider_id:
             continue
         return {
@@ -247,8 +253,8 @@ def leaderboard_raw_rows(*, include_dry_run: bool = False) -> list[dict]:
             continue
         gate = latest_quality_gate(run_dir)
         primary_gate = gate.get("primary_record") if gate else None
-        gate_metrics = primary_gate.get("metrics_snapshot") if isinstance(primary_gate, dict) else {}
-        providers = benchmark.get("providers") if isinstance(benchmark.get("providers"), dict) else {}
+        gate_metrics = _as_dict(primary_gate.get("metrics_snapshot") if isinstance(primary_gate, dict) else {})
+        providers = _as_dict(benchmark.get("providers"))
         for provider_id, provider_score in providers.items():
             if not isinstance(provider_score, dict):
                 continue
@@ -258,7 +264,7 @@ def leaderboard_raw_rows(*, include_dry_run: bool = False) -> list[dict]:
             scores: list[float] = []
             latencies: list[float] = []
             for record in selected_records:
-                telemetry = record.get("telemetry") if isinstance(record.get("telemetry"), dict) else {}
+                telemetry = _as_dict(record.get("telemetry"))
                 if telemetry.get("ok") is True:
                     ok_count += 1
                 score = score_value(record)
@@ -385,11 +391,9 @@ def summarize_run(run_dir: Path) -> dict:
         if score is not None:
             scores.append(score)
         latency = telemetry.get("first_content_token_ms") or telemetry.get("total_ms")
-        try:
-            latency_value = float(latency)
+        latency_value = to_float(latency)
+        if latency_value is not None:
             latencies.append(latency_value)
-        except (TypeError, ValueError):
-            latency_value = None
         samples.append(
             {
                 "task_id": task.get("id"),
@@ -407,9 +411,9 @@ def summarize_run(run_dir: Path) -> dict:
     avg_score = sum(scores) / len(scores) if scores else None
     avg_latency = sum(latencies) / len(latencies) if latencies else None
     primary_gate = gate.get("primary_record") if gate else None
-    metrics = primary_gate.get("metrics_snapshot") if isinstance(primary_gate, dict) else {}
-    providers = benchmark.get("providers") if isinstance(benchmark.get("providers"), dict) else {}
-    provider_score = next(iter(providers.values()), {}) if providers else {}
+    metrics = _as_dict(primary_gate.get("metrics_snapshot") if isinstance(primary_gate, dict) else {})
+    providers = _as_dict(benchmark.get("providers"))
+    provider_score = _as_dict(next(iter(providers.values()), {}) if providers else {})
     return {
         "state": state,
         "metrics": {
@@ -443,11 +447,11 @@ def sanitized_config() -> dict:
     if not PROVIDERS_LOCAL.exists():
         return {"exists": False, "providers": None}
     data = read_json(PROVIDERS_LOCAL)
-    out = {"exists": True, "providers": {}}
+    out: dict[str, Any] = {"exists": True, "providers": {}}
     for label in ("tested_model", "judge_model"):
         item = data.get(label) or {}
         env_name = str(item.get("api_key_env") or "")
-        extra_body = item.get("extra_body") if isinstance(item.get("extra_body"), dict) else {}
+        extra_body = _as_dict(item.get("extra_body"))
         out["providers"][label] = {
             "provider_id": item.get("provider_id"),
             "base_url": item.get("base_url"),
@@ -593,7 +597,7 @@ def probe_reasoning_efforts(item: dict, secret: str, model_id: str) -> dict:
         try:
             status, data, elapsed_ms = http_json("POST", f"{base_url}/v1/chat/completions", headers=headers, payload=payload, timeout=90.0)
             choice = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
-            message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            message = _as_dict(choice.get("message"))
             supported.append(
                 {
                     "value": effort,
@@ -693,7 +697,7 @@ def query_bool(qs: dict[str, list[str]], name: str, default: bool = False) -> bo
 
 
 def artifact_listing(root: Path) -> list[dict]:
-    artifacts = []
+    artifacts: list[dict] = []
     if not root.exists():
         return artifacts
     for item in root.iterdir():
@@ -1001,7 +1005,7 @@ def main() -> int:
     parser.add_argument("--enable-config-write", action="store_true", help="enable POST /api/config writes to local provider and secret files")
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.config_write_enabled = bool(args.enable_config_write)
+    server.config_write_enabled = bool(args.enable_config_write)  # type: ignore[attr-defined]
     print(f"serving http://{args.host}:{args.port}")
     try:
         server.serve_forever()
