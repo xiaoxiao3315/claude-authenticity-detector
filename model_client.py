@@ -23,7 +23,11 @@ import httpx
 
 from cli_io import append_jsonl, now_iso
 from local_env import load_local_env
+from logging_setup import get_logger
 from redaction import redact_text
+
+log = get_logger(__name__)
+
 
 SAFE_RESPONSE_HEADER_NAMES = {
     "request-id",
@@ -362,6 +366,13 @@ def call_model_with_retries(
             return result
 
         sleep_seconds = min(60.0, retry_backoff * (2 ** (attempt - 1)))
+        log.warning(
+            "retrying %s after failed attempt %d/%d (sleep %.2fs): %s",
+            model.provider_id, attempt, total_attempts, sleep_seconds,
+            redact_text(result.metrics.error, max_chars=200),
+            extra={"provider_id": model.provider_id, "attempt": attempt,
+                   "max_attempts": total_attempts, "sleep_seconds": round(sleep_seconds, 3)},
+        )
         append_jsonl(
             events_file,
             {

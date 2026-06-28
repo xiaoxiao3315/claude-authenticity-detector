@@ -38,6 +38,7 @@ SELFTEST_FLAG_MODULES = [
     "evidence_registry",
     "job_runtime",
     "judge_calibration",
+    "logging_setup",
     "model_client",
     "quality_gate",
     "rescore",

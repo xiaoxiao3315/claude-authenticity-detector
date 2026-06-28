@@ -356,4 +356,26 @@ def test_retry_emits_request_retry_events(events_file, _no_sleep):
     assert retries[0]["sleep_seconds"] == 0.5
 
 
+def test_retry_emits_warning_log(events_file, _no_sleep, caplog):
+    import logging
+    from logging_setup import setup_logging
+    setup_logging(level="WARNING", force=True)
+    # The eval logger has propagate=False, so attach caplog's handler to it
+    # directly rather than relying on root propagation.
+    eval_logger = logging.getLogger("eval")
+    eval_logger.addHandler(caplog.handler)
+    try:
+        client = _sequenced_client([httpx.Response(429, text="slow"), _ok_response()])
+        with caplog.at_level(logging.WARNING, logger="eval"):
+            _retry(_openai_model(), client, events_file, retries=2, retry_backoff=0.5)
+    finally:
+        eval_logger.removeHandler(caplog.handler)
+    # one retry happened -> one WARNING about retrying, carrying structured extras
+    retry_records = [r for r in caplog.records if "retrying" in r.getMessage()]
+    assert len(retry_records) == 1
+    assert getattr(retry_records[0], "provider_id", None) == "tested_model"
+    assert getattr(retry_records[0], "attempt", None) == 1
+
+
+
 

@@ -12,11 +12,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from logging_setup import get_logger, setup_logging, verbosity_to_level
+
 try:
     import httpx
 except ImportError:
     sys.stderr.write("httpx is required: pip install httpx\n")
     raise SystemExit(1)
+
+log = get_logger(__name__)
+
 
 from benchmarking import (
     SCORE_FORMULA_VERSION,
@@ -624,8 +629,14 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--list-tasks", action="store_true")
     parser.add_argument("--list-modes", action="store_true")
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0,
+        help="increase diagnostic logging (-v INFO, -vv DEBUG); goes to stderr",
+    )
     parser.add_argument("--index-db", type=Path, default=Path("runs") / "eval_index.sqlite")
     args = parser.parse_args()
+
+    setup_logging(level=verbosity_to_level(args.verbose))
 
     tasks = load_tasks(args.tasks)
     benchmark_config = (
@@ -696,7 +707,9 @@ def main() -> int:
     try:
         for provider in providers:
             for task in tasks:
-                print(f"Running {task['id']} on {provider.id} ({provider.model})...")
+                log.info("running task %s on %s (%s)", task["id"], provider.id, provider.model,
+                         extra={"task_id": task["id"], "provider_id": provider.id,
+                                "model": provider.model})
                 event_path = run_dir / "events" / provider.id / f"{task['id']}.jsonl"
                 max_tokens = int(
                     args.max_tokens

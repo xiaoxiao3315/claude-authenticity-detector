@@ -28,6 +28,7 @@ STRICT_MODULES = [
     "benchmarking",
     "rescore",
     "decisions",
+    "logging_setup",
 ]
 
 
