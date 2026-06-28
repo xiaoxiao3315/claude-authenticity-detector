@@ -64,6 +64,21 @@ python .\eval_cli.py judge-calibrate --golden-set judge_golden/golden_set_v1.jso
 
 ---
 
+## 测试 / CI
+
+所有核心纯函数都有离线自测（无网络、无落盘）。一条命令跑全部：
+
+```powershell
+python scripts\run_all_selftests.py        # 逐模块 PASS/FAIL 汇总，任一失败即非零退出
+python scripts\run_all_selftests.py -v     # 同时打印每个模块的输出
+```
+
+- 覆盖 17 个模块（打分、基线对比、真伪裁决、配置脱敏、质量门禁等）。新增模块加进 `scripts/run_all_selftests.py` 的清单即自动纳入。
+- GitHub Actions（`.github/workflows/selftests.yml`）在每次 push / PR 时字节编译全部模块并跑这个聚合器。
+- `scripts\check_all.ps1` 也调用同一个聚合器（外加 dry-run campaign + 打包冒烟），是单一真相源。
+
+---
+
 ## v0.2.1 Two-Model Headless Flow
 
 The preferred entrypoint is now CLI-first:

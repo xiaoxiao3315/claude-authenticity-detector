@@ -22,15 +22,8 @@ try {
     }
 
     Write-Host "[check] self-tests"
-    python .\eval_cli.py self-test
-    python .\validate_run_records.py --self-test
-    python .\quality_gate.py --self-test
-    python .\compatibility.py --self-test
-    python .\trace_evaluation.py --self-test
-    python .\audit_export.py --self-test
-    python .\authenticity.py --self-test
-    python .\baseline_registry.py --self-test
-    python .\judge_calibration.py --self-test
+    python .\scripts\run_all_selftests.py
+    if ($LASTEXITCODE -ne 0) { throw "self-tests failed (exit $LASTEXITCODE)" }
 
     if (-not $SkipDryRun) {
         $campaignId = "CMP-CHECK-" + (Get-Date -Format "yyyyMMddHHmmss")
