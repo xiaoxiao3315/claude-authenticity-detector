@@ -287,3 +287,63 @@ def test_run_rescore_handles_scorer_exception(tmp_path):
     assert "scorer crashed" in records[0]["rescore_error"]
 
 
+# ---------------------------------------------------------------------------
+# list_rescores / read_rescore + wait_for_resume + csv helpers
+# ---------------------------------------------------------------------------
+def test_list_and_read_rescore(tmp_path):
+    runs_dir, run_id = _run_with_response(tmp_path, "has apple")
+    result = RS.run_rescore(
+        runs_dir=runs_dir, run_id=run_id,
+        task_bank=[{"id": "t1", "scoring_type": "keyword_check"}],
+        score_response=lambda t, r: {"score": 10.0 if "apple" in r else 0.0, "format_ok": True})
+    run_dir = runs_dir / run_id
+    listed = RS.list_rescores(run_dir)
+    assert len(listed) == 1
+    assert listed[0]["rescore_id"] == result["rescore_id"]
+    detail = RS.read_rescore(run_dir, result["rescore_id"])
+    assert detail["manifest"]["rescore_id"] == result["rescore_id"]
+    assert isinstance(detail["summary"], list)
+
+
+def test_list_rescores_empty(tmp_path):
+    (tmp_path / "run_x").mkdir()
+    assert RS.list_rescores(tmp_path / "run_x") == []
+
+
+def test_read_rescore_missing_raises(tmp_path):
+    (tmp_path / "run_x").mkdir()
+    with pytest.raises(FileNotFoundError, match="rescore not found"):
+        RS.read_rescore(tmp_path / "run_x", "ghost")
+
+
+def test_wait_for_resume_no_pause():
+    assert RS.wait_for_resume(None, None, 0, 1) is False
+    assert RS.wait_for_resume({}, None, 0, 1) is False
+    assert RS.wait_for_resume({"pause_requested": False}, None, 0, 1) is False
+
+
+def test_wait_for_resume_stop_requested():
+    # paused + stop_requested + no resume_event -> returns True (stopped) after callback
+    events = []
+    jc = {"pause_requested": True, "stop_requested": True}
+    out = RS.wait_for_resume(jc, lambda e: events.append(e["event"]), 1, 3)
+    assert out is True
+    assert "run_paused" in events
+
+
+def test_write_rescore_summary_roundtrip(tmp_path):
+    path = tmp_path / "summary.csv"
+    rows = [{"rescore_id": "r1", "task_id": "t1", "status": "completed",
+             "new_final_score_0_10": 9.0, "ignored_col": "x"}]
+    RS.write_rescore_summary(path, rows)
+    read = RS.read_csv_rows(path)
+    assert read[0]["rescore_id"] == "r1"
+    assert read[0]["task_id"] == "t1"
+    assert "ignored_col" not in read[0]  # only declared fieldnames written
+
+
+def test_read_csv_rows_missing(tmp_path):
+    assert RS.read_csv_rows(tmp_path / "nope.csv") == []
+
+
+
