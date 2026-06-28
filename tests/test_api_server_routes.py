@@ -54,6 +54,66 @@ def test_summarize_run_basic(tmp_path):
     assert len(out["samples"]) == 1
 
 
+# ---------------------------------------------------------------------------
+# leaderboard_raw_rows / leaderboard assembly
+# ---------------------------------------------------------------------------
+def _leaderboard_run(runs: Path, run_id="run_lb", live=True, score=850.0):
+    run_dir = runs / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text(json.dumps({
+        "job_id": run_id, "status": "completed", "final_decision": "GO",
+        "live_provider": live, "started_at": "2026-06-28T00:00:00Z",
+        "completed_at": "2026-06-28T00:05:00Z",
+    }), encoding="utf-8")
+    (run_dir / "benchmark_scores.json").write_text(json.dumps({
+        "benchmark_mode": "smoke", "generated_at": "2026-06-28T00:05:00Z",
+        "providers": {"tested": {"benchmark_score": score, "quality_score": 800.0,
+                                 "task_count": 1, "mode": "smoke"}},
+    }), encoding="utf-8")
+    (run_dir / "run_records.jsonl").write_text(json.dumps({
+        "task": {"id": "t1"}, "provider": {"id": "tested", "model_returned": "claude-opus-4-6",
+                                            "provider_display_name": "Tested GW",
+                                            "base_url_host": "gw.x", "leaderboard_group": "gateway_candidate",
+                                            "provider_channel": "gateway"},
+        "telemetry": {"ok": True, "first_content_token_ms": 800},
+        "scoring": {"final_score": {"score": 9.0}},
+    }) + "\n", encoding="utf-8")
+    return run_dir
+
+
+def test_leaderboard_raw_rows_live_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "RUNS_DIR", tmp_path)
+    _leaderboard_run(tmp_path, "run_live", live=True)
+    _leaderboard_run(tmp_path, "run_dry", live=False)
+    rows = S.leaderboard_raw_rows(include_dry_run=False)
+    ids = {r["run_id"] for r in rows}
+    assert "run_live" in ids
+    assert "run_dry" not in ids  # dry excluded by default
+
+
+def test_leaderboard_raw_rows_include_dry(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "RUNS_DIR", tmp_path)
+    _leaderboard_run(tmp_path, "run_dry", live=False)
+    rows = S.leaderboard_raw_rows(include_dry_run=True)
+    assert any(r["run_id"] == "run_dry" for r in rows)
+
+
+def test_leaderboard_assembles_ranked_entries(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "RUNS_DIR", tmp_path)
+    _leaderboard_run(tmp_path, "run_a", live=True, score=900.0)
+    board = S.leaderboard(limit=50)
+    assert isinstance(board, dict)
+    entries = board.get("leaderboard") or board.get("entries")
+    assert entries and entries[0].get("rank") == 1
+    assert entries[0]["provider_id"] == "tested"
+    assert entries[0]["history_count"] >= 1
+
+
+def test_leaderboard_empty_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "RUNS_DIR", tmp_path / "nonexistent")
+    assert S.leaderboard_raw_rows() == []
+
+
 def test_summarize_run_redacts_sample_error(tmp_path):
     recs = [{
         "task": {"id": "t1"}, "provider": {"id": "tested"},
