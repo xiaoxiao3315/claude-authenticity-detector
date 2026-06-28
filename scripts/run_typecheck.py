@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Strict type-check gate for the graduated module set.
+"""Strict type-check gate for the app module set.
 
-mypy on the whole tree still reports ~300 historical findings in the legacy
-modules. Blocking CI on all of them at once is not actionable. Instead we hold a
-strict zero-error line on modules that have been cleaned, and grow the set over
-time. CI runs THIS script; it fails if any graduated module regresses.
+All 25 app modules are now in STRICT_MODULES and `mypy *.py` is clean tree-wide.
+CI runs THIS script; it fails if any module regresses. The `--all` flag also
+prints a (non-gating) whole-tree error count as a backstop.
 
-To graduate a module: clean `python -m mypy <mod>.py`, add it to STRICT_MODULES
-here, and (optionally) tighten its section in mypy.ini.
+When adding a new module: clean `python -m mypy <mod>.py`, add it to
+STRICT_MODULES here, and add its section to mypy.ini.
 
 Usage:
     python scripts/run_typecheck.py          # check the strict set
