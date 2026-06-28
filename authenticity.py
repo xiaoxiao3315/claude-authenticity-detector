@@ -53,6 +53,16 @@ def read_json(path: Path) -> Any:
         return json.load(f)
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Narrow Any -> dict (empty when not a dict) for the type checker."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    """Narrow Any -> list (empty when not a list) for the type checker."""
+    return value if isinstance(value, list) else []
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -77,8 +87,8 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def record_event_path(record: dict[str, Any]) -> Path | None:
-    artifacts = record.get("artifacts") if isinstance(record.get("artifacts"), dict) else {}
-    response = record.get("response") if isinstance(record.get("response"), dict) else {}
+    artifacts = _as_dict(record.get("artifacts"))
+    response = _as_dict(record.get("response"))
     value = artifacts.get("events_file") or response.get("events_file")
     if not value:
         return None
@@ -112,7 +122,7 @@ def clamp01(value: float | None) -> float | None:
 
 def active_run_refs(campaign_dir_path: Path) -> list[dict[str, Any]]:
     run_index = load_run_index(campaign_dir_path)
-    refs = run_index.get("runs") if isinstance(run_index.get("runs"), list) else []
+    refs = _as_list(run_index.get("runs"))
     return [ref for ref in refs if isinstance(ref, dict) and ref.get("status") != "replaced"]
 
 
@@ -163,14 +173,14 @@ def record_feature_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
     categories: Counter[str] = Counter()
     gateway_audit_counts: Counter[str] = Counter()
     for record in records:
-        task = record.get("task") if isinstance(record.get("task"), dict) else {}
-        provider = record.get("provider") if isinstance(record.get("provider"), dict) else {}
-        request = record.get("request") if isinstance(record.get("request"), dict) else {}
-        usage = record.get("usage") if isinstance(record.get("usage"), dict) else {}
-        telemetry = record.get("telemetry") if isinstance(record.get("telemetry"), dict) else {}
-        trace = record.get("trace") if isinstance(record.get("trace"), dict) else {}
-        artifacts = record.get("artifacts") if isinstance(record.get("artifacts"), dict) else {}
-        response = record.get("response") if isinstance(record.get("response"), dict) else {}
+        task = _as_dict(record.get("task"))
+        provider = _as_dict(record.get("provider"))
+        request = _as_dict(record.get("request"))
+        usage = _as_dict(record.get("usage"))
+        telemetry = _as_dict(record.get("telemetry"))
+        trace = _as_dict(record.get("trace"))
+        artifacts = _as_dict(record.get("artifacts"))
+        response = _as_dict(record.get("response"))
         events = record_events(record)
         record_request_id_present = False
         record_upstream_request_present = False
@@ -193,7 +203,7 @@ def record_feature_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
             request_hash_seen += 1
         if artifacts.get("events_file") or response.get("events_file"):
             event_path_seen += 1
-        raw_types = trace.get("raw_event_types") if isinstance(trace.get("raw_event_types"), list) else []
+        raw_types = _as_list(trace.get("raw_event_types"))
         if raw_types:
             raw_event_seen += 1
             for event_type in raw_types:
@@ -205,7 +215,7 @@ def record_feature_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
             response_headers_seen += 1
         if any(event.get("request_id") for event in events if isinstance(event, dict)):
             record_request_id_present = True
-        tool_calls = trace.get("tool_calls") if isinstance(trace.get("tool_calls"), list) else []
+        tool_calls = _as_list(trace.get("tool_calls"))
         if tool_calls:
             tool_use_seen += 1
         if provider.get("upstream_request_id") or telemetry.get("upstream_request_id"):
@@ -286,8 +296,8 @@ def score_values(summary: dict[str, Any]) -> list[float]:
 
 
 def statistical_confidence(summary: dict[str, Any], *, min_sample_threshold: int = 30) -> dict[str, Any]:
-    samples = summary.get("samples") if isinstance(summary.get("samples"), list) else []
-    child_runs = summary.get("child_runs") if isinstance(summary.get("child_runs"), list) else []
+    samples = _as_list(summary.get("samples"))
+    child_runs = _as_list(summary.get("child_runs"))
     scores = score_values(summary)
     total_samples = len(samples)
     evaluated_samples = len(scores)
@@ -327,10 +337,8 @@ def statistical_confidence(summary: dict[str, Any], *, min_sample_threshold: int
     if average_repeated_range is not None:
         repeated_task_consistency = round(max(0.0, 1.0 - min(average_repeated_range / 10.0, 1.0)), 6)
 
-    run_quality = [numeric(run.get("average_quality_score")) for run in child_runs if isinstance(run, dict)]
-    run_quality = [value for value in run_quality if value is not None]
-    run_transport = [numeric(run.get("transport_success_rate")) for run in child_runs if isinstance(run, dict)]
-    run_transport = [value for value in run_transport if value is not None]
+    run_quality = [v for v in (numeric(run.get("average_quality_score")) for run in child_runs if isinstance(run, dict)) if v is not None]
+    run_transport = [v for v in (numeric(run.get("transport_success_rate")) for run in child_runs if isinstance(run, dict)) if v is not None]
     completed_dates = {
         str(run.get("completed_at") or "")[:10]
         for run in child_runs
@@ -394,7 +402,7 @@ def build_protocol_fingerprint(
     gateway_provider: str,
     persist: bool,
 ) -> dict[str, Any]:
-    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
+    metrics = _as_dict(summary.get("metrics"))
     feature_metrics = record_feature_metrics(records)
     total_cases = int(metrics.get("total_cases") or feature_metrics["record_count"] or 0)
     protocol_rate = clamp01(numeric(metrics.get("protocol_compatibility_score")))
@@ -454,7 +462,7 @@ def build_protocol_fingerprint(
     else:
         decision = decision_from_score(score)
 
-    tested = summary.get("tested_model") if isinstance(summary.get("tested_model"), dict) else {}
+    tested = _as_dict(summary.get("tested_model"))
     fingerprint = {
         "schema_version": PROTOCOL_FINGERPRINT_SCHEMA_VERSION,
         "campaign_id": summary.get("campaign_id") or campaign_dir_path.name,
@@ -513,7 +521,7 @@ def build_baseline_comparison(
         if baseline_summary is None:
             baseline_summary = summarize_campaign(baseline_campaign_dir, runs_dir, persist=False)
 
-    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
+    metrics = _as_dict(summary.get("metrics"))
     live_provider = summary.get("live_provider") is True
     reasons: list[str] = []
     comparison_metrics: dict[str, Any] = {
@@ -539,7 +547,7 @@ def build_baseline_comparison(
         decision = "REVIEW"
     else:
         baseline_source = "campaign"
-        baseline_metrics = baseline_summary.get("metrics") if isinstance(baseline_summary.get("metrics"), dict) else {}
+        baseline_metrics = _as_dict(baseline_summary.get("metrics"))
         quality = numeric(metrics.get("average_quality_score"))
         baseline_quality = numeric(baseline_metrics.get("average_quality_score"))
         transport = numeric(metrics.get("transport_success_rate"))
@@ -607,8 +615,8 @@ def build_baseline_comparison(
 
 
 def build_auditability(summary: dict[str, Any], records: list[dict[str, Any]], protocol_fingerprint: dict[str, Any]) -> dict[str, Any]:
-    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
-    tested = summary.get("tested_model") if isinstance(summary.get("tested_model"), dict) else {}
+    metrics = _as_dict(summary.get("metrics"))
+    tested = _as_dict(summary.get("tested_model"))
     feature_metrics = record_feature_metrics(records)
     total_cases = int(metrics.get("total_cases") or feature_metrics["record_count"] or 0)
     model_returned_seen = int(metrics.get("model_returned_seen_count") or 0)
@@ -676,7 +684,7 @@ def build_auditability(summary: dict[str, Any], records: list[dict[str, Any]], p
 
 
 def quality_score_from_summary(summary: dict[str, Any]) -> float | None:
-    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
+    metrics = _as_dict(summary.get("metrics"))
     avg_quality = numeric(metrics.get("average_quality_score"))
     if avg_quality is None:
         return None
@@ -684,7 +692,7 @@ def quality_score_from_summary(summary: dict[str, Any]) -> float | None:
 
 
 def gateway_score_from_summary(summary: dict[str, Any]) -> float | None:
-    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
+    metrics = _as_dict(summary.get("metrics"))
     transport = clamp01(numeric(metrics.get("transport_success_rate")))
     p95 = numeric(metrics.get("p95_latency_ms"))
     if transport is None and p95 is None:
@@ -732,7 +740,7 @@ def write_authenticity_evidence(
     )
     auditability = build_auditability(summary, records, protocol_fingerprint)
     statistical = statistical_confidence(summary)
-    decisions = summary.get("decisions") if isinstance(summary.get("decisions"), dict) else {}
+    decisions = _as_dict(summary.get("decisions"))
     model_quality_decision = str(decisions.get("model_confidence_decision") or "REVIEW")
     gateway_reliability_decision = str(decisions.get("gateway_reliability_decision") or "REVIEW")
     protocol_decision = str(protocol_fingerprint.get("decision") or "REVIEW")
@@ -745,7 +753,7 @@ def write_authenticity_evidence(
         baseline_decision,
         auditability_decision,
     )
-    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
+    metrics = _as_dict(summary.get("metrics"))
     model_quality_score = quality_score_from_summary(summary)
     gateway_reliability_score = gateway_score_from_summary(summary)
     available_scores = [

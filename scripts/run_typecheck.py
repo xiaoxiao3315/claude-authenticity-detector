@@ -36,6 +36,7 @@ STRICT_MODULES = [
     "campaigns",
     "run_eval",
     "run_records",
+    "authenticity",
 ]
 
 
