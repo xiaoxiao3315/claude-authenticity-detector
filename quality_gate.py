@@ -735,6 +735,25 @@ def evaluate_policy(
     elif metrics.get("needle_found"):
         passed_rules.append("needle_context_ok")
 
+    # Authenticity verdict from the baseline-comparison subsystem
+    # (compare_to_baseline). This unifies the two verdict engines: a campaign
+    # that carries an authenticity verdict can no longer get a GO while the
+    # detector privately suspects a wrapper/downgrade. Absent metric -> no-op,
+    # so campaigns without a baseline comparison are unaffected.
+    authenticity_verdict = str(metrics.get("authenticity_verdict") or "").strip()
+    if authenticity_verdict in {"suspected_wrapper", "suspected_downgrade"}:
+        blockers.append(issue(
+            "authenticity_verdict_blocks", "baseline_comparison", "authenticity_verdict",
+            authenticity_verdict, "matches_official",
+            "baseline comparison flagged the endpoint as a wrapper or downgrade"))
+    elif authenticity_verdict == "insufficient_evidence":
+        review_items.append(issue(
+            "authenticity_insufficient_requires_review", "baseline_comparison",
+            "authenticity_verdict", authenticity_verdict, "matches_official",
+            "baseline comparison could not confirm authenticity (insufficient evidence)"))
+    elif authenticity_verdict in {"matches_official", "official_claude"}:
+        passed_rules.append("authenticity_ok")
+
     success_rate = metrics.get("success_rate")
     success_no_go = numeric(thresholds.get("success_rate_no_go"), 0.95)
     success_review = numeric(thresholds.get("success_rate_review"), 0.98)

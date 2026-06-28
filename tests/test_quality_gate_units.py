@@ -322,3 +322,39 @@ def test_evaluate_policy_high_json_failure_is_nogo():
     assert any(b["rule_id"] == "json_failure_rate_too_high" for b in blockers)
 
 
+# ---------------------------------------------------------------------------
+# authenticity verdict from baseline comparison folded into the gate (P3)
+# ---------------------------------------------------------------------------
+def test_evaluate_policy_wrapper_verdict_is_nogo():
+    decision, blockers, _, _ = _evaluate(_clean_metrics(authenticity_verdict="suspected_wrapper"))
+    assert decision == "NO-GO"
+    assert any(b["rule_id"] == "authenticity_verdict_blocks" for b in blockers)
+
+
+def test_evaluate_policy_downgrade_verdict_is_nogo():
+    decision, blockers, _, _ = _evaluate(_clean_metrics(authenticity_verdict="suspected_downgrade"))
+    assert decision == "NO-GO"
+    assert any(b["rule_id"] == "authenticity_verdict_blocks" for b in blockers)
+
+
+def test_evaluate_policy_insufficient_authenticity_is_review():
+    decision, blockers, review, _ = _evaluate(_clean_metrics(authenticity_verdict="insufficient_evidence"))
+    assert decision == "REVIEW"
+    assert blockers == []
+    assert any(r["rule_id"] == "authenticity_insufficient_requires_review" for r in review)
+
+
+def test_evaluate_policy_matches_official_passes():
+    decision, blockers, _, passed = _evaluate(_clean_metrics(authenticity_verdict="matches_official"))
+    assert decision == "GO"
+    assert "authenticity_ok" in passed
+
+
+def test_evaluate_policy_no_authenticity_verdict_is_noop():
+    # absent verdict must not change the clean GO (campaigns without baseline comparison)
+    decision, blockers, _, passed = _evaluate(_clean_metrics())
+    assert decision == "GO"
+    assert not any(b["rule_id"] == "authenticity_verdict_blocks" for b in blockers)
+    assert "authenticity_ok" not in passed
+
+
