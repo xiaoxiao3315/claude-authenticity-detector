@@ -43,6 +43,8 @@ STRICT_MODULES = [
     "acceptance_pack",
     "archive_registry",
     "baseline_registry",
+    "job_runtime",
+    "validate_run_records",
 ]
 
 

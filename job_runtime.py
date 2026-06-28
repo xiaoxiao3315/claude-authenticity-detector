@@ -177,7 +177,7 @@ class JobRuntime:
         resume_event = Event()
         resume_event.set()
         now = self._now_iso()
-        job = {
+        job: dict[str, Any] = {
             "job_id": job_id,
             "status": "queued",
             "created_at": now,
@@ -503,6 +503,7 @@ def _self_test() -> None:
         total_tasks=2,
         now_iso=lambda: "2026-01-01T12:00:00",
     )
+    assert stopped_patch is not None
     assert stopped_patch["status"] == "stopped"
     assert stopped_patch["completed_at"] == "2026-01-01T12:00:00"
     assert stopped_patch["stop_reason"] == "user_stop_requested"

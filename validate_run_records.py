@@ -155,7 +155,7 @@ def self_test_records() -> list[dict[str, Any]]:
         "stop_reason": "end_turn",
     }
 
-    cases = [
+    cases: list[tuple[str, str, dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]] = [
         ("success", "completed", base_metrics, {"score": 9.0}, None),
         (
             "api_failed",
@@ -217,8 +217,8 @@ def self_test_records() -> list[dict[str, Any]]:
 
 def main() -> int:
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     except AttributeError:
         pass
 
