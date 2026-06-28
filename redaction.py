@@ -31,10 +31,33 @@ SECRET_KEY_FRAGMENTS = (
     "x-api-key",
 )
 
+# Suffixes that mark a key as METADATA about a credential, not the credential
+# itself — an env-var NAME, a presence flag, a salted fingerprint, an id. These
+# must NOT be redacted (e.g. api_key_present=False, api_key_env="TESTED_KEY"),
+# or the config/observability surface loses the fields the UI needs.
+SECRET_KEY_METADATA_SUFFIXES = (
+    "_present",
+    "_env",
+    "_name",
+    "_id",
+    "_fingerprint",
+    "_hash",
+    "_set",
+    "_configured",
+    "_count",
+)
+
 
 def is_secret_key(key: Any) -> bool:
-    """True if a dict key name signals its value is a credential."""
+    """True if a dict key name signals its value is a raw credential.
+
+    Matches credential fragments (api_key, secret, token, ...) but explicitly
+    NOT metadata-about-a-credential keys (api_key_env, api_key_present, ...),
+    whose values are names/flags, not secrets.
+    """
     lowered = str(key).lower()
+    if lowered.endswith(SECRET_KEY_METADATA_SUFFIXES):
+        return False
     return any(fragment in lowered for fragment in SECRET_KEY_FRAGMENTS)
 
 
@@ -78,8 +101,11 @@ def redact_raw_fragments(value: Any, raw_values: list[Any] | None = None, *, max
 def redact_value(value: Any, *, max_chars: int | None = None, parent_key: Any = None) -> Any:
     # A value sitting under a credential-named key is redacted whole, even if the
     # value itself carries no intrinsic secret marker (e.g. {"x-api-key": "abc123"}).
-    if parent_key is not None and is_secret_key(parent_key) and not isinstance(value, (dict, list, tuple)):
-        return "[REDACTED]" if value is not None else None
+    # Booleans/numbers are never secrets (a presence flag like api_key_present=False
+    # must survive), so only string credential values are masked here.
+    if (parent_key is not None and is_secret_key(parent_key)
+            and isinstance(value, str)):
+        return "[REDACTED]"
     if isinstance(value, str):
         return redact_text(value, max_chars=max_chars)
     if isinstance(value, list):
@@ -107,6 +133,17 @@ def _self_test() -> int:
     assert "barevalue123456" not in str(out), out
     assert out["n"] == 5
     assert is_secret_key("X-Api-Key") and is_secret_key("authorization") and not is_secret_key("model")
+
+    # Metadata-about-a-credential keys must SURVIVE (not the secret itself):
+    # api_key_present is a flag, api_key_env is an env-var name, _fingerprint a hash.
+    assert not is_secret_key("api_key_present")
+    assert not is_secret_key("api_key_env")
+    assert not is_secret_key("key_fingerprint")
+    meta = redact_value({"api_key_present": False, "api_key_env": "TESTED_KEY"})
+    assert meta["api_key_present"] is False
+    assert meta["api_key_env"] == "TESTED_KEY"
+    # but the raw credential value under api_key IS masked
+    assert redact_value({"api_key": "rawsecretvalue"})["api_key"] == "[REDACTED]"
 
     # Raw-fragment scrub for a known echoed key.
     assert "RAWKEY1234567890" not in (redact_raw_fragments("got RAWKEY1234567890", ["RAWKEY1234567890"]) or "")

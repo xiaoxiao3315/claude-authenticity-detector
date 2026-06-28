@@ -164,3 +164,29 @@ def test_redact_value_nested_structure():
     assert "abc123456789" not in flat
     assert "deepsecret123456" not in flat
 
+
+# ---------------------------------------------------------------------------
+# metadata-about-a-credential keys must SURVIVE (regression: over-redaction)
+# ---------------------------------------------------------------------------
+def test_credential_metadata_keys_survive():
+    # api_key_present is a flag; api_key_env is an env-var NAME; key_fingerprint
+    # is a salted hash — none are the secret itself and must not be masked.
+    out = redact_value({"api_key_present": False, "api_key_env": "TESTED_KEY",
+                        "key_fingerprint": "abc123", "model": "claude"})
+    assert out["api_key_present"] is False
+    assert out["api_key_env"] == "TESTED_KEY"
+    assert out["key_fingerprint"] == "abc123"
+    assert out["model"] == "claude"
+
+
+def test_raw_credential_value_still_masked():
+    # the actual credential under a bare api_key/secret/token IS masked
+    assert redact_value({"api_key": "rawsecret"})["api_key"] == "[REDACTED]"
+    assert redact_value({"secret": "rawsecret"})["secret"] == "[REDACTED]"
+    assert redact_value({"x-api-key": "rawsecret"})["x-api-key"] == "[REDACTED]"
+
+
+def test_boolean_under_secret_key_not_masked():
+    # a bool value is never a secret, even directly under a secret-named key
+    assert redact_value({"token": True})["token"] is True
+
