@@ -54,6 +54,16 @@ def read_json(path: Path) -> Any:
         return json.load(f)
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Narrow Any -> dict (empty when not a dict) for the type checker."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    """Narrow Any -> list (empty when not a list) for the type checker."""
+    return value if isinstance(value, list) else []
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -85,7 +95,7 @@ def numeric(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def ratio(numerator: int | float, denominator: int | float) -> float | None:
+def ratio(numerator: int | float, denominator: int | float | None) -> float | None:
     if not denominator:
         return None
     return round(float(numerator) / float(denominator), 6)
@@ -166,13 +176,13 @@ def load_summary(campaign_dir_path: Path) -> dict[str, Any] | None:
 def summary_needs_refresh(summary: dict[str, Any] | None) -> bool:
     if not isinstance(summary, dict):
         return True
-    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
+    metrics = _as_dict(summary.get("metrics"))
     if not REQUIRED_SUMMARY_METRIC_KEYS.issubset(metrics):
         return True
-    decisions = summary.get("decisions") if isinstance(summary.get("decisions"), dict) else {}
+    decisions = _as_dict(summary.get("decisions"))
     if not {"model_confidence_decision", "gateway_reliability_decision", "overall_decision"}.issubset(decisions):
         return True
-    outcomes = summary.get("outcomes") if isinstance(summary.get("outcomes"), dict) else {}
+    outcomes = _as_dict(summary.get("outcomes"))
     return not REQUIRED_SUMMARY_OUTCOME_KEYS.issubset(outcomes)
 
 
@@ -206,14 +216,14 @@ def latest_quality_gate_record(run_dir: Path) -> dict[str, Any] | None:
 
 
 def score_value(record: dict[str, Any]) -> float | None:
-    scoring = record.get("scoring") if isinstance(record.get("scoring"), dict) else {}
-    final_score = scoring.get("final_score") if isinstance(scoring.get("final_score"), dict) else {}
+    scoring = _as_dict(record.get("scoring"))
+    final_score = _as_dict(scoring.get("final_score"))
     return numeric(final_score.get("score"))
 
 
 def judge_reason(record: dict[str, Any]) -> str:
-    scoring = record.get("scoring") if isinstance(record.get("scoring"), dict) else {}
-    final_score = scoring.get("final_score") if isinstance(scoring.get("final_score"), dict) else {}
+    scoring = _as_dict(record.get("scoring"))
+    final_score = _as_dict(scoring.get("final_score"))
     return redact_text(final_score.get("details") or "", max_chars=500) or ""
 
 
@@ -280,8 +290,8 @@ def campaign_outcomes(metrics: dict[str, Any], decisions: dict[str, Any]) -> dic
     model_decision = str(decisions.get("model_confidence_decision") or "REVIEW")
     gateway_decision = str(decisions.get("gateway_reliability_decision") or "REVIEW")
     overall_decision = str(decisions.get("overall_decision") or worst_decision(model_decision, gateway_decision))
-    model_reasons = decisions.get("model_confidence_reasons") if isinstance(decisions.get("model_confidence_reasons"), list) else []
-    gateway_reasons = decisions.get("gateway_reliability_reasons") if isinstance(decisions.get("gateway_reliability_reasons"), list) else []
+    model_reasons = _as_list(decisions.get("model_confidence_reasons"))
+    gateway_reasons = _as_list(decisions.get("gateway_reliability_reasons"))
     next_action, next_action_reason = retest_action(
         model_decision=model_decision,
         model_reasons=[str(item) for item in model_reasons],
@@ -301,11 +311,11 @@ def campaign_outcomes(metrics: dict[str, Any], decisions: dict[str, Any]) -> dic
 
 
 def outcomes_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
-    existing = summary.get("outcomes") if isinstance(summary.get("outcomes"), dict) else {}
+    existing = _as_dict(summary.get("outcomes"))
     if REQUIRED_SUMMARY_OUTCOME_KEYS.issubset(existing):
         return existing
-    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
-    decisions = summary.get("decisions") if isinstance(summary.get("decisions"), dict) else {}
+    metrics = _as_dict(summary.get("metrics"))
+    decisions = _as_dict(summary.get("decisions"))
     return campaign_outcomes(metrics, decisions)
 
 
@@ -374,10 +384,10 @@ def provider_score_for_run(run_dir: Path, provider_id: str | None) -> dict[str, 
     if not path.exists():
         return {}
     data = read_json(path)
-    providers = data.get("providers") if isinstance(data.get("providers"), dict) else {}
+    providers = _as_dict(data.get("providers"))
     if provider_id and provider_id in providers and isinstance(providers[provider_id], dict):
         return providers[provider_id]
-    first = next(iter(providers.values()), {})
+    first: Any = next(iter(providers.values()), {})
     return first if isinstance(first, dict) else {}
 
 
@@ -399,9 +409,9 @@ def compatibility_key_string(key: dict[str, Any]) -> str:
 def summarize_campaign(campaign_dir_path: Path, runs_dir: Path, *, persist: bool = True) -> dict[str, Any]:
     campaign = load_campaign(campaign_dir_path)
     run_index = load_run_index(campaign_dir_path)
-    run_refs = run_index.get("runs") if isinstance(run_index.get("runs"), list) else []
+    run_refs = _as_list(run_index.get("runs"))
     active_refs = [run_ref for run_ref in run_refs if run_ref.get("status") != "replaced"]
-    tested_identity = campaign.get("tested_model") if isinstance(campaign.get("tested_model"), dict) else {}
+    tested_identity = _as_dict(campaign.get("tested_model"))
     tested_provider_id = str(tested_identity.get("provider_id") or "")
     expected_protocol = str(tested_identity.get("protocol") or "")
 
@@ -436,17 +446,18 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path, *, persist: bool
 
         for record in records:
             all_records.append(record)
-            task = record.get("task") if isinstance(record.get("task"), dict) else {}
-            provider = record.get("provider") if isinstance(record.get("provider"), dict) else {}
-            telemetry = record.get("telemetry") if isinstance(record.get("telemetry"), dict) else {}
-            response = record.get("response") if isinstance(record.get("response"), dict) else {}
-            scoring = record.get("scoring") if isinstance(record.get("scoring"), dict) else {}
-            judge_score = scoring.get("judge_score") if isinstance(scoring.get("judge_score"), dict) else {}
+            task = _as_dict(record.get("task"))
+            provider = _as_dict(record.get("provider"))
+            telemetry = _as_dict(record.get("telemetry"))
+            response = _as_dict(record.get("response"))
+            scoring = _as_dict(record.get("scoring"))
+            judge_score = _as_dict(scoring.get("judge_score"))
             ok = telemetry.get("ok") is True
             if ok:
                 transport_ok_count += 1
                 run_transport_ok += 1
-            if ok and numeric(response.get("content_chars")) and numeric(response.get("content_chars")) > 0:
+            content_chars = numeric(response.get("content_chars"))
+            if ok and content_chars is not None and content_chars > 0:
                 model_response_count += 1
             if provider.get("api_style") == expected_protocol:
                 protocol_match_count += 1
@@ -613,11 +624,11 @@ def summarize_campaign(campaign_dir_path: Path, runs_dir: Path, *, persist: bool
 
 
 def summary_to_leaderboard_entry(summary: dict[str, Any]) -> dict[str, Any]:
-    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
-    decisions = summary.get("decisions") if isinstance(summary.get("decisions"), dict) else {}
+    metrics = _as_dict(summary.get("metrics"))
+    decisions = _as_dict(summary.get("decisions"))
     outcomes = outcomes_from_summary(summary)
-    tested = summary.get("tested_model") if isinstance(summary.get("tested_model"), dict) else {}
-    judge = summary.get("judge_model") if isinstance(summary.get("judge_model"), dict) else {}
+    tested = _as_dict(summary.get("tested_model"))
+    judge = _as_dict(summary.get("judge_model"))
     return {
         "campaign_id": summary.get("campaign_id"),
         "tested_model": tested.get("model"),
