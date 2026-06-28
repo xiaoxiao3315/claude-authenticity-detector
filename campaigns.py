@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from redaction import redact_text
+# Shared decision vocabulary — single source of truth (see decisions.py).
+# Re-exported so existing `campaigns.worst_decision` / `.DECISION_ORDER`
+# references (and the self-test) keep working unchanged.
+from decisions import DECISION_ORDER, worst_decision
 
 
-DECISION_ORDER = {"GO": 0, "REVIEW": 1, "NO-GO": 2}
 OUTCOME_ORDER = {"PASS": 0, "RETEST": 1, "FAIL": 2, "PENDING": 3}
 DECISION_OUTCOME_MAP = {"GO": "PASS", "REVIEW": "RETEST", "NO-GO": "FAIL"}
 SUMMARY_SCHEMA_VERSION = "campaign_summary_v1"
@@ -232,14 +235,6 @@ def error_type(error: Any) -> str:
     if "json" in lowered:
         return "json_or_parse"
     return "transport_or_model"
-
-
-def worst_decision(*decisions: str | None) -> str:
-    selected = "GO"
-    for decision in decisions:
-        if DECISION_ORDER.get(str(decision or "GO"), 0) > DECISION_ORDER[selected]:
-            selected = str(decision)
-    return selected
 
 
 def decision_to_outcome(decision: str | None) -> str:

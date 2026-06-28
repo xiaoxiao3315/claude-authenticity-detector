@@ -27,6 +27,7 @@ STRICT_MODULES = [
     "model_client",
     "benchmarking",
     "rescore",
+    "decisions",
 ]
 
 

@@ -27,6 +27,7 @@ IMPORTABLE_SELFTESTS = {
     "model_client": "_self_test",
     "benchmarking": "_self_test",
     "campaigns": "_self_test",
+    "decisions": "_self_test",
     "rescore": "_self_test",
     "run_eval": "_self_test",
     "api_server": "_self_test",

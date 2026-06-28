@@ -34,6 +34,7 @@ SELFTEST_FLAG_MODULES = [
     "campaigns",
     "cli_io",
     "compatibility",
+    "decisions",
     "evidence_registry",
     "job_runtime",
     "judge_calibration",

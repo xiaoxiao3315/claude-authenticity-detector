@@ -11,13 +11,21 @@ from pathlib import Path
 from typing import Any
 
 from campaigns import load_campaign, load_run_index, load_summary, summarize_campaign
+# Shared decision vocabulary — single source of truth (see decisions.py).
+# Re-exported here so existing `authenticity.worst_decision` / `.decision_from_score`
+# / `.decision_score` / `.DECISION_ORDER` references keep working unchanged.
+from decisions import (
+    DECISION_ORDER,
+    decision_from_score,
+    decision_score,
+    worst_decision,
+)
 from redaction import redact_text
 
 
 AUTHENTICITY_SCHEMA_VERSION = "authenticity_summary_v1"
 BASELINE_COMPARISON_SCHEMA_VERSION = "baseline_comparison_v1"
 PROTOCOL_FINGERPRINT_SCHEMA_VERSION = "protocol_fingerprint_v1"
-DECISION_ORDER = {"GO": 0, "REVIEW": 1, "NO-GO": 2}
 REQUEST_ID_KEYS = ("request_id", "upstream_request_id", "openai_request_id", "anthropic_request_id", "cf_ray")
 GATEWAY_AUDIT_KEYS = (
     "upstream_provider",
@@ -100,34 +108,6 @@ def clamp01(value: float | None) -> float | None:
     if value is None:
         return None
     return max(0.0, min(1.0, float(value)))
-
-
-def worst_decision(*decisions: str | None) -> str:
-    selected = "GO"
-    for decision in decisions:
-        value = str(decision or "GO")
-        if DECISION_ORDER.get(value, 0) > DECISION_ORDER[selected]:
-            selected = value
-    return selected
-
-
-def decision_from_score(score: float | None, *, go_threshold: float = 0.85, review_threshold: float = 0.60) -> str:
-    if score is None:
-        return "REVIEW"
-    if score >= go_threshold:
-        return "GO"
-    if score >= review_threshold:
-        return "REVIEW"
-    return "NO-GO"
-
-
-def decision_score(decision: str | None) -> float:
-    value = str(decision or "REVIEW")
-    if value == "GO":
-        return 1.0
-    if value == "NO-GO":
-        return 0.0
-    return 0.5
 
 
 def active_run_refs(campaign_dir_path: Path) -> list[dict[str, Any]]:
