@@ -102,9 +102,10 @@ def validate_golden_set(doc: dict[str, Any]) -> list[str]:
             problems.append(f"{where} ({cid}): expected_decision must be GO / REVIEW / NO-GO")
         band = case.get("expected_score_band")
         if band is not None:
+            lo = numeric(band[0]) if isinstance(band, (list, tuple)) and len(band) == 2 else None
+            hi = numeric(band[1]) if isinstance(band, (list, tuple)) and len(band) == 2 else None
             if (not isinstance(band, (list, tuple)) or len(band) != 2
-                    or numeric(band[0]) is None or numeric(band[1]) is None
-                    or numeric(band[0]) > numeric(band[1])):
+                    or lo is None or hi is None or lo > hi):
                 problems.append(f"{where} ({cid}): expected_score_band must be [lo, hi] with lo<=hi")
     return problems
 
@@ -197,7 +198,7 @@ def compute_calibration(
         elif expected == "GO":
             go_truth += 1
 
-        if not ok or observed is None:
+        if not ok or observed is None or expected is None:
             unscored += 1
             per_case.append({
                 "id": cid, "expected": expected, "observed": observed,
@@ -218,7 +219,7 @@ def compute_calibration(
         if band is not None and score is not None:
             band_total += 1
             lo, hi = numeric(band[0]), numeric(band[1])
-            band_ok = lo <= score <= hi
+            band_ok = lo is not None and hi is not None and lo <= score <= hi
             if band_ok:
                 band_hits += 1
 
@@ -301,7 +302,7 @@ def render_calibration_report(result: dict[str, Any], verdict: dict[str, Any]) -
         JUDGE_REVIEW: "⚠️ 评审模型需复核",
         JUDGE_UNRELIABLE: "❌ 评审模型不可信",
         JUDGE_INSUFFICIENT: "❔ 证据不足",
-    }.get(verdict.get("verdict"), verdict.get("verdict"))
+    }.get(str(verdict.get("verdict")), verdict.get("verdict"))
 
     lines = ["=" * 48, "Judge 金标校准报告", "=" * 48]
     lines.append(f"判定: {label}")
