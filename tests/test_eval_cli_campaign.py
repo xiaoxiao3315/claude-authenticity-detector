@@ -194,3 +194,42 @@ def test_campaign_leaderboard_after_run(tmp_path, capsys):
     # the produced campaign should surface somewhere in the payload
     assert "camp_test" in json.dumps(board, ensure_ascii=False)
 
+
+# ---------------------------------------------------------------------------
+# campaign_retest
+# ---------------------------------------------------------------------------
+def _retest_ns(tmp_path, **over):
+    base = dict(campaign_id="camp_test", campaigns_dir=str(tmp_path / "campaigns"),
+                runs_dir=str(tmp_path / "runs"), new_campaign_id=None,
+                job=str(_job_file(tmp_path)), providers=None, repeat=1, live=False,
+                force=False, dry_run=True, timeout=None, tested_max_tokens=None,
+                judge_max_tokens=None, max_concurrency=None, retries=None,
+                retry_backoff=None, skip_trace_evaluation=True)
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+def test_campaign_retest_skips_non_retest_without_force(tmp_path, capsys):
+    E.run_campaign(_campaign_ns(tmp_path))
+    capsys.readouterr()
+    rc = E.campaign_retest(_retest_ns(tmp_path, force=False))
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    # a non-RETEST campaign is skipped unless --force
+    assert out["status"] == "skipped"
+    assert "RETEST" in out["reason"]
+
+
+def test_campaign_retest_missing_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="campaign not found"):
+        E.campaign_retest(_retest_ns(tmp_path, campaign_id="ghost"))
+
+
+def test_campaign_retest_force_runs_new_campaign(tmp_path, capsys):
+    E.run_campaign(_campaign_ns(tmp_path))
+    capsys.readouterr()
+    rc = E.campaign_retest(_retest_ns(tmp_path, force=True, new_campaign_id="camp_retest"))
+    assert rc in (0, 1)
+    # a new campaign dir was created by the forced retest
+    assert (tmp_path / "campaigns" / "camp_retest" / "campaign.json").exists()
+
