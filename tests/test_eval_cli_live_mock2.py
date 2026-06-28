@@ -153,6 +153,32 @@ def test_needle_live_context_ok(tmp_path, capsys, monkeypatch):
     assert out["verdict"] == "context_ok"
 
 
+def test_needle_live_advertised_window_unproven(tmp_path, capsys, monkeypatch):
+    # recall succeeds at a small target, but the endpoint claims 1M -> the
+    # advertised window is UNPROVEN, not silently passed as context_ok.
+    def handler(request):
+        text = request.content.decode("utf-8", errors="replace")
+        m = re.search(r"AUTH_CANARY=[0-9a-f]+", text)
+        echoed = m.group(0) if m else "no canary"
+        return httpx.Response(200, json={
+            "model": "claude-opus-4-6",
+            "content": [{"type": "text", "text": echoed}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 50000, "output_tokens": 8},
+        })
+
+    _patch_client(monkeypatch, handler)
+    args = _ns(providers=str(_providers_file(tmp_path)), provider="tested_model", live=True,
+               target_tokens=2000, advertised_tokens=1_000_000, seed=5, baseline_id=None,
+               baselines_dir=str(tmp_path / "b"), timeout=30.0)
+    rc = E.needle(args)
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["advertised_tokens"] == 1_000_000
+    assert out["advertised_window_proven"] is False
+    assert out["verdict"] == "context_ok_below_advertised"
+
+
 def test_needle_live_http_error(tmp_path, capsys, monkeypatch):
     def handler(request):
         return httpx.Response(429, text="Upstream rate limit exceeded")

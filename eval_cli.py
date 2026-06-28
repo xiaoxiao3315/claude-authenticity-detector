@@ -1995,7 +1995,7 @@ def verify_endpoint(args: argparse.Namespace) -> int:
                     behavior["error_envelope"] = {"probe_error": "no 4xx response to classify"}
             except Exception as exc:
                 behavior["error_envelope"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
-        # needle fake-1M probe (#1): >200K context, recall + silent-truncation
+        # needle long-context probe (#1): ~120K context, recall + silent-truncation
         if getattr(args, "with_needle", False):
             try:
                 nd_args = argparse.Namespace(providers=args.providers, provider=role, live=True,
@@ -2085,6 +2085,12 @@ def _assemble_needle_prompt(target_tokens: int, seed: int, depth: float = 0.01) 
 
 def needle(args: argparse.Namespace) -> int:
     target_tokens = int(getattr(args, "target_tokens", 120000) or 120000)
+    # The window the endpoint CLAIMS to support (e.g. 1_000_000 for a "1M" gateway).
+    # The probe can only prove context up to target_tokens (upstreams reject single
+    # requests above ~160-220K), so when advertised >> target we report that the
+    # advertised window is UNPROVEN rather than implying it was verified.
+    advertised_tokens = getattr(args, "advertised_tokens", None)
+    advertised_tokens = int(advertised_tokens) if advertised_tokens else None
     seed = int(getattr(args, "seed", 1) or 1)
     live = bool(getattr(args, "live", False))
     if live:
@@ -2122,6 +2128,7 @@ def needle(args: argparse.Namespace) -> int:
             "probe": "needle_recall",
             "evidence_status": "dry_run_reference_only",
             "target_tokens": target_tokens,
+            "advertised_tokens": advertised_tokens,
             "seed": seed,
             "canary_sha256": hashlib.sha256(canary.encode()).hexdigest()[:16],
             "sent_chars": sent_chars,
@@ -2165,10 +2172,20 @@ def needle(args: argparse.Namespace) -> int:
     verdict = "fake_1m_silent_truncation" if truncation.get("silent_truncation") else (
         "context_ok" if recall.get("score") == 10.0 else "insufficient_or_legit_error"
     )
+    # Honesty guard: a successful recall at target_tokens only proves context up
+    # to target_tokens. If the endpoint advertises a much larger window, that
+    # window is UNPROVEN — don't let context_ok be read as "1M verified".
+    advertised_window_proven = None
+    if advertised_tokens:
+        advertised_window_proven = bool(verdict == "context_ok" and target_tokens >= advertised_tokens)
+        if verdict == "context_ok" and target_tokens < advertised_tokens:
+            verdict = "context_ok_below_advertised"
     result = {
         "probe": "needle_recall",
         "evidence_status": "live_observed",
         "target_tokens": target_tokens,
+        "advertised_tokens": advertised_tokens,
+        "advertised_window_proven": advertised_window_proven,
         "seed": seed,
         "http_status": http_status,
         "observed_input_tokens": observed_input_tokens,
@@ -2760,7 +2777,7 @@ def main() -> int:
     verify_parser.add_argument("--json", action="store_true", help="also print raw JSON verdict")
     verify_parser.add_argument("--with-sse", action="store_true", help="also run the SSE event-order probe (extra live request)")
     verify_parser.add_argument("--with-error-envelope", action="store_true", help="also run the error-envelope probe (malformed requests)")
-    verify_parser.add_argument("--with-needle", action="store_true", help="also run the fake-1M needle probe (>200K request, slow/expensive)")
+    verify_parser.add_argument("--with-needle", action="store_true", help="also run the long-context needle probe (~120K request, slow/expensive)")
     verify_parser.add_argument("--needle-tokens", type=int, default=120000, help="needle target prompt size in tokens")
     verify_parser.add_argument("--with-capability", action="store_true", help="also run the capability-anchor probe (silent-downgrade detector; needs a baseline capability_anchor.json)")
     verify_parser.add_argument("--capability-items", type=Path, help="capability anchor item set (default judge_golden/capability_anchors_v1.json)")
@@ -2795,10 +2812,11 @@ def main() -> int:
     sse_parser.add_argument("--live", action="store_true", help="REAL streaming request (small cost). Default off = dry-run")
     sse_parser.set_defaults(func=sse_fingerprint)
 
-    needle_parser = sub.add_parser("needle", help="fake-1M context probe: plant a needle in a >200K prompt, check recall + silent truncation (--live, expensive)")
+    needle_parser = sub.add_parser("needle", help="long-context needle probe: plant a needle in a ~120K-token prompt, check recall + silent truncation; --advertised-tokens flags an unproven larger window (--live, expensive)")
     needle_parser.add_argument("--providers", type=Path)
     needle_parser.add_argument("--provider", default="tested_model", help="endpoint to probe")
-    needle_parser.add_argument("--target-tokens", type=int, default=120000, help="approx prompt size in tokens")
+    needle_parser.add_argument("--target-tokens", type=int, default=120000, help="approx prompt size in tokens actually sent (upstreams reject single requests above ~160-220K)")
+    needle_parser.add_argument("--advertised-tokens", type=int, default=None, help="the context window the endpoint CLAIMS (e.g. 1000000); recall at --target-tokens does NOT prove this larger window")
     needle_parser.add_argument("--seed", type=int, default=1, help="reproducible prompt seed")
     needle_parser.add_argument("--baseline-id", help="baseline to read this link's prefix from (for token shortfall)")
     needle_parser.add_argument("--baselines-dir", type=Path)
