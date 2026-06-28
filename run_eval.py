@@ -549,7 +549,55 @@ def write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow({k: row.get(k) for k in fieldnames})
 
 
+def _self_test() -> int:
+    """Offline unit checks for the pure scoring helpers. No network, no files."""
+    # score_json_exact: a perfect match scores 10 and is format_ok.
+    perfect = score_json_exact({"expected_json": {"status": "ok", "count": 3}},
+                               '{"status": "ok", "count": 3}')
+    assert perfect["score"] == 10.0 and perfect["format_ok"] is True, perfect
+    # wrong value loses the per-key value points but keeps structural credit.
+    wrongval = score_json_exact({"expected_json": {"status": "ok", "count": 3}},
+                                '{"status": "ok", "count": 99}')
+    assert 0 < wrongval["score"] < 10.0 and wrongval["format_ok"] is False, wrongval
+    # invalid JSON -> 0.
+    broken = score_json_exact({"expected_json": {"a": 1}}, "{not json")
+    assert broken["score"] == 0 and broken["format_ok"] is False, broken
+    # non-object top level -> 0.
+    arr = score_json_exact({"expected_json": {"a": 1}}, "[1,2,3]")
+    assert arr["score"] == 0, arr
+    # missing expected_json -> score None (cannot grade).
+    assert score_json_exact({}, "{}")["score"] is None
+
+    # score_keyword_check: 2 equal-weight checks, 1 hit -> 5.0
+    kc = {"keyword_checks": [
+        {"label": "a", "keywords": ["alpha"]},
+        {"label": "b", "keywords": ["beta"]},
+    ]}
+    half = score_keyword_check(kc, "this text mentions alpha only")
+    assert half["score"] == 5.0, half
+    both = score_keyword_check(kc, "alpha and beta both here")
+    assert both["score"] == 10.0, both
+    none_hit = score_keyword_check(kc, "nothing relevant")
+    assert none_hit["score"] == 0.0, none_hit
+    assert score_keyword_check({}, "x")["score"] is None
+
+    # normalize_for_keyword_match strips punctuation/whitespace (CJK + ASCII).
+    assert normalize_for_keyword_match("a, b。c") == "abc"
+    assert normalize_for_keyword_match("Hello World!") == "helloworld"
+
+    # provider_leaderboard_group is a stable string for a provider.
+    grp = provider_leaderboard_group(Provider(
+        id="p1", base_url="https://x", model="claude-opus-4",
+        auth_type="bearer", auth_env="K"))
+    assert isinstance(grp, str) and grp, grp
+
+    print("run_eval self-test ok")
+    return 0
+
+
 def main() -> int:
+    if "--self-test" in sys.argv:
+        return _self_test()
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")

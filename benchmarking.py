@@ -495,3 +495,55 @@ def paged_runs_from_index(db_path: Path, limit: int = 20, offset: int = 0) -> di
         "offset": offset,
         "runs": [dict(row) for row in rows],
     }
+
+
+def _self_test() -> int:
+    """Offline unit checks for the pure scoring helpers. No DB, no network."""
+    # numeric: empty/None -> default; bad -> default; good -> float.
+    assert numeric("3.5") == 3.5 and numeric(2) == 2.0
+    assert numeric("") is None and numeric(None) is None
+    assert numeric("", default=0.0) == 0.0 and numeric("x", default=-1.0) == -1.0
+
+    # round_or_none.
+    assert round_or_none(None) is None
+    assert round_or_none(1.23456) == 1.23
+
+    # weighted_average: ignores None values and non-positive weights.
+    assert weighted_average([]) is None
+    assert weighted_average([(10.0, 1.0), (20.0, 1.0)]) == 15.0
+    assert weighted_average([(10.0, 3.0), (20.0, 1.0)]) == 12.5
+    assert weighted_average([(10.0, 1.0), (None, 5.0)]) == 10.0  # None dropped
+    assert weighted_average([(10.0, 0.0)]) is None  # zero weight dropped
+
+    # quality_ratio: explicit score, judge_error short-circuit, format_ok fallbacks.
+    assert quality_ratio({"quality_0_10": 8}) == 0.8
+    assert quality_ratio({"score_0_10": 5}) == 0.5
+    assert quality_ratio({"judge_error": "boom"}) == 0.0
+    assert quality_ratio({"format_ok": "true"}) == 0.8
+    assert quality_ratio({"format_ok": "false"}) == 0.2
+    assert quality_ratio({"ok": "true"}) == 0.5
+    assert quality_ratio({}) == 0.0
+    assert quality_ratio({"quality_0_10": 99}) == 1.0  # clamped to 1.0
+
+    # risk_penalty: failed call and model mismatch each add penalty.
+    pv = 10.0
+    assert risk_penalty({"ok": "true"}, pv) == 0.0
+    assert risk_penalty({"ok": "false"}, pv) > 0.0
+    mismatch = risk_penalty({"ok": "true", "model_requested": "a", "model_returned": "b"}, pv)
+    assert mismatch > 0.0, mismatch
+
+    # task_sort_key returns a comparable tuple.
+    k1 = task_sort_key({"category": "a", "point_value": 5, "id": "t1"})
+    k2 = task_sort_key({"category": "a", "point_value": 5, "id": "t2"})
+    assert isinstance(k1, tuple) and k1 < k2
+
+    print("benchmarking self-test ok")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if "--self-test" in _sys.argv:
+        raise SystemExit(_self_test())
+    _sys.stderr.write("benchmarking.py is a library module; use eval_cli.py for the CLI, or --self-test.\n")
+    raise SystemExit(2)

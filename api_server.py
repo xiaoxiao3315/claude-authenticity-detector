@@ -931,7 +931,68 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _self_test() -> int:
+    """Offline unit checks for the pure helpers. No socket, no files."""
+    # sanitize_config_value: SECURITY — any key whose name hints at a secret is
+    # redacted, recursively, so /api/config can never leak a key.
+    raw = {
+        "base_url": "https://x",
+        "api_key": "sk-secret",
+        "AUTHORIZATION": "Bearer abc",
+        "nested": {"password": "p", "token": "t", "model": "claude"},
+        "list": [{"secret": "s", "ok": "keep"}],
+    }
+    clean = sanitize_config_value(raw)
+    assert clean["base_url"] == "https://x"
+    assert clean["api_key"] == "[REDACTED]"
+    assert clean["AUTHORIZATION"] == "[REDACTED]"
+    assert clean["nested"]["password"] == "[REDACTED]"
+    assert clean["nested"]["token"] == "[REDACTED]"
+    assert clean["nested"]["model"] == "claude"  # not a secret
+    assert clean["list"][0]["secret"] == "[REDACTED]"
+    assert clean["list"][0]["ok"] == "keep"
+    assert "sk-secret" not in json.dumps(clean)  # nothing leaked anywhere
+
+    # to_float: numbers parse, junk -> None.
+    assert to_float("3.5") == 3.5 and to_float(7) == 7.0
+    assert to_float(None) is None and to_float("x") is None
+
+    # percentile: single value + interpolation.
+    assert percentile([], 0.5) is None
+    assert percentile([10.0], 0.9) == 10.0
+    assert percentile([1.0, 2.0, 3.0, 4.0], 0.5) == 2.5
+
+    # is_text_model: text hints pass; image/embedding/etc rejected.
+    assert is_text_model("claude-opus-4") is True
+    assert is_text_model("gpt-4o-mini") is True
+    assert is_text_model("dall-e-3-image") is False
+    assert is_text_model("text-embedding-3-large") is False
+    assert is_text_model("whisper-tts") is False
+    assert is_text_model("some-unknown-model") is False  # no hint
+
+    # model_ids_from_payload: handles {data:[...]}, bare list, str/dict items.
+    assert model_ids_from_payload({"data": [{"id": "a"}, "b"]}) == ["a", "b"]
+    assert model_ids_from_payload(["x", {"name": "y"}, {"model": "z"}]) == ["x", "y", "z"]
+    assert model_ids_from_payload({"models": [{"id": "m"}]}) == ["m"]
+    assert model_ids_from_payload("garbage") == []
+
+    # provider_auth_headers: bearer vs x-api-key vs unsupported.
+    assert provider_auth_headers({"auth_type": "bearer"}, "K") == {"Authorization": "Bearer K"}
+    assert provider_auth_headers({"auth_type": "x-api-key"}, "K") == {"x-api-key": "K"}
+    try:
+        provider_auth_headers({"auth_type": "weird"}, "K")
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+    print("api_server self-test ok")
+    return 0
+
+
 def main() -> int:
+    import sys
+    if "--self-test" in sys.argv:
+        return _self_test()
     import argparse
 
     parser = argparse.ArgumentParser(description="Serve the eval dashboard and read-only run APIs")

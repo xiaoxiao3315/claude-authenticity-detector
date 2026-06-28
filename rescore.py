@@ -505,3 +505,47 @@ def run_rescore(
         "manifest": manifest,
         "stopped": stopped,
     }
+
+
+def _self_test() -> int:
+    """Offline unit checks for the pure helpers. No files, no network."""
+    # csv_value: list -> semicolon-joined; None -> ""; scalar -> str.
+    assert csv_value(["a", "b", "c"]) == "a;b;c"
+    assert csv_value([1, 2]) == "1;2"
+    assert csv_value(None) == ""
+    assert csv_value(42) == "42"
+    assert csv_value("x") == "x"
+
+    # score_value: pulls .score from a dict, else None.
+    assert score_value({"score": 7.5}) == 7.5
+    assert score_value({"other": 1}) is None
+    assert score_value(None) is None
+    assert score_value("not a dict") is None
+
+    # filter_source_records: provider + task_id filters, both optional.
+    recs = [
+        {"provider_id": "p1", "task_id": "t1"},
+        {"provider_id": "p1", "task_id": "t2"},
+        {"provider_id": "p2", "task_id": "t1"},
+    ]
+    assert len(filter_source_records(recs, None, None)) == 3
+    assert len(filter_source_records(recs, "p1", None)) == 2
+    assert len(filter_source_records(recs, None, ["t1"])) == 2
+    assert len(filter_source_records(recs, "p1", ["t1"])) == 1
+    assert filter_source_records(recs, "nope", None) == []
+
+    # task_lookup: indexes by id, skips entries without an id.
+    bank = [{"id": "a", "x": 1}, {"id": "b"}, {"no_id": True}]
+    lut = task_lookup(bank)
+    assert set(lut.keys()) == {"a", "b"} and lut["a"]["x"] == 1
+
+    print("rescore self-test ok")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if "--self-test" in _sys.argv:
+        raise SystemExit(_self_test())
+    _sys.stderr.write("rescore.py is a library module; use eval_cli.py for the CLI, or --self-test.\n")
+    raise SystemExit(2)

@@ -853,3 +853,63 @@ def export_campaign(campaign_dir_path: Path, runs_dir: Path, *, include_raw: boo
     campaign.setdefault("artifacts", {})["acceptance_pack"] = str(zip_path)
     write_json(campaign_dir_path / "campaign.json", campaign)
     return zip_path
+
+
+def _self_test() -> int:
+    """Offline unit checks for the pure helpers. No network, no files."""
+    # numeric: parse, reject non-numeric and non-finite.
+    assert numeric("3.5") == 3.5 and numeric(7) == 7.0
+    assert numeric(None) is None and numeric("abc") is None
+    assert numeric(float("inf")) is None and numeric(float("nan")) is None
+
+    # ratio: rounds, guards divide-by-zero.
+    assert ratio(1, 4) == 0.25 and ratio(1, 3) == 0.333333
+    assert ratio(5, 0) is None and ratio(1, None) is None
+
+    # model_name_matches: exact, dated-suffix, and rejections.
+    assert model_name_matches("claude-opus-4", "claude-opus-4") is True
+    assert model_name_matches("claude-opus-4", "claude-opus-4-2026-01-01") is True
+    assert model_name_matches("claude-opus-4", "claude-haiku-4") is False
+    assert model_name_matches("", "claude") is False
+    assert model_name_matches("claude-opus-4", "claude-opus-4-latest") is False
+
+    # percentile: single value, and linear interpolation.
+    assert percentile([], 0.5) is None
+    assert percentile([10.0], 0.5) == 10.0
+    assert percentile([1.0, 2.0, 3.0, 4.0], 0.5) == 2.5  # index 1.5 -> 2*0.5+3*0.5
+    assert percentile([1.0, 2.0, 3.0, 4.0], 0.0) == 1.0
+    assert percentile([1.0, 2.0, 3.0, 4.0], 1.0) == 4.0
+
+    # safe_campaign_id: passes clean ids, blocks traversal.
+    assert safe_campaign_id("camp-001") == "camp-001"
+    for bad in ("", "../x", "a/b", "a\\b", "..", "x/../y"):
+        try:
+            safe_campaign_id(bad)
+            raise AssertionError(f"expected ValueError for {bad!r}")
+        except ValueError:
+            pass
+
+    # worst_decision: picks the most severe; default GO.
+    assert worst_decision("GO", "REVIEW", "NO-GO") == "NO-GO"
+    assert worst_decision("GO", "REVIEW") == "REVIEW"
+    assert worst_decision() == "GO"
+    assert worst_decision("GO", None) == "GO"
+
+    # decision_to_outcome: maps decisions, passes through outcomes, defaults PENDING.
+    assert decision_to_outcome("GO") == "PASS"
+    assert decision_to_outcome("NO-GO") == "FAIL"
+    assert decision_to_outcome("REVIEW") == "RETEST"
+    assert decision_to_outcome("PASS") == "PASS"
+    assert decision_to_outcome("garbage") == "PENDING"
+    assert decision_to_outcome(None) == "PENDING"
+
+    print("campaigns self-test ok")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if "--self-test" in _sys.argv:
+        raise SystemExit(_self_test())
+    _sys.stderr.write("campaigns.py is a library module; use eval_cli.py for the CLI, or --self-test.\n")
+    raise SystemExit(2)
