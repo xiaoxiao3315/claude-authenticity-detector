@@ -213,7 +213,12 @@ def build_baseline_from_samples(
                 probe_id: _distribution(values)
                 for probe_id, values in sorted(probe_tokens.items())
             },
-            # capability-anchor pass rate is a later (P1) addition; placeholder.
+            # NOTE: capability-anchor pass-rate is NOT stored here. It lives in a
+            # separate sidecar file `baselines/<id>/capability_anchor.json` and is
+            # compared independently (see eval_cli.py: base_cap_path / score_capability_vs_baseline).
+            # This key is kept as an always-None placeholder ONLY so the content
+            # signature (content_fingerprint hashes the whole behavior dict) stays
+            # stable for existing baselines — do not populate it; read the sidecar instead.
             "capability_anchor_pass_rate": None,
         },
     }
