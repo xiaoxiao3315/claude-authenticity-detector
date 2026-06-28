@@ -35,6 +35,32 @@ SCORING_CONFIDENCE_DEFAULTS = {
     "manual": 0.5,
 }
 
+# Some task files express scoring_confidence as a word ("high") rather than a
+# 0..1 float. Map known words; anything else falls back to the scoring_type
+# default so a single bad value can't crash the whole task-selection pipeline.
+SCORING_CONFIDENCE_WORDS = {
+    "very_high": 0.95,
+    "high": 0.85,
+    "medium": 0.6,
+    "moderate": 0.6,
+    "low": 0.4,
+    "very_low": 0.25,
+}
+
+
+def coerce_scoring_confidence(value: Any, scoring_type: str) -> float:
+    """Best-effort 0..1 confidence. Accepts a number, a known word, or falls
+    back to the scoring-type default. Never raises on bad input."""
+    default = SCORING_CONFIDENCE_DEFAULTS.get(scoring_type, 0.5)
+    if value is None or value == "":
+        return float(default)
+    parsed = numeric(value)
+    if parsed is not None:
+        return parsed
+    word = SCORING_CONFIDENCE_WORDS.get(str(value).strip().lower())
+    return float(word if word is not None else default)
+
+
 DIFFICULTY_POINT_VALUES = {
     "easy": 80,
     "medium": 100,
@@ -76,9 +102,8 @@ def task_benchmark_defaults(task: dict[str, Any]) -> dict[str, Any]:
         or task.get("enterprise_dimension")
         or task.get("category")
         or "Unspecified",
-        "scoring_confidence": float(
-            task.get("scoring_confidence")
-            or SCORING_CONFIDENCE_DEFAULTS.get(scoring_type, 0.5)
+        "scoring_confidence": coerce_scoring_confidence(
+            task.get("scoring_confidence"), scoring_type
         ),
     }
 
@@ -536,6 +561,19 @@ def _self_test() -> int:
     k1 = task_sort_key({"category": "a", "point_value": 5, "id": "t1"})
     k2 = task_sort_key({"category": "a", "point_value": 5, "id": "t2"})
     assert isinstance(k1, tuple) and k1 < k2
+
+    # coerce_scoring_confidence: numbers pass through, words map, junk -> type default,
+    # and it NEVER raises (this guards the real bug where "high" crashed float()).
+    assert coerce_scoring_confidence(0.55, "manual") == 0.55
+    assert coerce_scoring_confidence("0.9", "manual") == 0.9
+    assert coerce_scoring_confidence("high", "manual") == 0.85
+    assert coerce_scoring_confidence("HIGH", "manual") == 0.85
+    assert coerce_scoring_confidence(None, "json_exact") == 0.95   # type default
+    assert coerce_scoring_confidence("", "keyword_check") == 0.65
+    assert coerce_scoring_confidence("nonsense", "manual") == 0.5  # unknown word -> default
+    # end-to-end: a task carrying the word form must enrich without raising.
+    enriched = task_benchmark_defaults({"id": "x", "scoring_type": "manual", "scoring_confidence": "high"})
+    assert enriched["scoring_confidence"] == 0.85
 
     print("benchmarking self-test ok")
     return 0
