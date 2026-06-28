@@ -26,6 +26,12 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Narrow Any -> dict (empty when not a dict), so the type checker sees a
+    concrete dict at the many `x.get(...) if isinstance(x, dict) else {}` sites."""
+    return value if isinstance(value, dict) else {}
+
+
 def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -129,6 +135,7 @@ def percentile(values: list[float], pct: float) -> float | None:
 def load_policy(policy_path: Path, policy_id: str | None = None) -> dict[str, Any]:
     data = read_json(policy_path)
     wanted = policy_id or DEFAULT_POLICY_ID
+    policy: dict[str, Any] | None
     if data.get("policy_id") == wanted:
         policy = dict(data)
     else:
@@ -166,8 +173,8 @@ def sample_from_run_record(record: dict[str, Any]) -> dict[str, Any]:
     provider = record.get("provider") or {}
     telemetry = record.get("telemetry") or {}
     scoring = record.get("scoring") or {}
-    final_score = scoring.get("final_score") if isinstance(scoring.get("final_score"), dict) else {}
-    judge_score = scoring.get("judge_score") if isinstance(scoring.get("judge_score"), dict) else {}
+    final_score = _as_dict(scoring.get("final_score"))
+    judge_score = _as_dict(scoring.get("judge_score"))
     return {
         "source_kind": "run_record",
         "source_record_id": record.get("record_id"),
@@ -217,7 +224,7 @@ def sample_from_result_item(item: dict[str, Any]) -> dict[str, Any]:
     task = item.get("task") or {}
     provider = item.get("provider") or {}
     metrics = item.get("metrics") or {}
-    score = item.get("score") if isinstance(item.get("score"), dict) else {}
+    score = _as_dict(item.get("score"))
     return {
         "source_kind": "results_json",
         "source_record_id": f"{item.get('run_id')}:{provider.get('id')}:{task.get('id')}",
@@ -267,7 +274,7 @@ def load_benchmark_provider_scores(run_dir: Path) -> tuple[dict[str, Any], dict[
     data = read_json(path)
     if not isinstance(data, dict):
         return {}, {"benchmark_scores_file": str(path)}
-    providers = data.get("providers") if isinstance(data.get("providers"), dict) else {}
+    providers = _as_dict(data.get("providers"))
     return providers or {}, {"benchmark_scores_file": str(path)}
 
 
@@ -342,7 +349,7 @@ def load_rescore_evidence(run_dir: Path, rescore_id: str | None, provider_id: st
         manifest_rescore_id = str(manifest.get("rescore_id") or "")
         if not rescore_id and manifest_rescore_id and archived_evidence("rescore", run_dir.parent, run_dir.name, manifest_rescore_id):
             return False
-        filters = manifest.get("filters") if isinstance(manifest.get("filters"), dict) else {}
+        filters = _as_dict(manifest.get("filters"))
         filter_provider_id = filters.get("provider_id")
         return not provider_id or not filter_provider_id or str(filter_provider_id) == str(provider_id)
 
@@ -420,7 +427,7 @@ def trace_evaluation_from_dir(eval_dir: Path, provider_id: str, trace_eval_id: s
     if not manifest_path.exists():
         return None
     manifest = read_json(manifest_path)
-    provider_metrics = manifest.get("provider_metrics") if isinstance(manifest.get("provider_metrics"), dict) else {}
+    provider_metrics = _as_dict(manifest.get("provider_metrics"))
     metrics = provider_metrics.get(provider_id) if isinstance(provider_metrics.get(provider_id), dict) else None
     if not metrics:
         if trace_eval_id:
@@ -465,7 +472,7 @@ def load_trace_evaluation_evidence(
         manifest_trace_id = str(manifest.get("trace_eval_id") or "")
         if not trace_eval_id and manifest_trace_id and archived_evidence("trace_evaluation", run_dir.parent, run_dir.name, manifest_trace_id):
             return False
-        provider_metrics = manifest.get("provider_metrics") if isinstance(manifest.get("provider_metrics"), dict) else {}
+        provider_metrics = _as_dict(manifest.get("provider_metrics"))
         return bool(provider_metrics.get(provider_id))
 
     selection = registry.select_manifest_dir(
@@ -506,7 +513,7 @@ def apply_rescore(samples: list[dict[str, Any]], rescore: dict[str, Any], provid
         source_record_id = str(item.get("source_record_id") or "")
         rescore_record = by_record_id.get(source_record_id)
         if rescore_record and str(rescore_record.get("source_provider_id") or provider_id) == provider_id:
-            final_score = rescore_record.get("new_final_score") if isinstance(rescore_record.get("new_final_score"), dict) else {}
+            final_score = _as_dict(rescore_record.get("new_final_score"))
             new_score = score_value(final_score)
             if new_score is not None:
                 item["score_0_10"] = new_score
@@ -604,8 +611,7 @@ def aggregate_metrics(
         for value in (numeric(sample.get("first_content_token_ms")) for sample in samples)
         if value is not None
     ]
-    scores = [numeric(sample.get("score_0_10")) for sample in samples]
-    scores = [value for value in scores if value is not None]
+    scores = [value for value in (numeric(sample.get("score_0_10")) for sample in samples) if value is not None]
     effective_score_1000 = round((sum(scores) / len(scores)) * 100.0, 2) if scores else None
     benchmark_score = numeric((provider_score or {}).get("benchmark_score")) if provider_score else None
     rescore_coverage = ratio(rescore_applied_count, sample_count)
@@ -619,9 +625,9 @@ def aggregate_metrics(
         gate_score = effective_score_1000
         gate_score_source = "sample_scores"
     manifest = compatibility.get("manifest") or {}
-    rescore_manifest = rescore.get("manifest") if isinstance(rescore.get("manifest"), dict) else {}
-    trace_metrics = trace_evaluation.get("provider_metrics") if isinstance(trace_evaluation.get("provider_metrics"), dict) else {}
-    trace_manifest = trace_evaluation.get("manifest") if isinstance(trace_evaluation.get("manifest"), dict) else {}
+    rescore_manifest = _as_dict(rescore.get("manifest"))
+    trace_metrics = _as_dict(trace_evaluation.get("provider_metrics"))
+    trace_manifest = _as_dict(trace_evaluation.get("manifest"))
     trace_record_count = numeric(trace_metrics.get("record_count"))
     return {
         "sample_count": sample_count,
@@ -725,12 +731,13 @@ def manifest_age_days(manifest: dict[str, Any]) -> float | None:
 
 
 def rescore_provider_mismatch(rescore: dict[str, Any], provider_id: str) -> bool:
-    manifest = rescore.get("manifest") if isinstance(rescore.get("manifest"), dict) else {}
-    filters = manifest.get("filters") if isinstance(manifest.get("filters"), dict) else {}
+    manifest = _as_dict(rescore.get("manifest"))
+    filters = _as_dict(manifest.get("filters"))
     filter_provider_id = filters.get("provider_id")
     if filter_provider_id and str(filter_provider_id) != str(provider_id):
         return True
-    records = rescore.get("records") if isinstance(rescore.get("records"), list) else []
+    raw_records = rescore.get("records")
+    records = raw_records if isinstance(raw_records, list) else []
     record_provider_ids = {
         str(record.get("source_provider_id") or record.get("provider_id") or "")
         for record in records
@@ -740,8 +747,8 @@ def rescore_provider_mismatch(rescore: dict[str, Any], provider_id: str) -> bool
 
 
 def trace_provider_mismatch(trace_evaluation: dict[str, Any], provider_id: str) -> bool:
-    manifest = trace_evaluation.get("manifest") if isinstance(trace_evaluation.get("manifest"), dict) else {}
-    provider_metrics = manifest.get("provider_metrics") if isinstance(manifest.get("provider_metrics"), dict) else {}
+    manifest = _as_dict(trace_evaluation.get("manifest"))
+    provider_metrics = _as_dict(manifest.get("provider_metrics"))
     return bool(provider_metrics and str(provider_id) not in {str(key) for key in provider_metrics.keys()})
 
 
@@ -781,7 +788,7 @@ def evaluate_policy(
     # Fake-1M / silent-truncation: needle probe reported HTTP 200 but input_tokens
     # far below sent. Hard blocker. Absent (no needle evidence) -> 0 -> no-op.
     silent_truncation_count = metrics.get("silent_truncation_count", 0) or 0
-    silent_truncation_no_go = numeric(thresholds.get("silent_truncation_no_go"), 0)
+    silent_truncation_no_go = numeric(thresholds.get("silent_truncation_no_go"), 0) or 0
     if silent_truncation_count > silent_truncation_no_go:
         blockers.append(issue("silent_truncation_blocks", "needle", "silent_truncation_count", silent_truncation_count, silent_truncation_no_go, "endpoint silently truncated a long-context request (suspected fake 1M)"))
     elif metrics.get("needle_found"):
@@ -885,7 +892,7 @@ def evaluate_policy(
         if not rescore.get("found"):
             review_items.append(issue("required_rescore_missing", "rescore", "rescore_id", rescore.get("rescore_id"), "present", rescore.get("error") or "rescore is required but missing"))
         else:
-            manifest = rescore.get("manifest") if isinstance(rescore.get("manifest"), dict) else {}
+            manifest = _as_dict(rescore.get("manifest"))
             if manifest_incomplete(manifest):
                 review_items.append(issue("rescore_incomplete_requires_review", "rescore", "status", manifest.get("status"), "completed", "rescore manifest is stopped or partial"))
             if manifest_source_run_mismatch(manifest, source_run_id):
@@ -906,7 +913,7 @@ def evaluate_policy(
         if "provider mismatch" in str(trace_evaluation.get("error") or ""):
             review_items.append(issue("trace_evaluation_provider_mismatch", "trace_evaluation", "provider_id", provider_id, "matching provider", "trace evaluation evidence is not bound to this provider"))
     elif metrics.get("trace_requested") and metrics.get("trace_found"):
-        manifest = trace_evaluation.get("manifest") if isinstance(trace_evaluation.get("manifest"), dict) else {}
+        manifest = _as_dict(trace_evaluation.get("manifest"))
         required_coverage = numeric(thresholds.get("trace_required_coverage"), 1.0)
         coverage = metrics.get("trace_coverage")
         if manifest_incomplete(manifest):
@@ -1469,7 +1476,7 @@ def self_test() -> None:
         # silent_truncation (fake-1M) is a hard blocker; absent metric is a no-op
         st_policy = {"thresholds": {"silent_truncation_no_go": 0}}
         base_metrics = {"sample_count": 5, "success_rate": 1.0, "compatibility_found": True, "compatibility_suite_status": "PASS"}
-        empty = {}
+        empty: dict[str, Any] = {}
         d_block, blockers, _, _ = evaluate_policy(
             policy=st_policy, source_run_id="r", provider_id="p",
             metrics={**base_metrics, "silent_truncation_count": 1, "needle_found": True},

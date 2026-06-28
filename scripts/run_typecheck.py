@@ -32,6 +32,7 @@ STRICT_MODULES = [
     "redaction",
     "trace_evaluation",
     "evidence_registry",
+    "quality_gate",
 ]
 
 
