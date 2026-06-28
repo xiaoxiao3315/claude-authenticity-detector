@@ -61,5 +61,5 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Run pytest (self-tests under coverage)
-        run: python -m pytest -q --cov=. --cov-report=term-missing --cov-fail-under=80
+        run: python -m pytest -q --cov=. --cov-report=term-missing --cov-fail-under=82
 

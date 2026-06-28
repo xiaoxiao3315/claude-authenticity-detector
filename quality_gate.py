@@ -31,6 +31,10 @@ def write_json(path: Path, data: Any) -> None:
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    # NOTE: intentionally STRICTER than cli_io.read_jsonl / compatibility.read_jsonl
+    # (which skip corrupt lines). The quality gate reads records it OWNS and must
+    # not silently drop a malformed row from a release-decision input — a corrupt
+    # gate record is a hard error, not best-effort. Keep this fail-loud.
     rows: list[dict[str, Any]] = []
     if not path.exists():
         return rows
@@ -532,7 +536,9 @@ def load_authenticity_evidence(run_dir: Path, provider_id: str | None = None) ->
     The file shape is the compare_to_baseline output (carries a `verdict` key:
     matches_official / suspected_wrapper / suspected_downgrade / insufficient_evidence).
     Absent file -> {"found": False, "verdict": None}, so the gate rule is a no-op
-    on runs that never produced a comparison.
+    on runs that never produced a comparison. A PRESENT-but-corrupt artifact
+    (unreadable / not an object / missing verdict) -> insufficient_evidence, so a
+    tampered or truncated security artifact triggers REVIEW rather than vanishing.
     """
     base = run_dir / "authenticity"
     candidates = []
@@ -541,14 +547,24 @@ def load_authenticity_evidence(run_dir: Path, provider_id: str | None = None) ->
         candidates.append(base / f"{safe_pid}.json")
     candidates.append(base / "verdict.json")
     for path in candidates:
-        if path.exists():
-            try:
-                doc = read_json(path)
-            except Exception:
-                continue
-            if isinstance(doc, dict):
-                verdict = doc.get("verdict")
-                return {"found": bool(verdict), "verdict": verdict, "doc": doc}
+        if not path.exists():
+            continue
+        # A PRESENT-but-corrupt authenticity artifact must NOT silently read as
+        # "absent" — for a security verdict, evidence we can't parse is a reason
+        # to review, not to wave through. Surface insufficient_evidence (-> REVIEW).
+        try:
+            doc = read_json(path)
+        except Exception:
+            return {"found": True, "verdict": "insufficient_evidence",
+                    "error": f"authenticity artifact unreadable: {path.name}"}
+        if not isinstance(doc, dict):
+            return {"found": True, "verdict": "insufficient_evidence",
+                    "error": f"authenticity artifact malformed (not an object): {path.name}"}
+        verdict = doc.get("verdict")
+        if not verdict:
+            return {"found": True, "verdict": "insufficient_evidence",
+                    "error": f"authenticity artifact has no verdict: {path.name}"}
+        return {"found": True, "verdict": verdict, "doc": doc}
     return {"found": False, "verdict": None}
 
 

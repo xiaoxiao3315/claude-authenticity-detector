@@ -103,6 +103,40 @@ def test_load_authenticity_evidence_verdict_json_fallback(tmp_path):
     assert out["verdict"] == "matches_official"
 
 
+def test_load_authenticity_evidence_corrupt_is_insufficient(tmp_path):
+    # a PRESENT-but-unreadable artifact must surface as insufficient_evidence
+    # (-> REVIEW), not silently read as absent.
+    run_dir = tmp_path / "run_x"
+    (run_dir / "authenticity").mkdir(parents=True)
+    (run_dir / "authenticity" / "p.json").write_text("{not valid json", encoding="utf-8")
+    out = Q.load_authenticity_evidence(run_dir, provider_id="p")
+    assert out["found"] is True
+    assert out["verdict"] == "insufficient_evidence"
+    assert "unreadable" in out.get("error", "")
+
+
+def test_load_authenticity_evidence_no_verdict_key_is_insufficient(tmp_path):
+    run_dir = tmp_path / "run_x"
+    (run_dir / "authenticity").mkdir(parents=True)
+    (run_dir / "authenticity" / "p.json").write_text(json.dumps({"note": "no verdict"}), encoding="utf-8")
+    out = Q.load_authenticity_evidence(run_dir, provider_id="p")
+    assert out["verdict"] == "insufficient_evidence"
+
+
+def test_corrupt_authenticity_artifact_routes_gate_to_review(tmp_path):
+    # end-to-end: a corrupt artifact must make the gate REVIEW, never silent GO
+    Q.make_fake_run(tmp_path, run_id="run_corrupt", provider_id="fake_provider")
+    (tmp_path / "run_corrupt" / "authenticity").mkdir()
+    (tmp_path / "run_corrupt" / "authenticity" / "fake_provider.json").write_text(
+        "{truncated", encoding="utf-8")
+    policy = _policy_file(tmp_path)
+    result = Q.run_quality_gate(runs_dir=tmp_path, run_id="run_corrupt", policy_path=policy,
+                                compatibility_run_id="compat_go")
+    rec = result["records"][0]
+    assert rec["decision"] in ("REVIEW", "NO-GO")  # never GO on corrupt evidence
+    assert any(r["rule_id"] == "authenticity_insufficient_requires_review" for r in rec["review_items"])
+
+
 # ---------------------------------------------------------------------------
 # trace_evaluation: run + list + read
 # ---------------------------------------------------------------------------
