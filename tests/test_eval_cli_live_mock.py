@@ -194,3 +194,88 @@ def test_verify_endpoint_with_capability_live(tmp_path, capsys, mock_anthropic_c
     captured = capsys.readouterr().out
     assert any(tag in captured for tag in ("真", "降级", "套壳", "证据不足", "官方"))
 
+
+# ---------------------------------------------------------------------------
+# baseline_compare --live (both output modes)
+# ---------------------------------------------------------------------------
+def test_baseline_compare_json(tmp_path, capsys, mock_anthropic_client):
+    baselines_dir = _baseline(tmp_path)
+    args = _ns(providers=str(_providers_file(tmp_path)), provider="tested_model",
+               baseline_id="OFFICIAL-X", baselines_dir=str(baselines_dir), live=True,
+               samples=2, report=False)
+    rc = E.baseline_compare(args)
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    # the verdict JSON carries a verdict/decision field
+    assert any(k in out for k in ("verdict", "decision", "confidence", "matches_official"))
+
+
+def test_baseline_compare_report(tmp_path, capsys, mock_anthropic_client):
+    baselines_dir = _baseline(tmp_path)
+    args = _ns(providers=str(_providers_file(tmp_path)), provider="tested_model",
+               baseline_id="OFFICIAL-X", baselines_dir=str(baselines_dir), live=True,
+               samples=2, report=True)
+    rc = E.baseline_compare(args)
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert any(tag in captured for tag in ("真", "降级", "套壳", "证据不足", "官方"))
+
+
+def test_baseline_compare_missing_baseline(tmp_path, mock_anthropic_client):
+    args = _ns(providers=str(_providers_file(tmp_path)), provider="tested_model",
+               baseline_id="GHOST", baselines_dir=str(tmp_path / "baselines"), live=True,
+               samples=2, report=False)
+    with pytest.raises(ValueError, match="baseline not found"):
+        E.baseline_compare(args)
+
+
+# ---------------------------------------------------------------------------
+# verify_endpoint --with-sse --with-error-envelope (combined mock)
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def mock_combined_client(monkeypatch):
+    """Mock that streams SSE for event-stream requests and returns JSON otherwise."""
+    real_client = httpx.Client
+    sse = (
+        b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+        b"event: content_block_start\ndata: {\"type\":\"content_block_start\"}\n\n"
+        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"
+        b"event: message_delta\ndata: {\"type\":\"message_delta\"}\n\n"
+        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "text/event-stream" in (request.headers.get("accept") or ""):
+            def gen():
+                for i in range(0, len(sse), 20):
+                    yield sse[i:i + 20]
+            return httpx.Response(200, content=gen(),
+                                  headers={"content-type": "text/event-stream"})
+        return _anthropic_response()
+
+    class _Factory:
+        def __init__(self, *a, **k):
+            self._c = real_client(transport=httpx.MockTransport(handler))
+        def __enter__(self):
+            return self._c
+        def __exit__(self, *a):
+            self._c.close()
+
+    monkeypatch.setattr(E.httpx, "Client", _Factory)
+    monkeypatch.setenv("TESTED_KEY", "sk-test-123")
+    monkeypatch.setattr(E, "load_local_env", lambda *a, **k: {}, raising=False)
+
+
+def test_verify_endpoint_with_sse_and_error_envelope(tmp_path, capsys, mock_combined_client):
+    baselines_dir = _baseline(tmp_path)
+    args = _ns(providers=str(_providers_file(tmp_path)), baseline_id="OFFICIAL-X",
+               baselines_dir=str(baselines_dir), live=True, samples=2,
+               with_sse=True, with_error_envelope=True, with_needle=False,
+               with_capability=False, json=True)
+    rc = E.verify_endpoint(args)
+    assert rc == 0
+    captured = capsys.readouterr().out
+    # the verdict report rendered, behavior signals folded in
+    assert any(tag in captured for tag in ("真", "降级", "套壳", "证据不足", "官方"))
+
+
