@@ -29,6 +29,13 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Narrow an Any to a dict (empty when it isn't one). Lets the type checker
+    see a concrete dict at the many `x.get(...) if isinstance(x, dict) else {}`
+    call sites without per-line ignores."""
+    return value if isinstance(value, dict) else {}
+
+
 def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -119,6 +126,7 @@ def load_policy(policy_path: Path, policy_id: str | None = None) -> dict[str, An
             },
         }
     data = read_json(policy_path)
+    policy: dict[str, Any] | None
     if data.get("policy_id") == wanted:
         policy = dict(data)
     else:
@@ -163,13 +171,13 @@ def resolve_artifact_path(path_value: Any, *, root_dir: Path, run_dir: Path) -> 
 
 
 def source_from_run_record(record: dict[str, Any], run_id: str, run_dir: Path, root_dir: Path) -> dict[str, Any]:
-    run = record.get("run") if isinstance(record.get("run"), dict) else {}
-    task = record.get("task") if isinstance(record.get("task"), dict) else {}
-    provider = record.get("provider") if isinstance(record.get("provider"), dict) else {}
-    telemetry = record.get("telemetry") if isinstance(record.get("telemetry"), dict) else {}
-    response = record.get("response") if isinstance(record.get("response"), dict) else {}
-    artifacts = record.get("artifacts") if isinstance(record.get("artifacts"), dict) else {}
-    trace = record.get("trace") if isinstance(record.get("trace"), dict) else {}
+    run = _as_dict(record.get("run"))
+    task = _as_dict(record.get("task"))
+    provider = _as_dict(record.get("provider"))
+    telemetry = _as_dict(record.get("telemetry"))
+    response = _as_dict(record.get("response"))
+    artifacts = _as_dict(record.get("artifacts"))
+    trace = _as_dict(record.get("trace"))
     events_file = artifacts.get("events_file") or response.get("events_file")
     response_file = artifacts.get("response_file") or response.get("response_file")
     resolved_events = resolve_artifact_path(events_file, root_dir=root_dir, run_dir=run_dir)
@@ -258,13 +266,13 @@ def parse_events(events_path: Path) -> dict[str, Any]:
             event_types.append(event_type)
             positions.setdefault(event_type, index)
             if event_type == "content_block_start":
-                block = event.get("content_block") if isinstance(event.get("content_block"), dict) else {}
+                block = _as_dict(event.get("content_block"))
                 block_type = str(block.get("type") or "unknown")
                 block_types.append(block_type)
                 if block_type == "tool_use":
                     tool_event_count += 1
             elif event_type == "content_block_delta":
-                delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+                delta = _as_dict(event.get("delta"))
                 delta_type = str(delta.get("type") or "unknown")
                 delta_types.append(delta_type)
                 if delta_type == "text_delta":
@@ -274,7 +282,7 @@ def parse_events(events_path: Path) -> dict[str, Any]:
                 elif "tool" in delta_type or "input_json" in delta_type:
                     tool_event_count += 1
             elif event_type == "message_delta":
-                delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+                delta = _as_dict(event.get("delta"))
                 if delta.get("stop_reason") not in (None, ""):
                     stop_reason = delta.get("stop_reason")
                 if isinstance(event.get("usage"), dict):
@@ -320,8 +328,8 @@ def evaluate_source(source: dict[str, Any], policy: dict[str, Any], trace_eval_i
     thresholds = policy.get("thresholds") or {}
     first_content_warn = numeric(thresholds.get("first_content_token_ms_warn"), 15000) or 15000
     thinking_warn_count = int(numeric(thresholds.get("thinking_delta_count_warn"), 100) or 100)
-    telemetry = source.get("telemetry") if isinstance(source.get("telemetry"), dict) else {}
-    trace = source.get("trace") if isinstance(source.get("trace"), dict) else {}
+    telemetry = _as_dict(source.get("telemetry"))
+    trace = _as_dict(source.get("trace"))
     checks: list[dict[str, Any]] = []
     evidence: dict[str, Any] = {
         "raw_event_types": source.get("raw_event_types") or [],
@@ -706,7 +714,7 @@ def run_self_test() -> None:
         runs_dir = root / "runs"
         run_dir = runs_dir / "trace_fixture"
         events_dir = run_dir / "events" / "provider_a"
-        good = [
+        good: list[dict[str, Any]] = [
             {"type": "message_start"},
             {"type": "content_block_start", "content_block": {"type": "text"}},
             {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "ok"}},
@@ -714,7 +722,7 @@ def run_self_test() -> None:
             {"type": "message_stop"},
         ]
         no_stop = good[:-1]
-        thinking_only = [
+        thinking_only: list[dict[str, Any]] = [
             {"type": "message_start"},
             {"type": "content_block_start", "content_block": {"type": "thinking"}},
             {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "hmm"}},
@@ -754,8 +762,8 @@ def main() -> int:
     try:
         import sys
 
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     except AttributeError:
         pass
     parser = argparse.ArgumentParser(description="Run offline trace evaluation over run_records/events")

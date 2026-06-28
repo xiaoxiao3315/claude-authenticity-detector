@@ -30,6 +30,7 @@ STRICT_MODULES = [
     "decisions",
     "logging_setup",
     "redaction",
+    "trace_evaluation",
 ]
 
 
