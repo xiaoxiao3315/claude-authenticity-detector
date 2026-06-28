@@ -45,3 +45,21 @@ jobs:
       - name: Strict type-check (graduated module set)
         run: python scripts/run_typecheck.py --all
 
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run pytest (self-tests under coverage)
+        run: python -m pytest -q --cov=. --cov-report=term-missing
+
