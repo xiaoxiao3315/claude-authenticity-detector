@@ -16,12 +16,22 @@ ALLOWED_RUN_STATUSES = {"completed", "failed", "stopped", "partial"}
 SCHEMA_PATH = Path(__file__).with_name("run_record.schema.json")
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Narrow Any -> dict (empty when not a dict) for the type checker."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    """Narrow Any -> list (empty when not a list) for the type checker."""
+    return value if isinstance(value, list) else []
+
+
 def as_plain_dict(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
     if isinstance(value, dict):
         return dict(value)
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return asdict(value)
     data: dict[str, Any] = {}
     for key in dir(value):
@@ -285,11 +295,11 @@ def _validate_schema_subset(value: Any, schema: dict[str, Any], path: str) -> li
     if isinstance(value, str) and "minLength" in schema and len(value) < int(schema["minLength"]):
         errors.append(f"{path} must have length >= {schema['minLength']}")
     if isinstance(value, dict):
-        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        required = _as_list(schema.get("required"))
         for key in required:
             if key not in value:
                 errors.append(f"missing {path}.{key}" if path != "$" else f"missing top-level key: {key}")
-        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        properties = _as_dict(schema.get("properties"))
         for key, child_schema in properties.items():
             if key in value and isinstance(child_schema, dict):
                 child_path = f"{path}.{key}" if path != "$" else key
@@ -348,13 +358,13 @@ def validate_run_record(record: dict[str, Any]) -> list[str]:
             if key not in value:
                 errors.append(f"missing {parent}.{key}")
 
-    run = record.get("run") if isinstance(record.get("run"), dict) else {}
+    run = _as_dict(record.get("run"))
     if run.get("status") not in ALLOWED_RUN_STATUSES:
         errors.append("run.status must be completed, failed, stopped, or partial")
-    provider = record.get("provider") if isinstance(record.get("provider"), dict) else {}
+    provider = _as_dict(record.get("provider"))
     if provider.get("api_style") not in {"anthropic_messages", "openai_chat"}:
         errors.append("provider.api_style must be anthropic_messages or openai_chat")
-    trace = record.get("trace") if isinstance(record.get("trace"), dict) else {}
+    trace = _as_dict(record.get("trace"))
     if not isinstance(trace.get("tool_calls"), list):
         errors.append("trace.tool_calls must be an array")
     if not isinstance(trace.get("raw_event_types"), list):

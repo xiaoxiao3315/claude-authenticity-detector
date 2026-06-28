@@ -89,6 +89,16 @@ def load_json(path: Path) -> dict[str, Any]:
     return data
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Narrow Any -> dict (empty when not a dict) for the type checker."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    """Narrow Any -> list (empty when not a list) for the type checker."""
+    return value if isinstance(value, list) else []
+
+
 def load_providers(path: Path) -> list[Provider]:
     load_local_env()
     data = load_json(path)
@@ -345,10 +355,10 @@ def score_token_count_check(
     """
     from baseline_registry import score_token_count
 
-    probe = task.get("token_probe") if isinstance(task.get("token_probe"), dict) else {}
+    probe = _as_dict(task.get("token_probe"))
     ctx = run_ctx or {}
-    probe_tokens = ctx.get("probe_tokens_by_id") if isinstance(ctx.get("probe_tokens_by_id"), dict) else {}
-    self_tokens = probe_tokens.get(task.get("id"))
+    probe_tokens = _as_dict(ctx.get("probe_tokens_by_id"))
+    self_tokens = probe_tokens.get(str(task.get("id")))
     if self_tokens is None and metrics is not None:
         self_tokens = getattr(metrics, "input_tokens", None)
     partner_id = probe.get("diff_partner_id")
@@ -604,8 +614,8 @@ def main() -> int:
     if "--self-test" in sys.argv:
         return _self_test()
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     except AttributeError:
         pass
 

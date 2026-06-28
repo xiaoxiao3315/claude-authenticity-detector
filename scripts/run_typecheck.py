@@ -34,6 +34,8 @@ STRICT_MODULES = [
     "evidence_registry",
     "quality_gate",
     "campaigns",
+    "run_eval",
+    "run_records",
 ]
 
 
