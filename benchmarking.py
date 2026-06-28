@@ -264,7 +264,7 @@ def calculate_provider_score(
     latency_score = calculate_latency_score(rows)
     cost_efficiency_score = calculate_cost_score(rows)
 
-    components = {
+    components: dict[str, Any] = {
         "quality_score": round_or_none(quality_score),
         "engineering_score": round_or_none(weighted_average(component_values.get("engineering_score", []))),
         "provider_trust_score": round_or_none(weighted_average(component_values.get("provider_trust_score", []))),
@@ -334,8 +334,8 @@ def risk_penalty(row: dict[str, Any], point_value: float) -> float:
 
 
 def calculate_latency_score(rows: list[dict[str, Any]]) -> float | None:
-    values = [numeric(row.get("first_content_token_ms")) for row in rows]
-    values = [value for value in values if value is not None and value > 0]
+    raw = [numeric(row.get("first_content_token_ms")) for row in rows]
+    values = [value for value in raw if value is not None and value > 0]
     if not values:
         return None
     avg_ms = sum(values) / len(values)
@@ -362,12 +362,12 @@ def calculate_cost_score(rows: list[dict[str, Any]]) -> float | None:
     return max(0.0, min(1000.0, base + cache_ratio * 160.0))
 
 
-def weighted_average(values: list[tuple[float, float]]) -> float | None:
-    values = [(value, weight) for value, weight in values if value is not None and weight > 0]
-    if not values:
+def weighted_average(values: list[tuple[Any, float]]) -> float | None:
+    pairs = [(value, weight) for value, weight in values if value is not None and weight > 0]
+    if not pairs:
         return None
-    total_weight = sum(weight for _, weight in values)
-    return sum(value * weight for value, weight in values) / total_weight
+    total_weight = sum(weight for _, weight in pairs)
+    return sum(value * weight for value, weight in pairs) / total_weight
 
 
 def numeric(value: Any, default: float | None = None) -> float | None:

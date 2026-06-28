@@ -105,7 +105,7 @@ def safe_response_headers(headers: Any) -> dict[str, str]:
     for key, value in dict(headers or {}).items():
         normalized = str(key).lower()
         if normalized in SAFE_RESPONSE_HEADER_NAMES:
-            out[normalized] = redact_text(str(value), max_chars=160)
+            out[normalized] = redact_text(str(value), max_chars=160) or ""
     return dict(sorted(out.items()))
 
 
@@ -159,7 +159,7 @@ def dry_completion(model: ModelConfig, messages: list[dict[str, str]], max_token
 
 def call_model(
     *,
-    client: httpx.Client,
+    client: httpx.Client | None,
     model: ModelConfig,
     messages: list[dict[str, str]],
     max_tokens: int,
@@ -173,6 +173,7 @@ def call_model(
         return result
 
     secret = auth_value(model)
+    assert client is not None, "live call_model requires an httpx client"
     payload: dict[str, Any]
     headers: dict[str, str]
     url: str
@@ -313,7 +314,7 @@ def retryable_call_failure(metrics: CallMetrics) -> bool:
 
 def call_model_with_retries(
     *,
-    client: httpx.Client,
+    client: httpx.Client | None,
     model: ModelConfig,
     messages: list[dict[str, str]],
     max_tokens: int,

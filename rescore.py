@@ -535,7 +535,7 @@ def _self_test() -> int:
     assert filter_source_records(recs, "nope", None) == []
 
     # task_lookup: indexes by id, skips entries without an id.
-    bank = [{"id": "a", "x": 1}, {"id": "b"}, {"no_id": True}]
+    bank: list[dict[str, Any]] = [{"id": "a", "x": 1}, {"id": "b"}, {"no_id": True}]
     lut = task_lookup(bank)
     assert set(lut.keys()) == {"a", "b"} and lut["a"]["x"] == 1
 
