@@ -132,3 +132,36 @@ def test_run_job_state_completed_or_partial(tmp_path, capsys):
     assert state.get("completed_at")
     assert "final_decision" in state
 
+
+# ---------------------------------------------------------------------------
+# export_job: run -> export acceptance pack -> the pack verifies (round-trip)
+# ---------------------------------------------------------------------------
+def test_export_job_produces_verifiable_pack(tmp_path, capsys):
+    import acceptance_pack as AP
+    runs = tmp_path / "runs"
+    E.run_job(_ns(job=str(_job_file(tmp_path)), runs_dir=str(runs), run_id="run_exp", live=False))
+    capsys.readouterr()
+    export_args = argparse.Namespace(runs_dir=str(runs), latest=False, job_id="run_exp",
+                                     include_raw=False)
+    rc = E.export_job(export_args)
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    pack = Path(out["artifact"])
+    assert pack.exists() and pack.name == "acceptance_pack.zip"
+    # the produced pack passes the independent integrity verifier
+    result = AP.verify_acceptance_pack(pack)
+    assert result["verified"] is True, result
+
+
+def test_export_job_include_raw(tmp_path, capsys):
+    import acceptance_pack as AP
+    runs = tmp_path / "runs"
+    E.run_job(_ns(job=str(_job_file(tmp_path)), runs_dir=str(runs), run_id="run_exp2", live=False))
+    capsys.readouterr()
+    export_args = argparse.Namespace(runs_dir=str(runs), latest=False, job_id="run_exp2",
+                                     include_raw=True)
+    assert E.export_job(export_args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert AP.verify_acceptance_pack(Path(out["artifact"]))["verified"] is True
+
+
