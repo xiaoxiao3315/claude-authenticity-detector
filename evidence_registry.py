@@ -187,8 +187,10 @@ def collect_bound_evidence_dirs(
         return BoundEvidenceDirs(dirs, warnings, expected_ids, bound_ids)
 
     for record in records:
-        refs = record.get("evidence_refs") if isinstance(record.get("evidence_refs"), dict) else {}
-        evidence_ids = record.get("evidence_ids") if isinstance(record.get("evidence_ids"), dict) else {}
+        raw_refs = record.get("evidence_refs")
+        refs: dict[str, Any] = raw_refs if isinstance(raw_refs, dict) else {}
+        raw_ev_ids = record.get("evidence_ids")
+        evidence_ids: dict[str, Any] = raw_ev_ids if isinstance(raw_ev_ids, dict) else {}
 
         expected_id: str | None = None
         raw_expected_id = evidence_ids.get(id_key)
