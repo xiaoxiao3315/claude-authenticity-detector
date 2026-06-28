@@ -86,6 +86,7 @@ class Completion:
     text: str
     metrics: CallMetrics
     raw: dict[str, Any] | None = None
+    response_headers: dict[str, str] = field(default_factory=dict)
 
 
 def auth_value(model: ModelConfig) -> str:
@@ -289,7 +290,7 @@ def call_model(
             "model_returned": metrics.server_model,
         },
     )
-    return Completion(text=text, metrics=metrics, raw=data)
+    return Completion(text=text, metrics=metrics, raw=data, response_headers=safe_response_headers(response.headers))
 
 
 def retryable_call_failure(metrics: CallMetrics) -> bool:

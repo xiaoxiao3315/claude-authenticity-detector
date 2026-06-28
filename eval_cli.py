@@ -1452,11 +1452,15 @@ BASELINE_CANARY_PROBES = [
 
 
 def _raw_protocol_observation(completion: Completion, model: ModelConfig) -> dict[str, Any]:
-    """Extract RAW protocol values from the upstream response body.
+    """Extract RAW protocol values from the upstream response body + headers.
 
     Reads completion.raw (set in call_model BEFORE the L639/640 stop/model
     fallback would rewrite them), so the baseline captures the source's true
-    shape, not the normalized CallMetrics.
+    shape, not the normalized CallMetrics. Also inspects the response headers
+    (completion.response_headers, allowlisted+lowercased in call_model) for the
+    Anthropic header dialect — a genuine api.anthropic.com / faithful gateway
+    emits anthropic-request-id (a `req_`-prefixed id) and anthropic-* headers;
+    a thin OpenAI-style wrapper typically does not.
     """
     data = completion.raw if isinstance(completion.raw, dict) else {}
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
@@ -1466,11 +1470,19 @@ def _raw_protocol_observation(completion: Completion, model: ModelConfig) -> dic
         raw_stop = (choices[0].get("finish_reason") if choices else None)
     else:
         raw_stop = data.get("stop_reason")
+    headers = completion.response_headers if isinstance(completion.response_headers, dict) else {}
+    request_id = headers.get("anthropic-request-id") or ""
+    has_anthropic_request_id = bool(request_id) and str(request_id).startswith("req_")
+    has_anthropic_headers = any(
+        key.startswith("anthropic-") for key in headers
+    )
     return {
         "raw_stop_reason": raw_stop,
         "raw_usage_keys": raw_usage_keys,
         "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens")),
         "output_tokens": usage.get("output_tokens", usage.get("completion_tokens")),
+        "has_anthropic_request_id": has_anthropic_request_id,
+        "has_anthropic_headers": has_anthropic_headers,
     }
 
 
@@ -1513,8 +1525,8 @@ def _collect_baseline_samples(
                     input_tokens=obs["input_tokens"],
                     output_tokens=obs["output_tokens"],
                     total_ms=completion.metrics.total_ms,
-                    has_anthropic_request_id=False,
-                    has_anthropic_headers=False,
+                    has_anthropic_request_id=obs["has_anthropic_request_id"],
+                    has_anthropic_headers=obs["has_anthropic_headers"],
                     probe_id=probe["id"],
                     live=live,
                     ok=bool(completion.metrics.ok),

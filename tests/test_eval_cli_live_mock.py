@@ -60,6 +60,11 @@ def _anthropic_response() -> httpx.Response:
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 4150, "output_tokens": 3,
                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+    }, headers={
+        # genuine-Anthropic header dialect — the P1 signal that was previously dead
+        "anthropic-request-id": "req_abc123",
+        "anthropic-ratelimit-requests-remaining": "100",
+        "request-id": "req_abc123",
     })
 
 
@@ -156,6 +161,11 @@ def test_baseline_build_live(tmp_path, capsys, mock_anthropic_client):
     assert pf["stop_reason_in_claude_enum"] is True
     assert pf["stop_reason_counts"] == {"end_turn": 6}
     assert pf["usage_naming_dialect_counts"].get("anthropic") == 6
+    # P1 regression guard: the anthropic header/request-id signal must be LIVE,
+    # not the permanently-0.0 it used to be. The fake gateway emits anthropic-*
+    # headers + a req_-prefixed id, so both rates must be 1.0.
+    assert pf["anthropic_request_id_rate"] == 1.0
+    assert pf["anthropic_headers_rate"] == 1.0
 
 
 # ---------------------------------------------------------------------------

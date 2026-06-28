@@ -245,6 +245,48 @@ def test_model_ids_unexpected_shape():
 
 
 # ---------------------------------------------------------------------------
+# _raw_protocol_observation — header dialect detection (P1 regression)
+# ---------------------------------------------------------------------------
+def _model(protocol="anthropic_messages"):
+    from model_client import ModelConfig
+    return ModelConfig(provider_id="tested", base_url="https://gw.x", model="claude-opus-4-6",
+                       api_key_env="K", protocol=protocol, auth_type="x-api-key")
+
+
+def test_raw_observation_detects_anthropic_headers():
+    c = Completion(text="hi", metrics=CallMetrics(ok=True),
+                   raw={"stop_reason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 2}},
+                   response_headers={"anthropic-request-id": "req_xyz", "request-id": "req_xyz"})
+    obs = E._raw_protocol_observation(c, _model())
+    assert obs["has_anthropic_request_id"] is True
+    assert obs["has_anthropic_headers"] is True
+    assert obs["raw_stop_reason"] == "end_turn"
+    assert obs["input_tokens"] == 10
+
+
+def test_raw_observation_wrapper_without_anthropic_headers():
+    # an OpenAI-style wrapper: no anthropic-* headers, non-req_ id
+    c = Completion(text="hi", metrics=CallMetrics(ok=True),
+                   raw={"choices": [{"finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 1}},
+                   response_headers={"openai-request-id": "chatcmpl-1", "cf-ray": "abc"})
+    obs = E._raw_protocol_observation(c, _model(protocol="openai_chat"))
+    assert obs["has_anthropic_request_id"] is False
+    assert obs["has_anthropic_headers"] is False
+    assert obs["raw_stop_reason"] == "stop"
+
+
+def test_raw_observation_non_req_id_is_not_anthropic():
+    # has an anthropic-request-id header but the value isn't req_-prefixed
+    c = Completion(text="hi", metrics=CallMetrics(ok=True),
+                   raw={"stop_reason": "end_turn", "usage": {}},
+                   response_headers={"anthropic-request-id": "weird-format-123"})
+    obs = E._raw_protocol_observation(c, _model())
+    assert obs["has_anthropic_request_id"] is False  # not req_-prefixed
+    assert obs["has_anthropic_headers"] is True       # still an anthropic-* header present
+
+
+# ---------------------------------------------------------------------------
 # _assemble_needle_prompt — reproducible, canary planted
 # ---------------------------------------------------------------------------
 def test_assemble_needle_prompt_reproducible():
