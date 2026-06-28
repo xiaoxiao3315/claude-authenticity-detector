@@ -262,3 +262,77 @@ def test_build_payload_passes_tools_and_system():
     assert payload["tools"] == [{"name": "t"}]
     assert payload["tool_choice"] == {"type": "any"}
 
+
+# ---------------------------------------------------------------------------
+# evaluate_case — the per-category dispatcher tying graders together
+# ---------------------------------------------------------------------------
+def _good_metrics(**over):
+    return _metrics(http_status=200, content_chars=20, server_model="claude-opus-4-6", **over)
+
+
+def test_evaluate_case_messages_substring():
+    checks = K.evaluate_case(
+        suite={}, case={"category": "messages", "expected_substring": "FOO"},
+        provider=_provider(), primary_metrics=_good_metrics(), primary_response_text="has FOO here")
+    names = {c["name"] for c in checks}
+    assert "expected_substring" in names
+    assert "http_status" in names
+
+
+def test_evaluate_case_json_category():
+    checks = K.evaluate_case(
+        suite={}, case={"category": "json", "expected_json": {"a": 1}},
+        provider=_provider(), primary_metrics=_good_metrics(), primary_response_text='{"a": 1}')
+    by = {c["name"]: c["status"] for c in checks}
+    assert by["json_schema"] == "PASS"
+
+
+def test_evaluate_case_sse_category():
+    m = _good_metrics(event_types=["message_start", "content_block_delta", "message_delta", "message_stop"],
+                      first_event_ms=10.0, first_content_token_ms=20.0)
+    checks = K.evaluate_case(suite={}, case={"category": "sse"}, provider=_provider(),
+                             primary_metrics=m, primary_response_text="hi")
+    by = {c["name"]: c["status"] for c in checks}
+    assert by["sse_required_events"] == "PASS"
+
+
+def test_evaluate_case_usage_category():
+    primary = _good_metrics(input_tokens=100, output_tokens=10)
+    secondary = _good_metrics(input_tokens=5000, output_tokens=10)
+    checks = K.evaluate_case(suite={}, case={"category": "usage"}, provider=_provider(),
+                             primary_metrics=primary, primary_response_text="hi",
+                             secondary_metrics=secondary)
+    by = {c["name"]: c["status"] for c in checks}
+    assert by["usage_required_fields"] == "PASS"
+    assert by["usage_prompt_scale"] == "PASS"
+
+
+def test_evaluate_case_cache_category():
+    case = {"category": "cache", "request": {"messages": [{"cache_control": {"type": "ephemeral"}}]}}
+    primary = _good_metrics(cache_creation_input_tokens=50, cache_read_input_tokens=0)
+    checks = K.evaluate_case(suite={}, case=case, provider=_provider(),
+                             primary_metrics=primary, primary_response_text="hi")
+    by = {c["name"]: c["status"] for c in checks}
+    assert by["cache_control_sent"] == "PASS"
+
+
+def test_evaluate_case_tool_call_skips_text_requirement():
+    # tool_call category does not require displayable text
+    m = _metrics(http_status=200, content_chars=0, server_model="claude-opus-4-6",
+                 tool_use_event_count=1)
+    checks = K.evaluate_case(suite={}, case={"category": "tool_call"}, provider=_provider(),
+                             primary_metrics=m, primary_response_text="")
+    by = {c["name"]: c["status"] for c in checks}
+    assert by["displayable_text"] == "PASS"  # optional for tool_call
+
+
+def test_evaluate_case_forced_tool_choice_unsupported():
+    # an HTTP 400 with a tool_choice/thinking error on the tool_call_probe is treated as WARN
+    m = _metrics(http_status=400, error="tool_choice not supported with thinking",
+                 server_model="claude-opus-4-6")
+    checks = K.evaluate_case(
+        suite={}, case={"id": "tool_call_probe", "category": "tool_call"},
+        provider=_provider(), primary_metrics=m, primary_response_text="")
+    by = {c["name"]: c["status"] for c in checks}
+    assert by["tool_choice_support"] == "WARN"
+

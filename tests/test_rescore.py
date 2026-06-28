@@ -199,3 +199,91 @@ def test_task_lookup():
     assert "t2" in lut
     assert len(lut) == 2  # entry without id dropped
 
+
+# ---------------------------------------------------------------------------
+# run_rescore — the orchestrator, driven fully offline with injected fakes
+# ---------------------------------------------------------------------------
+def _run_with_response(tmp_path: Path, response_text="the answer"):
+    run_dir = tmp_path / "runs" / "run1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "resp.txt").write_text(response_text, encoding="utf-8")
+    rec = {
+        "record_id": "run1:tested:t1",
+        "run": {"run_id": "run1"},
+        "task": {"id": "t1", "category": "C", "scoring_type": "keyword_check"},
+        "provider": {"id": "tested"},
+        "scoring": {"final_score": {"score": 5.0}},
+        "artifacts": {"response_file": "resp.txt", "events_file": "e.jsonl"},
+        "telemetry": {"error": None},
+    }
+    (run_dir / "run_records.jsonl").write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    return run_dir.parent, "run1"
+
+
+def test_run_rescore_rule_only(tmp_path):
+    runs_dir, run_id = _run_with_response(tmp_path, "contains the keyword apple")
+
+    def fake_score(task, response_text):
+        # deterministic rule scorer: full marks if 'apple' present
+        return {"score": 10.0 if "apple" in response_text else 0.0, "format_ok": True,
+                "details": "rule"}
+
+    result = RS.run_rescore(
+        runs_dir=runs_dir, run_id=run_id,
+        task_bank=[{"id": "t1", "scoring_type": "keyword_check"}],
+        score_response=fake_score,
+    )
+    assert result["rescore_id"]
+    assert result["record_count"] == 1
+    # the written records file carries the per-record new scores
+    rescore_dir = runs_dir / run_id / "rescores" / result["rescore_id"]
+    assert rescore_dir.exists()
+    records = RS.read_jsonl(rescore_dir / "rescore_records.jsonl")
+    assert records[0]["new_final_score"]["score"] == 10.0
+
+
+def test_run_rescore_with_judge(tmp_path):
+    runs_dir, run_id = _run_with_response(tmp_path)
+
+    def fake_score(task, response_text):
+        return {"score": 6.0, "format_ok": True, "details": "rule"}
+
+    def fake_judge(task, response_text, rule_score):
+        return {"score": 9.0, "format_ok": True, "decision": "GO", "reason": "good"}
+
+    result = RS.run_rescore(
+        runs_dir=runs_dir, run_id=run_id,
+        task_bank=[{"id": "t1", "scoring_type": "keyword_check"}],
+        score_response=fake_score, judge_response=fake_judge,
+    )
+    rescore_dir = runs_dir / run_id / "rescores" / result["rescore_id"]
+    records = RS.read_jsonl(rescore_dir / "rescore_records.jsonl")
+    assert records[0]["new_judge_score"]["score"] == 9.0
+
+
+def test_run_rescore_missing_run_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="run not found"):
+        RS.run_rescore(runs_dir=tmp_path, run_id="ghost",
+                       task_bank=[], score_response=lambda t, r: {})
+
+
+def test_run_rescore_handles_scorer_exception(tmp_path):
+    runs_dir, run_id = _run_with_response(tmp_path)
+
+    def boom_score(task, response_text):
+        raise RuntimeError("scorer crashed")
+
+    result = RS.run_rescore(
+        runs_dir=runs_dir, run_id=run_id,
+        task_bank=[{"id": "t1", "scoring_type": "keyword_check"}],
+        score_response=boom_score,
+    )
+    # the crash is captured per-record as a failed status, not propagated
+    assert result["record_count"] == 1
+    assert result["manifest"]["failure_count"] == 1
+    rescore_dir = runs_dir / run_id / "rescores" / result["rescore_id"]
+    records = RS.read_jsonl(rescore_dir / "rescore_records.jsonl")
+    assert records[0]["rescore_error"] is not None
+    assert "scorer crashed" in records[0]["rescore_error"]
+
+
