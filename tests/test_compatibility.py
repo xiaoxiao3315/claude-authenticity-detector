@@ -24,6 +24,24 @@ def _provider(model="claude-opus-4-6"):
                     auth_type="x-api-key", auth_env="K")
 
 
+def test_read_jsonl_tolerates_corrupt_line(tmp_path):
+    # a truncated/corrupt events line must be skipped, not crash the probe (P7)
+    p = tmp_path / "events.jsonl"
+    p.write_text('{"a": 1}\n{truncated...\n{"b": 2}\n', encoding="utf-8")
+    rows = K.read_jsonl(p)
+    assert rows == [{"a": 1}, {"b": 2}]
+
+
+def test_read_jsonl_missing_file(tmp_path):
+    assert K.read_jsonl(tmp_path / "nope.jsonl") == []
+
+
+def test_read_jsonl_skips_non_dict(tmp_path):
+    p = tmp_path / "events.jsonl"
+    p.write_text('{"a": 1}\n[1,2,3]\n"str"\n', encoding="utf-8")
+    assert K.read_jsonl(p) == [{"a": 1}]
+
+
 def _metrics(**over):
     m = K.ProbeMetrics()
     for k, v in over.items():

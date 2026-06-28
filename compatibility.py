@@ -67,8 +67,16 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                records.append(json.loads(line))
+            if not line:
+                continue
+            # tolerate a corrupt/partial line (e.g. a truncated events file) the
+            # same way the other readers do, rather than crashing the whole probe.
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                records.append(value)
     return records
 
 

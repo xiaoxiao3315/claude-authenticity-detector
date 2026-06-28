@@ -60,7 +60,11 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             line = line.strip()
             if not line:
                 continue
-            value = json.loads(line)
+            # tolerate a corrupt/partial line rather than crashing the caller
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if isinstance(value, dict):
                 rows.append(value)
     return rows
