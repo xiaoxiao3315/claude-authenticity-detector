@@ -85,6 +85,76 @@
       "check": "exact",
       "expected_any": ["A"],
       "rationale": "Negation of universal = existential; A is the correct logical negation."
+    },
+    {
+      "id": "cap_bitwise_and",
+      "prompt": "计算十进制 13 和 6 按位与（13 & 6）的结果，只输出一个十进制整数。",
+      "check": "regex",
+      "pattern": "(?<!\\d)4(?!\\d)",
+      "rationale": "1101 & 0110 = 0100 = 4. Bitwise AND, single value."
+    },
+    {
+      "id": "cap_hex_to_dec",
+      "prompt": "十六进制数 0x2A 等于多少十进制？只输出一个整数。",
+      "check": "regex",
+      "pattern": "(?<!\\d)42(?!\\d)",
+      "rationale": "0x2A = 2*16 + 10 = 42. Base conversion."
+    },
+    {
+      "id": "cap_fibonacci",
+      "prompt": "斐波那契数列定义为 1, 1, 2, 3, 5, 8, ...（前两项都是 1，之后每项为前两项之和）。第 10 项是多少？只输出一个整数。",
+      "check": "regex",
+      "pattern": "(?<!\\d)55(?!\\d)",
+      "rationale": "1,1,2,3,5,8,13,21,34,55 — 10th term = 55. Sequence is fully specified in-prompt to avoid 0-vs-1 indexing ambiguity."
+    },
+    {
+      "id": "cap_set_intersection",
+      "prompt": "集合 {1,2,3,4} 和集合 {3,4,5,6} 的交集里有几个元素？只输出一个整数。",
+      "check": "regex",
+      "pattern": "(?<!\\d)2(?!\\d)",
+      "rationale": "Intersection = {3,4}, count = 2."
+    },
+    {
+      "id": "cap_count_primes",
+      "prompt": "20 以内（含 20）的质数有几个？只输出一个整数。",
+      "check": "regex",
+      "pattern": "(?<!\\d)8(?!\\d)",
+      "rationale": "2,3,5,7,11,13,17,19 = 8 primes. 1 is not prime."
+    },
+    {
+      "id": "cap_string_index",
+      "prompt": "Python 中字符串 'python' 的下标 2 处的字符是什么（下标从 0 开始）？只输出那个字符。",
+      "check": "exact",
+      "expected_any": ["t"],
+      "rationale": "p(0) y(1) t(2) — index 2 = 't'. Indexing base stated in-prompt."
+    },
+    {
+      "id": "cap_reverse_percent",
+      "prompt": "某个数的 30% 等于 45。这个数是多少？只输出一个整数。",
+      "check": "regex",
+      "pattern": "(?<!\\d)150(?!\\d)",
+      "rationale": "45 / 0.30 = 150. Reverse percentage."
+    },
+    {
+      "id": "cap_modulo",
+      "prompt": "17 除以 5 的余数是多少？只输出一个整数。",
+      "check": "regex",
+      "pattern": "(?<!\\d)2(?!\\d)",
+      "rationale": "17 = 3*5 + 2, remainder = 2."
+    },
+    {
+      "id": "cap_permutations",
+      "prompt": "3 个互不相同的元素一共有多少种不同的排列方式？只输出一个整数。",
+      "check": "regex",
+      "pattern": "(?<!\\d)6(?!\\d)",
+      "rationale": "3! = 6."
+    },
+    {
+      "id": "cap_list_comprehension",
+      "prompt": "下面 Python 代码输出什么？只输出结果，不要解释。\n\nprint([i*i for i in range(1,4)])",
+      "check": "contains",
+      "expected_all": ["[1, 4, 9]"],
+      "rationale": "range(1,4)=1,2,3 -> squares [1,4,9]. List comprehension + range semantics."
     }
   ]
 }
