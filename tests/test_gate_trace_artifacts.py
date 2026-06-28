@@ -57,6 +57,53 @@ def test_quality_gate_list_empty(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# P3b: a persisted authenticity verdict reaches the gate end-to-end
+# ---------------------------------------------------------------------------
+def test_quality_gate_consumes_authenticity_wrapper_verdict(tmp_path):
+    Q.make_fake_run(tmp_path, run_id="run_wrap", provider_id="fake_provider")
+    # persist a compare_to_baseline-shaped verdict where verify-endpoint would
+    (tmp_path / "run_wrap" / "authenticity").mkdir()
+    (tmp_path / "run_wrap" / "authenticity" / "fake_provider.json").write_text(
+        json.dumps({"verdict": "suspected_wrapper", "confidence": 0.8}), encoding="utf-8")
+    policy = _policy_file(tmp_path)
+    result = Q.run_quality_gate(runs_dir=tmp_path, run_id="run_wrap", policy_path=policy,
+                                compatibility_run_id="compat_go")
+    rec = result["records"][0]
+    assert rec["decision"] == "NO-GO"
+    assert any(b["rule_id"] == "authenticity_verdict_blocks" for b in rec["blockers"])
+    # the verdict actually rode through aggregate_metrics into the snapshot
+    assert rec["metrics_snapshot"]["authenticity_verdict"] == "suspected_wrapper"
+
+
+def test_quality_gate_authenticity_absent_is_noop(tmp_path):
+    Q.make_fake_run(tmp_path, run_id="run_plain", provider_id="fake_provider")
+    policy = _policy_file(tmp_path)
+    result = Q.run_quality_gate(runs_dir=tmp_path, run_id="run_plain", policy_path=policy,
+                                compatibility_run_id="compat_go")
+    rec = result["records"][0]
+    # no authenticity artifact -> no authenticity blocker, verdict metric is None
+    assert rec["metrics_snapshot"]["authenticity_verdict"] is None
+    assert not any(b["rule_id"] == "authenticity_verdict_blocks" for b in rec["blockers"])
+
+
+def test_load_authenticity_evidence_absent(tmp_path):
+    (tmp_path / "run_x").mkdir()
+    out = Q.load_authenticity_evidence(tmp_path / "run_x", "p")
+    assert out["found"] is False
+    assert out["verdict"] is None
+
+
+def test_load_authenticity_evidence_verdict_json_fallback(tmp_path):
+    run_dir = tmp_path / "run_x"
+    (run_dir / "authenticity").mkdir(parents=True)
+    (run_dir / "authenticity" / "verdict.json").write_text(
+        json.dumps({"verdict": "matches_official"}), encoding="utf-8")
+    out = Q.load_authenticity_evidence(run_dir, provider_id=None)
+    assert out["found"] is True
+    assert out["verdict"] == "matches_official"
+
+
+# ---------------------------------------------------------------------------
 # trace_evaluation: run + list + read
 # ---------------------------------------------------------------------------
 def _trace_run(tmp_path: Path):

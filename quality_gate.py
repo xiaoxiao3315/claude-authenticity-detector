@@ -523,6 +523,35 @@ def provider_ids_from_evidence(samples: list[dict[str, Any]], provider_scores: d
     return sorted(ids)
 
 
+def load_authenticity_evidence(run_dir: Path, provider_id: str | None = None) -> dict[str, Any]:
+    """Load an optional persisted baseline-comparison verdict for this run.
+
+    A run/campaign that ran `verify-endpoint` (or a future inline comparison)
+    may persist the compare_to_baseline result to
+    `<run_dir>/authenticity/<provider_id>.json` or `authenticity/verdict.json`.
+    The file shape is the compare_to_baseline output (carries a `verdict` key:
+    matches_official / suspected_wrapper / suspected_downgrade / insufficient_evidence).
+    Absent file -> {"found": False, "verdict": None}, so the gate rule is a no-op
+    on runs that never produced a comparison.
+    """
+    base = run_dir / "authenticity"
+    candidates = []
+    if provider_id:
+        safe_pid = str(provider_id).replace("/", "_").replace("\\", "_")
+        candidates.append(base / f"{safe_pid}.json")
+    candidates.append(base / "verdict.json")
+    for path in candidates:
+        if path.exists():
+            try:
+                doc = read_json(path)
+            except Exception:
+                continue
+            if isinstance(doc, dict):
+                verdict = doc.get("verdict")
+                return {"found": bool(verdict), "verdict": verdict, "doc": doc}
+    return {"found": False, "verdict": None}
+
+
 def aggregate_metrics(
     *,
     samples: list[dict[str, Any]],
@@ -531,6 +560,7 @@ def aggregate_metrics(
     trace_evaluation: dict[str, Any],
     rescore: dict[str, Any],
     rescore_applied_count: int,
+    authenticity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sample_count = len(samples)
     ok_count = sum(1 for sample in samples if sample.get("ok") is True)
@@ -626,6 +656,12 @@ def aggregate_metrics(
         "trace_thinking_only_count": trace_metrics.get("thinking_only_count"),
         "trace_missing_events_count": trace_metrics.get("missing_events_count"),
         "trace_max_tokens_count": trace_metrics.get("max_tokens_count"),
+        # Authenticity verdict from the baseline-comparison subsystem
+        # (compare_to_baseline), loaded from a persisted run-dir artifact when
+        # present. None/absent -> evaluate_policy treats it as a no-op, so a
+        # campaign without a baseline comparison is unaffected.
+        "authenticity_verdict": (authenticity or {}).get("verdict"),
+        "authenticity_found": bool((authenticity or {}).get("found")),
     }
 
 
@@ -1013,6 +1049,7 @@ def run_quality_gate(
         rescored_samples, rescore_applied_count = apply_rescore(provider_samples, rescore, current_provider_id)
         compatibility = load_compatibility_evidence(runs_dir, current_provider_id, compatibility_run_id)
         trace_evaluation = load_trace_evaluation_evidence(run_dir, current_provider_id, trace_eval_id)
+        authenticity = load_authenticity_evidence(run_dir, current_provider_id)
         provider_score = provider_scores.get(current_provider_id) if isinstance(provider_scores, dict) else None
         metrics = aggregate_metrics(
             samples=rescored_samples,
@@ -1021,6 +1058,7 @@ def run_quality_gate(
             trace_evaluation=trace_evaluation,
             rescore=rescore,
             rescore_applied_count=rescore_applied_count,
+            authenticity=authenticity,
         )
         decision, blockers, review_items, passed_rules = evaluate_policy(
             policy=policy,
