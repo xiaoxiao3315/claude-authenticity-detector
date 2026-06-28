@@ -417,7 +417,10 @@ def evaluate_sse(metrics: ProbeMetrics) -> list[dict[str, Any]]:
     else:
         checks.append(check("sse_required_events", PASS, "required SSE events present", {"event_types": event_types}))
     positions = {event: index_of(event_types, event) for event in required}
-    if all(value is not None for value in positions.values()) and positions["message_start"] < positions["content_block_delta"] < positions["message_stop"]:
+    p_start = positions["message_start"]
+    p_delta = positions["content_block_delta"]
+    p_stop = positions["message_stop"]
+    if p_start is not None and p_delta is not None and p_stop is not None and p_start < p_delta < p_stop:
         checks.append(check("sse_event_order", PASS, "SSE event order is plausible", positions))
     else:
         checks.append(check("sse_event_order", FAIL, "SSE event order is invalid or incomplete", positions))
@@ -829,7 +832,7 @@ def read_compatibility_run(runs_dir: Path, run_id: str) -> dict[str, Any]:
 
 def self_test() -> None:
     provider = Provider(id="fake_provider", base_url="https://example.invalid/anthropic", model="fake-model", auth_type="bearer", auth_env="FAKE_KEY")
-    suite = {
+    suite: dict[str, Any] = {
         "suite_version": "compatibility_suite_v1",
         "cases": [
             {"id": "messages_basic", "category": "messages", "request": {"prompt": "x"}, "expected_substring": "ok"},
@@ -866,8 +869,8 @@ def self_test() -> None:
 
 def main() -> int:
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     except AttributeError:
         pass
     parser = argparse.ArgumentParser(description="Run provider compatibility suite")

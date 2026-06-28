@@ -60,6 +60,11 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Narrow Any -> dict (empty when not a dict) for the type checker."""
+    return value if isinstance(value, dict) else {}
+
+
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -148,12 +153,12 @@ def resolve_path(path_value: Any, *, root_dir: Path, run_dir: Path) -> Path | No
 
 
 def provider_from_record(record: dict[str, Any]) -> str | None:
-    provider = record.get("provider") if isinstance(record.get("provider"), dict) else {}
+    provider = _as_dict(record.get("provider"))
     return provider.get("id") or record.get("provider_id") or record.get("provider")
 
 
 def task_from_record(record: dict[str, Any]) -> str | None:
-    task = record.get("task") if isinstance(record.get("task"), dict) else {}
+    task = _as_dict(record.get("task"))
     return task.get("id") or record.get("task_id")
 
 
@@ -359,7 +364,7 @@ def row_matches_provider(row: dict[str, Any], provider_ids: set[str]) -> bool:
     provider = row.get("provider_id") or row.get("source_provider_id") or row.get("provider")
     if provider and str(provider) in provider_ids:
         return True
-    metrics = row.get("metrics_snapshot") if isinstance(row.get("metrics_snapshot"), dict) else {}
+    metrics = _as_dict(row.get("metrics_snapshot"))
     provider = metrics.get("provider_id")
     return bool(provider and str(provider) in provider_ids)
 
@@ -476,7 +481,7 @@ def collect_compatibility_dirs(
         )
 
     for provider_id in provider_ids or {""}:
-        def matches_provider(manifest: dict[str, Any], provider_id: str = provider_id) -> bool:
+        def matches_provider_for_id(manifest: dict[str, Any], provider_id: str = provider_id) -> bool:
             manifest_run_id = str(manifest.get("run_id") or "")
             if manifest_run_id and archived_evidence("compatibility_run", runs_dir, manifest_run_id, manifest_run_id):
                 return False
@@ -487,7 +492,7 @@ def collect_compatibility_dirs(
             manifest_name="compatibility_manifest.json",
             label="compatibility run",
             id_key="run_id",
-            match_manifest=matches_provider,
+            match_manifest=matches_provider_for_id,
         )
         if selection.path:
             dirs.append(selection.path)
@@ -507,7 +512,7 @@ def collect_trace_dirs(run_dir: Path, provider_ids: set[str], trace_eval_id: str
         manifest_trace_id = str(manifest.get("trace_eval_id") or "")
         if not trace_eval_id and manifest_trace_id and archived_evidence("trace_evaluation", run_dir.parent, run_dir.name, manifest_trace_id):
             return False
-        metrics = manifest.get("provider_metrics") if isinstance(manifest.get("provider_metrics"), dict) else {}
+        metrics = _as_dict(manifest.get("provider_metrics"))
         return not provider_ids or bool(set(str(key) for key in metrics.keys()) & provider_ids)
 
     if trace_eval_id:
@@ -562,7 +567,7 @@ def collect_rescore_dirs(run_dir: Path, provider_ids: set[str], rescore_id: str 
         manifest_rescore_id = str(manifest.get("rescore_id") or "")
         if not rescore_id and manifest_rescore_id and archived_evidence("rescore", run_dir.parent, run_dir.name, manifest_rescore_id):
             return False
-        filters = manifest.get("filters") if isinstance(manifest.get("filters"), dict) else {}
+        filters = _as_dict(manifest.get("filters"))
         filter_provider_id = filters.get("provider_id")
         return not provider_ids or not filter_provider_id or str(filter_provider_id) in provider_ids
 
@@ -681,8 +686,8 @@ def write_redacted_csv_records(
 
 
 def artifact_paths_from_run_record(record: dict[str, Any], root_dir: Path, run_dir: Path) -> tuple[Path | None, Path | None]:
-    response = record.get("response") if isinstance(record.get("response"), dict) else {}
-    artifacts = record.get("artifacts") if isinstance(record.get("artifacts"), dict) else {}
+    response = _as_dict(record.get("response"))
+    artifacts = _as_dict(record.get("artifacts"))
     response_file = artifacts.get("response_file") or response.get("response_file")
     events_file = artifacts.get("events_file") or response.get("events_file")
     return (
@@ -799,7 +804,7 @@ def write_summary_markdown(
         for record in gate_records:
             provider_id = record.get("provider_id")
             decision = record.get("decision")
-            metrics = record.get("metrics_snapshot") if isinstance(record.get("metrics_snapshot"), dict) else {}
+            metrics = _as_dict(record.get("metrics_snapshot"))
             lines.extend(
                 [
                     "",
@@ -821,7 +826,7 @@ def write_summary_markdown(
         lines.append("")
         lines.append("No Quality Gate record was exported.")
     lines.extend(["", "## Bound Evidence"])
-    bound = manifest.get("bound_evidence") if isinstance(manifest.get("bound_evidence"), dict) else {}
+    bound = _as_dict(manifest.get("bound_evidence"))
     for key, value in bound.items():
         lines.append(f"- {key}: `{value}`")
     lines.extend(["", "## Warnings"])
@@ -943,7 +948,7 @@ def write_stopped_audit_export_result(
     write_evidence_summary(evidence_summary_path, [])
     manifest_path = export_dir / "audit_export_manifest.json"
     summary_path = export_dir / "audit_export_summary.md"
-    manifest = {
+    manifest: dict[str, Any] = {
         "schema_version": AUDIT_EXPORT_SCHEMA_VERSION,
         "audit_export_id": audit_export_id,
         "source_run_id": run_id,
@@ -1266,7 +1271,7 @@ def run_audit_export(
     stop_reason = "user_stop_requested" if stopped else None
     manifest_path = export_dir / "audit_export_manifest.json"
     summary_path = export_dir / "audit_export_summary.md"
-    manifest = {
+    manifest: dict[str, Any] = {
         "schema_version": AUDIT_EXPORT_SCHEMA_VERSION,
         "audit_export_id": audit_export_id,
         "source_run_id": run_id,
@@ -1380,7 +1385,7 @@ def make_fake_run(root: Path) -> tuple[Path, str]:
     response_path.parent.mkdir(parents=True, exist_ok=True)
     events_path.parent.mkdir(parents=True, exist_ok=True)
     response_path.write_text("SECRET_RESPONSE_TEXT FAKE_SECRET_TOKEN", encoding="utf-8")
-    events = [
+    events: list[dict[str, Any]] = [
         {"type": "message_start"},
         {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "SECRET_EVENT_TEXT"}},
         {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"input_tokens": 1, "output_tokens": 2}},
@@ -1581,8 +1586,8 @@ def main() -> int:
     try:
         import sys
 
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     except AttributeError:
         pass
     parser = argparse.ArgumentParser(description="Export a redacted offline audit evidence package")

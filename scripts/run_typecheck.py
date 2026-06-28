@@ -45,6 +45,9 @@ STRICT_MODULES = [
     "baseline_registry",
     "job_runtime",
     "validate_run_records",
+    "judge_calibration",
+    "compatibility",
+    "audit_export",
 ]
 
 
