@@ -2821,7 +2821,7 @@ def main() -> int:
     needle_parser.add_argument("--baseline-id", help="baseline to read this link's prefix from (for token shortfall)")
     needle_parser.add_argument("--baselines-dir", type=Path)
     needle_parser.add_argument("--timeout", type=float, default=300.0, help="per-request timeout seconds (huge prompts are slow)")
-    needle_parser.add_argument("--live", action="store_true", help="REAL >200K-token API call (expensive). Default off = dry-run assembles prompt only")
+    needle_parser.add_argument("--live", action="store_true", help="REAL long-context API call (~120K tokens, expensive). Default off = dry-run assembles prompt only")
     needle_parser.set_defaults(func=needle)
 
     args = parser.parse_args()
