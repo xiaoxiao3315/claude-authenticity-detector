@@ -239,3 +239,84 @@ def test_probe_config_role_no_key_returns_present_false(tmp_path, monkeypatch):
     assert out["api_key_present"] is False
     assert "missing environment variable" in out["error"]
 
+
+def test_probe_config_role_success_offline(tmp_path, monkeypatch):
+    # drive the full success path by stubbing http_json (no network)
+    cfg = {"tested_model": {"provider_id": "tested", "base_url": "https://gw.x",
+                            "api_key_env": "TESTED_KEY", "auth_type": "x-api-key",
+                            "protocol": "anthropic_messages", "model": "claude-opus-4-6"},
+           "judge_model": {"provider_id": "judge", "api_key_env": "JUDGE_KEY"}}
+    p = tmp_path / "providers.local.json"
+    p.write_text(json.dumps(cfg), encoding="utf-8")
+    monkeypatch.setattr(S, "PROVIDERS_LOCAL", p)
+    monkeypatch.setattr(S, "load_local_env", lambda *a, **k: {}, raising=False)
+    monkeypatch.setenv("TESTED_KEY", "sk-test")
+
+    def fake_http_json(method, url, *, headers, payload=None, timeout=30.0):
+        return 200, {"data": [{"id": "claude-opus-4-6"}, {"id": "text-embedding-3"}]}, 12.5
+    monkeypatch.setattr(S, "http_json", fake_http_json)
+
+    out = S.probe_config_role("tested_model", include_reasoning=False)
+    assert out["api_key_present"] is True
+    assert out["models_ok"] is True
+    assert out["model_count"] == 2
+    assert "claude-opus-4-6" in out["text_models"]
+    assert "text-embedding-3" not in out["text_models"]  # embedding excluded
+
+
+def test_probe_config_role_models_http_error(tmp_path, monkeypatch):
+    import urllib.error, io
+    cfg = {"tested_model": {"provider_id": "tested", "base_url": "https://gw.x",
+                            "api_key_env": "TESTED_KEY", "auth_type": "bearer", "model": "m"},
+           "judge_model": {"provider_id": "judge", "api_key_env": "JUDGE_KEY"}}
+    p = tmp_path / "providers.local.json"
+    p.write_text(json.dumps(cfg), encoding="utf-8")
+    monkeypatch.setattr(S, "PROVIDERS_LOCAL", p)
+    monkeypatch.setattr(S, "load_local_env", lambda *a, **k: {}, raising=False)
+    monkeypatch.setenv("TESTED_KEY", "sk-test")
+
+    def boom(method, url, *, headers, payload=None, timeout=30.0):
+        raise urllib.error.HTTPError(url, 401, "unauthorized", {}, io.BytesIO(b"bad key"))
+    monkeypatch.setattr(S, "http_json", boom)
+
+    out = S.probe_config_role("tested_model", include_reasoning=False)
+    assert out["models_ok"] is False
+    assert out["models_status"] == 401
+
+
+# ---------------------------------------------------------------------------
+# probe_reasoning_efforts — offline via stubbed http_json
+# ---------------------------------------------------------------------------
+def test_probe_reasoning_efforts_non_openai_skips():
+    out = S.probe_reasoning_efforts({"protocol": "anthropic_messages"}, "sk", "claude-opus-4-6")
+    assert out["supported"] == []
+    assert "only supports openai_chat" in out["skipped"]
+
+
+def test_probe_reasoning_efforts_offline(monkeypatch):
+    item = {"protocol": "openai_chat", "base_url": "https://gw.x", "auth_type": "bearer"}
+
+    def fake_http_json(method, url, *, headers, payload=None, timeout=90.0):
+        return 200, {"model": "gpt-5.5", "choices": [{"message": {"content": "OK"}}],
+                     "usage": {"completion_tokens": 1}}, 30.0
+    monkeypatch.setattr(S, "http_json", fake_http_json)
+
+    out = S.probe_reasoning_efforts(item, "sk", "gpt-5.5")
+    assert out["probe_model"] == "gpt-5.5"
+    assert len(out["supported"]) == len(S.REASONING_PROBE_VALUES)
+    assert out["rejected"] == []
+
+
+def test_probe_reasoning_efforts_rejects(monkeypatch):
+    import urllib.error, io
+    item = {"protocol": "openai_chat", "base_url": "https://gw.x", "auth_type": "bearer"}
+
+    def boom(method, url, *, headers, payload=None, timeout=90.0):
+        raise urllib.error.HTTPError(url, 400, "bad", {}, io.BytesIO(b"effort not supported"))
+    monkeypatch.setattr(S, "http_json", boom)
+
+    out = S.probe_reasoning_efforts(item, "sk", "gpt-5.5")
+    assert out["supported"] == []
+    assert len(out["rejected"]) == len(S.REASONING_PROBE_VALUES)
+    assert all(r["status"] == 400 for r in out["rejected"])
+
