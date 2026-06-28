@@ -39,6 +39,10 @@ STRICT_MODULES = [
     "authenticity",
     "api_server",
     "eval_cli",
+    "local_env",
+    "acceptance_pack",
+    "archive_registry",
+    "baseline_registry",
 ]
 
 

@@ -1407,6 +1407,7 @@ def _self_test() -> None:
         assert load_baseline_version(vdir, bid, "v0002") == v2
         # snapshot_path in the manifest is RELATIVE (portable across machines)
         man = load_versions_manifest(vdir, bid)
+        assert man is not None
         assert man["versions"][0]["snapshot_path"] == "versions/v0001/baseline.json", man["versions"][0]
         # latest pointer reflects v2 (the most recent distinct write)
         assert load_baseline(vdir, bid) == v2
@@ -1415,7 +1416,8 @@ def _self_test() -> None:
         assert r4["dedup"] is True and r4["version"] == "v0001" and r4.get("regressed") is True, r4
         assert len(list_baseline_versions(vdir, bid)) == 2  # still just v1, v2
         # diff of identical docs -> no change
-        assert diff_baselines(v1, v1)["changed"] is False
+        _diff_same = diff_baselines(v1, v1)
+        assert _diff_same is not None and _diff_same["changed"] is False
         # content fingerprint is stable & excludes volatile metadata
         v1b = dict(v1)
         v1b["sample_count"] = 999  # volatile field must not affect the hash
