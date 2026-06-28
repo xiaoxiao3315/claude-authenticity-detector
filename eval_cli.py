@@ -124,6 +124,16 @@ ALLOWED_AUTH_TYPES = {"bearer", "x-api-key"}
 SENSITIVE_CONFIG_KEY_TOKENS = ("authorization", "credential", "key", "password", "secret", "token")
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Narrow Any -> dict (empty when not a dict) for the type checker."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    """Narrow Any -> list (empty when not a list) for the type checker."""
+    return value if isinstance(value, list) else []
+
+
 def sanitize_config_value(value: Any) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
@@ -273,7 +283,7 @@ def sanitized_models(models: dict[str, ModelConfig]) -> dict[str, Any]:
     return out
 
 
-def key_fingerprint(env_name: str) -> str | None:
+def key_fingerprint_from_env(env_name: str) -> str | None:
     value = os.environ.get(env_name)
     if not value:
         return None
@@ -286,7 +296,7 @@ def campaign_model_identity(model: ModelConfig, *, include_key_fingerprint: bool
         "base_url_host": base_url_host(model.base_url),
         "model": model.model,
         "api_key_env": model.api_key_env,
-        "key_fingerprint": key_fingerprint(model.api_key_env) if include_key_fingerprint else None,
+        "key_fingerprint": key_fingerprint_from_env(model.api_key_env) if include_key_fingerprint else None,
         "protocol": model.protocol,
         "auth_type": model.auth_type,
         "provider_channel": model.provider_channel,
@@ -332,9 +342,8 @@ def benchmark_metadata(job: dict[str, Any], benchmark_config: dict[str, Any], be
 
 
 def benchmark_mode_settings(benchmark_config: dict[str, Any], benchmark_mode: str) -> dict[str, Any]:
-    modes = benchmark_config.get("modes") if isinstance(benchmark_config.get("modes"), dict) else {}
-    mode = modes.get(benchmark_mode) if isinstance(modes.get(benchmark_mode), dict) else {}
-    return mode
+    modes = _as_dict(benchmark_config.get("modes"))
+    return _as_dict(modes.get(benchmark_mode))
 
 
 def configured_max_concurrency(args: argparse.Namespace, job: dict[str, Any], benchmark_config: dict[str, Any], benchmark_mode: str) -> int:
@@ -1049,7 +1058,7 @@ def campaign_paths(args: argparse.Namespace) -> tuple[Path, Path]:
 
 
 def active_run_refs(run_index: dict[str, Any]) -> list[dict[str, Any]]:
-    refs = run_index.get("runs") if isinstance(run_index.get("runs"), list) else []
+    refs = _as_list(run_index.get("runs"))
     return [ref for ref in refs if ref.get("status") != "replaced"]
 
 
@@ -1073,7 +1082,7 @@ def latest_active_run_ref(run_index: dict[str, Any], round_index: int) -> dict[s
 
 
 def next_campaign_run_id(campaign_id: str, round_index: int, run_index: dict[str, Any], runs_dir: Path) -> tuple[str, int]:
-    refs = run_index.get("runs") if isinstance(run_index.get("runs"), list) else []
+    refs = _as_list(run_index.get("runs"))
     attempt = max([int(ref.get("attempt") or 1) for ref in refs if int(ref.get("round") or 0) == round_index] or [0]) + 1
     while True:
         run_id = f"{campaign_id}-R{round_index:02d}" if attempt == 1 else f"{campaign_id}-R{round_index:02d}-A{attempt:02d}"
@@ -1463,8 +1472,8 @@ def _raw_protocol_observation(completion: Completion, model: ModelConfig) -> dic
     emits anthropic-request-id (a `req_`-prefixed id) and anthropic-* headers;
     a thin OpenAI-style wrapper typically does not.
     """
-    data = completion.raw if isinstance(completion.raw, dict) else {}
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    data = _as_dict(completion.raw)
+    usage = _as_dict(data.get("usage"))
     raw_usage_keys = list(usage.keys())
     if model.protocol == "openai_chat":
         choices = data.get("choices") or []
@@ -2018,7 +2027,7 @@ def verify_endpoint(args: argparse.Namespace) -> int:
                 cap_items_path = resolve_path(getattr(args, "capability_items", None)
                                               or (ROOT / "judge_golden" / "capability_anchors_v1.json"))
                 cap_items_doc = read_json(cap_items_path)
-                cap_items = cap_items_doc.get("items") if isinstance(cap_items_doc, dict) else cap_items_doc
+                cap_items = _as_list(cap_items_doc.get("items") if isinstance(cap_items_doc, dict) else cap_items_doc)
                 base_cap_path = baselines_dir / str(args.baseline_id).replace("/", "_").replace("\\", "_") / "capability_anchor.json"
                 base_rate = None
                 if base_cap_path.exists():
@@ -2544,15 +2553,19 @@ def add_model_override_args(parser: argparse.ArgumentParser) -> None:
 
 def main() -> int:
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     except AttributeError:
         pass
     parser = argparse.ArgumentParser(description="Two-model headless eval CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
     self_test_parser = sub.add_parser("self-test", help="run eval_cli internal self-tests")
-    self_test_parser.set_defaults(func=lambda _args: (_self_test_judge_payload_sanitization(), print("eval_cli self-test ok"), 0)[2])
+    def _run_self_test(_args: argparse.Namespace) -> int:
+        _self_test_judge_payload_sanitization()
+        print("eval_cli self-test ok")
+        return 0
+    self_test_parser.set_defaults(func=_run_self_test)
 
     run_parser = sub.add_parser("run", help="run a configured two-model job")
     run_parser.add_argument("--job", default=DEFAULT_JOB, help="job name or path")

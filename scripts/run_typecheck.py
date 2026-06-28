@@ -38,6 +38,7 @@ STRICT_MODULES = [
     "run_records",
     "authenticity",
     "api_server",
+    "eval_cli",
 ]
 
 
