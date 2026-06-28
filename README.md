@@ -1,8 +1,68 @@
 # eval_automation_v0_2
 
-Backend-only core for the local LLM evaluation workflow.
+Backend-only core for local LLM evaluation **and Claude authenticity detection**.
 
-This folder intentionally excludes the old web console, historical runs, local secrets, campaigns, archives, screenshots, and generated logs. It keeps the evaluation kernel: benchmark execution, `run_record_v1`, compatibility checks, offline re-score, trace evaluation, quality gate, and redacted audit export.
+This folder keeps the evaluation kernel (benchmark execution, `run_record_v1`,
+compatibility checks, offline re-score, trace evaluation, quality gate, redacted
+audit export) **and a Claude official-authenticity detector** that answers one
+question: *is the model behind a gateway really official Claude, or has it been
+swapped / wrapped / downgraded / faking its context window?*
+
+It intentionally excludes the old web console, historical runs, local secrets,
+campaigns, archives, screenshots, and generated logs.
+
+---
+
+## ⭐ Claude 真伪检测（项目头号能力）
+
+Black-box detection of four ways a gateway can fake "official Claude":
+
+| 攻击 | 含义 | 探针 |
+|---|---|---|
+| 换模型 / 套壳 | 后面其实是 GPT 等，套个 Claude 壳 | 协议指纹 / SSE / 错误体 |
+| 换 tokenizer | 用了非 Claude 分词器 | token 差分 |
+| 假 1M 上下文 | 声称长上下文，实际静默截断 | needle 召回 |
+| 偷降级 | 还是 Claude，但偷换更小的（opus→haiku） | 能力锚点通过率 |
+
+最终给四类结论之一：**✅真·官方 / ⚠️疑似降级 / ❌疑似套壳 / ❔证据不足**，附分级证据链（强证据 / 佐证 / 仅参考）。
+
+### 自助三步走（脱离记 CLI）
+
+完整使用手册见 **[`docs/真伪检测使用手册.md`](docs/真伪检测使用手册.md)**。最短路径：
+
+```powershell
+# 1. 填要测的网关：configs/providers.local.json 的 suspect_model
+#    填 key：local_secrets.env 的 SUSPECT_MODEL_API_KEY（key 绝不进 json）
+# 2. dry-run 验证配置（不花额度）
+.\scripts\run_authenticity_check.ps1
+# 3. 真实检测（调网关、出中文判定）
+.\scripts\run_authenticity_check.ps1 -Live
+.\scripts\run_authenticity_check.ps1 -Live -Full   # 额外跑 needle 假1M探针（慢/贵）
+```
+
+### 底层 CLI（脚本就是它的封装）
+
+```powershell
+# 建可信基线（用一个你信任的真官方源；默认 OFFICIAL-CLAUDE-OPUS46 已就绪）
+python .\eval_cli.py baseline --provider tested_model --baseline-id OFFICIAL-CLAUDE-OPUS46 --live --request-delay 1.0
+python .\eval_cli.py capability-probe --provider tested_model --baseline-id OFFICIAL-CLAUDE-OPUS46 --live   # 能力基线（抓降级）
+# 检测一个可疑网关（四合一）
+python .\eval_cli.py verify-endpoint --baseline-id OFFICIAL-CLAUDE-OPUS46 --provider suspect_model --live --with-sse --with-error-envelope --with-capability
+# 基线版本化 / 漂移
+python .\eval_cli.py baseline-versions --baseline-id OFFICIAL-CLAUDE-OPUS46
+python .\eval_cli.py baseline-diff --baseline-id OFFICIAL-CLAUDE-OPUS46
+# 校准评审模型本身是否可信
+python .\eval_cli.py judge-calibrate --golden-set judge_golden/golden_set_v1.json --live --report
+```
+
+### 重要边界
+
+- **基线会过期**：网关上游会变（已实测到 drhknode 的 error-envelope 行为漂移）。基线超过一段时间应重建；版本化（`baseline-versions`/`baseline-diff`）会留痕历史指纹。
+- **黑盒限制**：能证明"接口表现得像/不像官方 Claude"、能抓套壳/降级/假长上下文，但不能单独证明背后一定是官方上游——真正身份保证仍需官方账号/合同/日志。
+- 永不读写 key；待测网关必须配在 `providers.local.json`（CLI 无 suspect 覆盖参数）。
+- 可视化报告页：React 站 `../llm_eval_result_site` 的 `/authenticity`。
+
+---
 
 ## v0.2.1 Two-Model Headless Flow
 
