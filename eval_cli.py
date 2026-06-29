@@ -1852,7 +1852,7 @@ def _run_variance_probe(
     item: dict[str, Any], model: ModelConfig, *,
     live: bool, events_file: Path, repeats: int, request_delay: float,
     retries: int, retry_backoff: float, max_tokens: int, timeout: float,
-    progress: Any = None,
+    progress: Any = None, fail_fast: int = 4,
 ) -> list[dict[str, Any]]:
     """Repeat ONE deterministic anchor `repeats` times at temp=0 to surface
     low-frequency swapping (a fraction of requests routed to a weaker model shows
@@ -1860,10 +1860,19 @@ def _run_variance_probe(
     [{passed, answer_norm, ok}] for score_consistency_variance.
 
     `progress`, when given, is called per repeat for live SSE updates.
+
+    Circuit breaker (R-001/R-002 lesson): if `fail_fast` consecutive repeats fail
+    (e.g. the gateway rate-limits rapid identical requests, as aigocode did),
+    abort the remaining repeats instead of grinding through 12×retries of doomed
+    calls — that both wastes quota and looks like an abuse pattern to upstream
+    rate-limiters. score_consistency_variance then sees too-few-answered ->
+    advisory, NOT a false conviction.
     """
     out: list[dict[str, Any]] = []
     client_timeout = httpx.Timeout(float(timeout or 120.0))
     prompt = str(item.get("prompt") or "")
+    consecutive_fail = 0
+    aborted = False
     with httpx.Client(timeout=client_timeout, follow_redirects=True) as client:
         for i in range(max(1, repeats)):
             if live and request_delay and i > 0:
@@ -1879,14 +1888,24 @@ def _run_variance_probe(
             )
             if not completion.metrics.ok:
                 out.append({"passed": None, "answer_norm": None, "ok": False})
+                consecutive_fail += 1
+                if live and consecutive_fail >= max(1, fail_fast):
+                    append_jsonl(events_file, {"at": now_iso(), "type": "variance_circuit_break",
+                                               "consecutive_failures": consecutive_fail,
+                                               "completed": i + 1, "planned": repeats})
+                    aborted = True
+                    break
                 continue
+            consecutive_fail = 0
             graded = score_capability_item(item, completion.text)
             # normalized answer for determinism check: collapse whitespace + lowercase
             answer_norm = " ".join((completion.text or "").split()).lower()[:120]
             out.append({"passed": bool(graded["passed"]), "answer_norm": answer_norm, "ok": True})
     if progress is not None:
-        progress({"stage": "variance", "done": repeats, "total": repeats,
-                  "label": f"一致性复检完成 {repeats}/{repeats}"})
+        label = (f"一致性复检中止（连续失败，已跑 {len(out)} 次）" if aborted
+                 else f"一致性复检完成 {repeats}/{repeats}")
+        progress({"stage": "variance", "done": len(out) if aborted else repeats,
+                  "total": repeats, "label": label, "aborted": aborted})
     return out
 
 

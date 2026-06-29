@@ -92,5 +92,36 @@ def test_rate_limited_repeats_are_advisory(tmp_path, monkeypatch):
         repeats=16, request_delay=0.0, retries=1, retry_backoff=0.0,
         max_tokens=64, timeout=30.0,
     )
+    # circuit breaker: a gateway that fails every request aborts after fail_fast
+    # consecutive failures (default 4) instead of grinding all 16 — R-002 lesson.
+    assert len(reps) == 4, reps
+    assert all(r["ok"] is False for r in reps), reps
     score = E.score_consistency_variance(reps)
     assert score["score"] is None and score.get("advisory") is True, score
+    # a variance_circuit_break event was logged
+    import json
+    evs = [json.loads(l) for l in open(tmp_path / "ev.jsonl", encoding="utf-8") if l.strip()]
+    assert any(e.get("type") == "variance_circuit_break" for e in evs), evs
+
+
+def test_circuit_break_does_not_trip_on_intermittent_failures(tmp_path, monkeypatch):
+    # fails are NOT consecutive (fail, ok, fail, ok…) -> breaker never trips, runs full.
+    real_client = httpx.Client
+    monkeypatch.setenv("K", "sk-throwaway-test")
+    state = {"i": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        state["i"] += 1
+        if state["i"] % 2 == 0:  # every other call fails — never 4 in a row
+            return httpx.Response(429, json={"type": "error", "error": {"type": "rate_limit_error"}})
+        return _anthropic_response("42")
+
+    monkeypatch.setattr(E.httpx, "Client",
+                        lambda *a, **k: real_client(transport=httpx.MockTransport(handler)))
+    reps = E._run_variance_probe(
+        ANCHOR, _model(), live=True, events_file=tmp_path / "ev2.jsonl",
+        repeats=12, request_delay=0.0, retries=1, retry_backoff=0.0,
+        max_tokens=64, timeout=30.0,
+    )
+    assert len(reps) == 12, reps  # ran the full set, no early abort
+
