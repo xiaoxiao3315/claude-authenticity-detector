@@ -116,4 +116,32 @@ body {
 /* 入场动画兜底：默认可见（anime 失败也不空白） */
 .reveal { opacity: 1; }
 
+/* 进度条 */
+.loading-meter { height: 5px; width: 200px; max-width: 60%; margin: 14px auto 0; background: var(--bg-1); border-radius: 3px; overflow: hidden; }
+.loading-bar { height: 100%; width: 0; background: linear-gradient(90deg, var(--signal), var(--violet)); border-radius: 3px; transition: width 0.4s var(--ease); }
+
+/* 分级证据卡片 */
+.evidence-groups { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+.evidence-group { border-radius: var(--radius-sm); border: 1px solid var(--line); overflow: hidden; }
+.evidence-title { font-size: 12.5px; font-weight: 700; padding: 8px 13px; }
+.g-strong { border-color: rgba(217,65,95,0.3); }
+.g-strong .evidence-title { background: rgba(217,65,95,0.1); color: var(--bad); }
+.g-corro .evidence-title { background: rgba(14,155,181,0.1); color: var(--signal-deep); }
+.g-adv .evidence-title { background: rgba(133,144,168,0.12); color: var(--ink-mute); }
+.g-err { border-color: rgba(217,138,22,0.4); }
+.g-err .evidence-title { background: rgba(217,138,22,0.12); color: var(--warn); }
+.evidence-row { padding: 8px 13px; font-size: 12px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 3px; }
+.evidence-row:first-of-type { border-top: none; }
+.ev-check { font-family: var(--mono); font-weight: 600; color: var(--ink); }
+.ev-cmp { color: var(--ink-mute); font-size: 11.5px; }
+.ev-cmp code { font-family: var(--mono); color: var(--ink-soft); background: rgba(255,255,255,0.5); padding: 1px 5px; border-radius: 4px; }
+.evidence-none { color: var(--ink-mute); font-size: 12.5px; text-align: center; padding: 20px 0; }
+
+/* 折叠的文本报告（次要） */
+.report-fold { margin-top: 6px; }
+.report-fold summary { cursor: pointer; font-size: 12.5px; color: var(--ink-mute); padding: 6px 0; user-select: none; }
+.report-fold summary:hover { color: var(--signal); }
+.report-fold .report-text { margin-top: 8px; }
+
+
 

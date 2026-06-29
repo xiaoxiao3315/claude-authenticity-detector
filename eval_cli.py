@@ -1811,14 +1811,23 @@ def _run_capability_items(
     items: list[dict[str, Any]], model: ModelConfig, *,
     live: bool, events_file: Path, request_delay: float, retries: int,
     retry_backoff: float, max_tokens: int, timeout: float,
+    progress: Any = None,
 ) -> list[dict[str, Any]]:
-    """Send each capability item to the model and grade it deterministically."""
+    """Send each capability item to the model and grade it deterministically.
+
+    `progress`, when given, is called with a dict per item so a caller (the web
+    SSE endpoint) can stream live progress. None = no-op (CLI path unchanged).
+    """
     results: list[dict[str, Any]] = []
     client_timeout = httpx.Timeout(float(timeout or 120.0))
+    total = len(items)
     with httpx.Client(timeout=client_timeout, follow_redirects=True) as client:
         for i, item in enumerate(items):
             if live and request_delay and i > 0:
                 time.sleep(request_delay)
+            if progress is not None:
+                progress({"stage": "capability", "done": i, "total": total,
+                          "label": f"能力探针 {i + 1}/{total}"})
             completion = call_model_with_retries(
                 client=client, model=model,
                 messages=[{"role": "user", "content": str(item.get("prompt") or "")}],
@@ -1832,6 +1841,9 @@ def _run_capability_items(
             graded = score_capability_item(item, completion.text)
             results.append({"id": item.get("id"), "passed": graded["passed"], "ok": True,
                             "detail": graded["detail"]})
+    if progress is not None:
+        progress({"stage": "capability", "done": total, "total": total,
+                  "label": f"能力探针完成 {total}/{total}"})
     return results
 
 
@@ -1912,6 +1924,7 @@ def verify_core(
     with_capability: bool = False,
     capability_items: Path | None = None,
     providers_path: Path | None = None,
+    progress: Any = None,
 ) -> dict[str, Any]:
     """Pure verification core, no argparse/print/stdout — returns the verdict dict.
 
@@ -1924,9 +1937,17 @@ def verify_core(
     Namespace and re-read the providers file, so they need `providers_path` +
     `role`; the web path keeps them off (only tokenizer + capability), so those
     args may be None there.
+
+    `progress`, when given, is called with a dict at each stage so the web SSE
+    endpoint can stream live progress. None = no-op (CLI path unchanged).
     """
+    def _emit(ev: dict[str, Any]) -> None:
+        if progress is not None:
+            progress(ev)
+
     out_dir = baselines_dir / "_verify" / role
     events_file = out_dir / "verify_events.jsonl"
+    _emit({"stage": "sampling", "label": "采集协议指纹（stop_reason / usage / 头）…"})
     samples = _collect_baseline_samples(
         model, samples_per_probe=max(1, int(samples_per_probe or 5)),
         live=live, events_file=events_file,
@@ -1940,6 +1961,7 @@ def verify_core(
          "base_url_host": base_url_host(model.base_url), "model": model.model, "protocol": model.protocol},
         baseline_id=f"verify_{role}", live=live,
     )
+    _emit({"stage": "protocol_done", "label": "协议指纹采集完成"})
 
     # gather behavior signals (the hard-to-fake layer) when live
     behavior: dict[str, Any] = {}
@@ -2052,6 +2074,7 @@ def verify_core(
                     retries=int(retries or 1),
                     retry_backoff=float(retry_backoff or 0.5),
                     max_tokens=256, timeout=120.0,
+                    progress=progress,
                 )
                 cap_agg = aggregate_capability(cap_results)
                 cap_score = score_capability_vs_baseline(
@@ -2063,6 +2086,7 @@ def verify_core(
             except Exception as exc:
                 behavior["capability"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
 
+    _emit({"stage": "judging", "label": "综合判定中…"})
     return compare_to_baseline(observed, baseline, behavior_signals=behavior or None)
 
 

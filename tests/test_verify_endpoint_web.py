@@ -121,3 +121,29 @@ def test_request_delay_floored(monkeypatch):
     assert captured["with_needle"] is False
     assert captured["with_error_envelope"] is False
     assert captured["with_sse"] is False
+
+
+def test_live_streams_sse_progress(live_server, monkeypatch):
+    # live path returns text/event-stream with per-probe progress + a result event.
+    # Stub run_web_verify so no network call happens.
+    def fake(payload, *, live, progress=None):
+        if progress:
+            for i in range(1, 4):
+                progress({"stage": "capability", "done": i, "total": 3, "label": f"能力探针 {i}/3"})
+        return {"live": True, "baseline_id": "X",
+                "verdict": {"verdict": "matches_official", "confidence": 0.9, "evidence_chain": []},
+                "report_text": "报告", "note": None}
+
+    monkeypatch.setattr(S, "run_web_verify", fake)
+    req = urllib.request.Request(f"{live_server}/api/authenticity/verify",
+                                 data=json.dumps({**SUSPECT, "live": True, "risk_ack": True, "api_key": "sk-x"}).encode(),
+                                 headers={"content-type": "application/json"}, method="POST")
+    resp = urllib.request.urlopen(req, timeout=10)
+    assert "text/event-stream" in resp.headers.get("content-type", "")
+    raw = resp.read().decode("utf-8")
+    events = [c for c in raw.split("\n\n") if c.strip()]
+    kinds = [next((l[7:].strip() for l in e.split("\n") if l.startswith("event:")), None) for e in events]
+    assert kinds.count("progress") == 3
+    assert kinds[-1] == "result"
+    assert "matches_official" in raw
+

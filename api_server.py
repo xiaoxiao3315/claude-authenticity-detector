@@ -543,7 +543,7 @@ WEB_VERIFY_KEY_ENV = "WEB_VERIFY_API_KEY"
 DEFAULT_BASELINE_ID = "OFFICIAL-CLAUDE-OPUS46"
 
 
-def run_web_verify(payload: dict, *, live: bool) -> dict:
+def run_web_verify(payload: dict, *, live: bool, progress=None) -> dict:
     """Run an authenticity verify from a web request and return a verdict dict.
 
     Key handling (R-001 iron rule): the suspect key is placed in os.environ only
@@ -589,12 +589,12 @@ def run_web_verify(payload: dict, *, live: bool) -> dict:
     )
     return _invoke_verify_core(model, baseline, baseline_id, baselines_dir,
                               live=live, api_key=api_key, req_delay=req_delay,
-                              with_capability=with_capability)
+                              with_capability=with_capability, progress=progress)
 
 
 def _invoke_verify_core(model, baseline, baseline_id, baselines_dir, *,
                         live: bool, api_key: str, req_delay: float,
-                        with_capability: bool) -> dict:
+                        with_capability: bool, progress=None) -> dict:
     """Bind the key into os.environ for the call only, run verify_core, clean up."""
     prior = os.environ.get(WEB_VERIFY_KEY_ENV)
     if live and api_key:
@@ -615,6 +615,7 @@ def _invoke_verify_core(model, baseline, baseline_id, baselines_dir, *,
             with_needle=False,         # R-001: huge request, most dangerous
             with_capability=with_capability,
             providers_path=None,
+            progress=progress,
         )
     finally:
         # never leave the key in the environment
@@ -962,8 +963,13 @@ class Handler(BaseHTTPRequestHandler):
                 "live 真伪检测未启用。请以 `python api_server.py --enable-live-verify` 重启后再试（dry-run 无需此开关）。",
             )
             return
+        if live:
+            # live runs many requests over >=2s gaps (tens of seconds). Stream
+            # per-probe progress via SSE so the page isn't a blank spinner.
+            self._stream_verify(payload)
+            return
         try:
-            result = run_web_verify(payload, live=live)
+            result = run_web_verify(payload, live=False)
             self.send_json(result)
         except ValueError as exc:
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
@@ -971,6 +977,49 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
         except Exception:
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error during verify")
+
+    def _stream_verify(self, payload: dict) -> None:
+        """Run a live verify in a worker thread, stream SSE progress + final result.
+
+        Each progress dict from verify_core is sent as an SSE `event: progress`;
+        the final verdict as `event: result`; any error as `event: error`. The
+        client reads the POST response body as a stream (not EventSource, so the
+        key still travels in the POST body, never a query string)."""
+        import queue, threading
+        q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+
+        def _worker() -> None:
+            try:
+                result = run_web_verify(payload, live=True,
+                                        progress=lambda ev: q.put(("progress", ev)))
+                q.put(("result", result))
+            except ValueError as exc:
+                q.put(("error", {"error": str(exc)}))
+            except FileNotFoundError as exc:
+                q.put(("error", {"error": str(exc)}))
+            except Exception:
+                q.put(("error", {"error": "internal server error during verify"}))
+            finally:
+                q.put(("__done__", {}))
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("content-type", "text/event-stream; charset=utf-8")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("x-accel-buffering", "no")
+        self.end_headers()
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        while True:
+            kind, data = q.get()
+            if kind == "__done__":
+                break
+            try:
+                payload_json = json.dumps(redact_value(data), ensure_ascii=False)
+                self.wfile.write(f"event: {kind}\ndata: {payload_json}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionError):
+                break  # client disconnected; worker is daemon, will end
+        worker.join(timeout=1)
 
 
     def handle_campaign_get(self, path: str) -> None:

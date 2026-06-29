@@ -108,11 +108,16 @@
           </div>
         </div>
         <div class="conf-meter"><div class="conf-fill" id="confFill"></div></div>
-        <pre class="report-text" id="reportText"></pre>
+        <div class="evidence-groups" id="evidenceGroups"></div>
+        <details class="report-fold">
+          <summary>查看完整文本报告</summary>
+          <pre class="report-text" id="reportText"></pre>
+        </details>
       </div>
       <div class="result-loading" id="resultLoading" hidden>
         <span class="spinner"></span>
         <p id="loadingText">检测中…</p>
+        <div class="loading-meter"><div class="loading-bar" id="loadingBar"></div></div>
       </div>
     </section>
   </main>
