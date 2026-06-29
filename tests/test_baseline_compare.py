@@ -40,7 +40,8 @@ def test_capability_confident_downgrade():
 
 
 def test_capability_midband_is_borderline_review():
-    r = B.score_capability_vs_baseline(0.80, 0.95, answered_count=12)  # gap 0.15
+    # thresholds calibrated 2026-06-29: downgrade 0.15, review 0.06. gap 0.10 = midband
+    r = B.score_capability_vs_baseline(0.85, 0.95, answered_count=12)  # gap 0.10
     assert r["score"] == 5.0 and r["borderline"] is True
 
 

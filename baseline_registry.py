@@ -884,8 +884,8 @@ def score_capability_vs_baseline(
     *,
     answered_count: int = 0,
     min_items: int = 5,
-    downgrade_margin: float = 0.25,
-    review_margin: float = 0.12,
+    downgrade_margin: float = 0.15,
+    review_margin: float = 0.06,
     confident_items: int = 10,
 ) -> dict[str, Any]:
     """Compare an observed capability pass-rate against the baseline's.
@@ -894,17 +894,21 @@ def score_capability_vs_baseline(
     (opus -> haiku) solves far fewer hard anchors while protocol/tokenizer look
     identical — capability is the signal that catches it.
 
-    Threshold rationale (anchors are objectively-graded, single-interpretation,
-    temperature 0, so a same-tier model is near-deterministic at ~1.0):
-      - downgrade_margin 0.25: a real tier drop (opus->haiku on hard anchors)
-        moves pass-rate by far more than sampling noise on ~12 items; 0.25 is
-        a conservative floor that a same-tier jitter won't cross.
-      - review_margin 0.12: gaps in [0.12, 0.25) are suspicious but within the
-        range a small-N estimate could produce by noise -> REVIEW, not convict.
-      - confident_items 10: a hard downgrade conviction (score 0) needs enough
-        answered anchors to trust the point estimate. With min_items..confident_items
-        answered, even a >=downgrade_margin gap is only a borderline REVIEW (the
-        estimate is too noisy to convict on its own).
+    Threshold rationale — CALIBRATED 2026-06-29 against REAL opus-4-6 vs
+    haiku-4-5 on drhknode (see baselines/_CALIB/capability_threshold_calibration.json).
+    Key finding: the two tiers are CLOSE on objective single-answer anchors —
+    measured gap was only 0.045 (v1 anchors) to 0.14 (hard anchors, bad items
+    removed). The original 0.25 margin would NEVER have fired on a real downgrade.
+      - downgrade_margin 0.15: just above the best-case real opus->haiku gap
+        (0.14) so a genuine tier drop can trip it, but well above same-tier
+        jitter (~0.05). Still NOT a sole conviction — capability is one signal.
+      - review_margin 0.06: just above measured same-tier noise (~0.05); gaps in
+        [0.06, 0.15) are suspicious-but-noisy -> REVIEW, not convict.
+      - confident_items 10: a downgrade conviction (score 0) needs enough answered
+        anchors to trust the estimate; below that, even a big gap is borderline.
+      - CAVEAT: capability is a WEAK discriminator for opus-vs-haiku on this task
+        type. The variance (low-frequency-swap) + protocol/tokenizer signals are
+        stronger; do not over-weight a capability miss.
 
     Returns a graded result feeding compare_to_baseline's behavior layer:
       score 10  = at/near baseline (match vote)
@@ -1006,6 +1010,58 @@ def score_consistency_variance(
                 "detail": f"{why}; review (corroborating, not a stand-alone conviction)"}
     return {**base, "score": 10.0,
             "detail": f"{n - failures}/{n} consistent, deterministic; tracks baseline"}
+
+
+def derive_capability_threshold(
+    strong_pass_rate: float,
+    weak_pass_rate: float,
+    *,
+    current_margin: float = 0.25,
+) -> dict[str, Any]:
+    """Calibrate the capability downgrade_margin from REAL strong-vs-weak rates.
+
+    strong = the trusted tier (e.g. official opus); weak = the tier a downgrade
+    would route to (e.g. haiku). The observed gap = strong - weak tells us how
+    much pass-rate actually drops on a real tier downgrade for THIS anchor set.
+
+    Returns the measured gap, a recommended downgrade_margin (the midpoint of the
+    gap — convict only past halfway down to the weak tier, so same-tier jitter
+    near the strong rate never trips it), and a verdict on whether the current
+    threshold is usable:
+      - gap < current_margin  => anchors DON'T separate the tiers; the current
+        margin would NEVER fire (calibration FAILS — need harder anchors).
+      - gap >= current_margin => current margin sits inside the gap and is usable;
+        recommended midpoint may tighten it.
+    """
+    gap = round(strong_pass_rate - weak_pass_rate, 4)
+    recommended = round(gap / 2.0, 4) if gap > 0 else 0.0
+    if gap <= 0:
+        status = "anchors_do_not_separate"
+        usable = False
+        detail = (f"weak tier ({weak_pass_rate}) is NOT below strong ({strong_pass_rate}) "
+                  f"on this anchor set — these anchors cannot detect a downgrade. Need harder anchors.")
+    elif gap < current_margin:
+        status = "current_margin_too_high"
+        usable = False
+        detail = (f"measured gap {gap} < current margin {current_margin}: a real downgrade "
+                  f"moves pass-rate less than the convict threshold, so the rule would NEVER fire. "
+                  f"Either lower margin toward {recommended}, or (better) add harder anchors that widen the gap.")
+    else:
+        status = "usable"
+        usable = True
+        detail = (f"measured gap {gap} >= current margin {current_margin}: the threshold sits inside "
+                  f"the real strong-vs-weak gap and will fire on a genuine downgrade. "
+                  f"Recommended midpoint margin: {recommended}.")
+    return {
+        "strong_pass_rate": strong_pass_rate,
+        "weak_pass_rate": weak_pass_rate,
+        "measured_gap": gap,
+        "current_margin": current_margin,
+        "recommended_margin": recommended,
+        "status": status,
+        "usable": usable,
+        "detail": detail,
+    }
 
 
 def score_needle_recall(canary_code: str | None, response_text: str) -> dict[str, Any]:
@@ -1481,9 +1537,16 @@ def _self_test() -> None:
     # variance score 0 folds into compare_to_baseline as a downgrade conviction
     var_dg = compare_to_baseline(
         build_baseline_from_samples(_fake_official_samples(), source, baseline_id="o", live=True),
-        baseline,
-        behavior_signals={"variance": swap})
+        baseline, behavior_signals={"variance": swap})
     assert var_dg["verdict"] == VERDICT_DOWNGRADE, var_dg
+
+    # 9d. capability threshold calibration from real strong-vs-weak rates.
+    wide = derive_capability_threshold(1.0, 0.6, current_margin=0.25)
+    assert wide["usable"] is True and wide["measured_gap"] == 0.4 and wide["recommended_margin"] == 0.2, wide
+    tiny = derive_capability_threshold(1.0, 0.9545, current_margin=0.25)  # REAL 2026-06-29 result
+    assert tiny["usable"] is False and tiny["status"] == "current_margin_too_high", tiny
+    same = derive_capability_threshold(1.0, 1.0, current_margin=0.25)
+    assert same["usable"] is False and same["status"] == "anchors_do_not_separate", same
 
     # 10. error envelope dialect (top-level type:error is the discriminator,
     #     NOT error.type — both Anthropic & OpenAI use invalid_request_error)
@@ -1570,14 +1633,15 @@ def _self_test() -> None:
     assert agg["failed_request_count"] == 1, agg
 
     # vs-baseline: tracks -> match vote; far below -> downgrade; small-N -> advisory
-    near = score_capability_vs_baseline(0.9, 0.95, answered_count=10)
+    # (thresholds CALIBRATED 2026-06-29: downgrade_margin 0.15, review_margin 0.06)
+    near = score_capability_vs_baseline(0.92, 0.95, answered_count=10)  # gap 0.03 < review
     assert near["score"] == 10.0, near
-    down = score_capability_vs_baseline(0.5, 0.95, answered_count=10)
+    down = score_capability_vs_baseline(0.5, 0.95, answered_count=10)   # gap 0.45 >= downgrade
     assert down["score"] == 0.0 and down["suspected_downgrade"] is True, down
     thin = score_capability_vs_baseline(0.4, 0.95, answered_count=2)
     assert thin["score"] is None and thin.get("advisory") is True, thin
-    # borderline band: a mid-range gap (>=review_margin, <downgrade_margin) -> REVIEW (5.0)
-    border = score_capability_vs_baseline(0.80, 0.95, answered_count=12)  # gap 0.15
+    # borderline band: a mid-range gap (>=review_margin 0.06, <downgrade_margin 0.15) -> REVIEW
+    border = score_capability_vs_baseline(0.85, 0.95, answered_count=12)  # gap 0.10
     assert border["score"] == 5.0 and border.get("borderline") is True, border
     # a large gap but too few answered to convict -> borderline REVIEW, not a hard 0.0
     big_thin = score_capability_vs_baseline(0.5, 0.95, answered_count=6)  # gap 0.45, <confident_items
