@@ -26,6 +26,7 @@ from campaigns import (
 from authenticity import load_or_build_authenticity
 from local_env import load_local_env
 from redaction import redact_text, redact_value
+import eval_cli
 
 
 ROOT = Path(__file__).resolve().parent
@@ -33,6 +34,10 @@ RUNS_DIR = ROOT / "runs"
 CAMPAIGNS_DIR = ROOT / "campaigns"
 REACT_DIST_DIR = ROOT.parent / "llm_eval_result_site" / "dist"
 WEB_DIR = REACT_DIST_DIR if REACT_DIST_DIR.exists() else ROOT / "web"
+# The authenticity verify page lives in the plain web/ dir and is served
+# independently of WEB_DIR, so it works whether or not the React dist is present.
+VERIFY_WEB_DIR = ROOT / "web"
+VERIFY_ASSETS = {"/verify", "/verify.html", "/verify.css", "/verify.js", "/vendor/anime.esm.js"}
 PROVIDERS_LOCAL = ROOT / "configs" / "providers.local.json"
 LOCAL_SECRETS = ROOT / "local_secrets.env"
 ALLOWED_PROTOCOLS = {"openai_chat", "anthropic_messages"}
@@ -528,6 +533,107 @@ def save_config(payload: dict) -> dict:
     return sanitized_config()
 
 
+# Server-side floor on the inter-request delay for web-initiated live probes.
+# R-001: an account was banned by rapid live probing. The web path NEVER lets a
+# caller probe faster than this, regardless of what the body asks for.
+WEB_VERIFY_MIN_DELAY = 2.0
+# Ephemeral env var name the supplied key is bound to only for the duration of a
+# single verify call. Popped in a finally — never persisted to disk.
+WEB_VERIFY_KEY_ENV = "WEB_VERIFY_API_KEY"
+DEFAULT_BASELINE_ID = "OFFICIAL-CLAUDE-OPUS46"
+
+
+def run_web_verify(payload: dict, *, live: bool) -> dict:
+    """Run an authenticity verify from a web request and return a verdict dict.
+
+    Key handling (R-001 iron rule): the suspect key is placed in os.environ only
+    for the call and popped in a finally. It is NEVER written to
+    providers.local.json or local_secrets.env. The web path also disables the
+    dangerous probes (needle fake-1M, malformed error-envelope) and floors the
+    request delay — see WEB_VERIFY_MIN_DELAY.
+    """
+    base_url = str(payload.get("base_url") or "").strip().rstrip("/")
+    model_name = str(payload.get("model") or "").strip()
+    protocol = str(payload.get("protocol") or "anthropic_messages").strip()
+    auth_type = str(payload.get("auth_type") or "x-api-key").strip()
+    baseline_id = str(payload.get("baseline_id") or DEFAULT_BASELINE_ID).strip()
+    api_key = str(payload.get("api_key") or "")
+    with_capability = bool(payload.get("with_capability"))
+    if not base_url or not model_name:
+        raise ValueError("base_url 和 model 是必填项")
+    if protocol not in ALLOWED_PROTOCOLS:
+        raise ValueError(f"protocol 必须是 {', '.join(sorted(ALLOWED_PROTOCOLS))} 之一")
+    if auth_type not in ALLOWED_AUTH_TYPES:
+        raise ValueError(f"auth_type 必须是 {', '.join(sorted(ALLOWED_AUTH_TYPES))} 之一")
+    if live and not api_key:
+        raise ValueError("live 检测需要提供 api_key")
+
+    baselines_dir = eval_cli.resolve_path(eval_cli.DEFAULT_BASELINES_DIR)
+    baseline = eval_cli.load_baseline(baselines_dir, baseline_id)
+    if baseline is None:
+        raise FileNotFoundError(f"找不到基线 {baseline_id}（请先用可信官方源建立基线）")
+
+    # request_delay floored server-side for LIVE only (R-001). dry-run makes no
+    # real requests, so there's nothing to rate-limit — skip the sleeps entirely.
+    req_delay = max(WEB_VERIFY_MIN_DELAY, float(payload.get("request_delay") or 0.0)) if live else 0.0
+
+    model = eval_cli.ModelConfig(
+        provider_id="web_suspect",
+        base_url=base_url,
+        model=model_name,
+        api_key_env=WEB_VERIFY_KEY_ENV,
+        protocol=protocol,
+        auth_type=auth_type,
+        provider_channel="gateway",
+        provider_display_name="web_suspect",
+    )
+    return _invoke_verify_core(model, baseline, baseline_id, baselines_dir,
+                              live=live, api_key=api_key, req_delay=req_delay,
+                              with_capability=with_capability)
+
+
+def _invoke_verify_core(model, baseline, baseline_id, baselines_dir, *,
+                        live: bool, api_key: str, req_delay: float,
+                        with_capability: bool) -> dict:
+    """Bind the key into os.environ for the call only, run verify_core, clean up."""
+    prior = os.environ.get(WEB_VERIFY_KEY_ENV)
+    if live and api_key:
+        os.environ[WEB_VERIFY_KEY_ENV] = api_key
+    try:
+        verdict = eval_cli.verify_core(
+            model, baseline,
+            role="web_suspect",
+            baselines_dir=baselines_dir,
+            baseline_id=baseline_id,
+            live=live,
+            samples_per_probe=5,
+            request_delay=req_delay,
+            retries=1,
+            retry_backoff=2.0,
+            with_sse=False,            # R-001: extra live request, keep web minimal
+            with_error_envelope=False, # R-001: malformed requests look like an attack
+            with_needle=False,         # R-001: huge request, most dangerous
+            with_capability=with_capability,
+            providers_path=None,
+        )
+    finally:
+        # never leave the key in the environment
+        if prior is None:
+            os.environ.pop(WEB_VERIFY_KEY_ENV, None)
+        else:
+            os.environ[WEB_VERIFY_KEY_ENV] = prior
+
+    report_text = eval_cli.render_verdict_report(verdict, baseline=baseline)
+    safe_verdict = redact_value(verdict)
+    return {
+        "live": live,
+        "baseline_id": baseline_id,
+        "verdict": safe_verdict,
+        "report_text": redact_text(report_text, max_chars=4000),
+        "note": None if live else "dry-run：仅验证配置与管线，无真伪判定意义。勾选风险确认并以 --enable-live-verify 启动后可跑真实检测。",
+    }
+
+
 def model_ids_from_payload(data) -> list[str]:
     if isinstance(data, dict):
         raw = data.get("data") or data.get("models") or data.get("items") or []
@@ -801,19 +907,71 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        # Always drain the request body first, BEFORE any early return. Leaving an
+        # unread body on the socket makes the connection state ambiguous: the client's
+        # urllib intermittently sees RemoteDisconnected/ConnectionReset instead of a
+        # clean HTTP response, which surfaced as a flaky 403 test. Read once, up front.
+        length = int(self.headers.get("content-length") or 0)
+        raw = self.rfile.read(length) if length > 0 else b""
+        if parsed.path == "/api/authenticity/verify":
+            self._handle_verify_post(raw)
+            return
         if parsed.path != "/api/config":
             self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
             return
         if not getattr(self.server, "config_write_enabled", False):
             self.send_error_json(HTTPStatus.FORBIDDEN, "config writes are disabled; restart with --enable-config-write to allow this endpoint")
             return
-        length = int(self.headers.get("content-length") or 0)
-        raw = self.rfile.read(length)
         try:
             payload = json.loads(raw.decode("utf-8") or "{}")
             self.send_json(save_config(payload))
         except Exception as exc:
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+
+    def _handle_verify_post(self, raw: bytes) -> None:
+        """POST /api/authenticity/verify — run a Claude-authenticity check.
+
+        Built-in R-001 ban-avoidance gates (a real account was banned by live
+        probing on 2026-06-28):
+          - dry-run by default; live requires BOTH risk_ack=true in the body AND
+            the server started with --enable-live-verify;
+          - request_delay floored to >=2.0s server-side;
+          - the dangerous probes (needle fake-1M, malformed error-envelope) are
+            never exposed on the web path;
+          - the supplied key lives only in os.environ for the call and is popped
+            in a finally — never written to providers.local.json / local_secrets.env.
+        """
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except Exception as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, f"invalid JSON body: {exc}")
+            return
+        if not isinstance(payload, dict):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "body must be a JSON object")
+            return
+        live = bool(payload.get("live"))
+        if live and not bool(payload.get("risk_ack")):
+            self.send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                "live 检测有触发上游风控/封号的风险（参见 R-001）。请先勾选风险确认（risk_ack=true）并使用可弃用的 key。",
+            )
+            return
+        if live and not getattr(self.server, "authenticity_live_enabled", False):
+            self.send_error_json(
+                HTTPStatus.FORBIDDEN,
+                "live 真伪检测未启用。请以 `python api_server.py --enable-live-verify` 重启后再试（dry-run 无需此开关）。",
+            )
+            return
+        try:
+            result = run_web_verify(payload, live=live)
+            self.send_json(result)
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except FileNotFoundError as exc:
+            self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+        except Exception:
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error during verify")
+
 
     def handle_campaign_get(self, path: str) -> None:
         parts = [part for part in path.split("/") if part]
@@ -912,6 +1070,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def serve_static(self, path: str) -> None:
+        # Verify-page assets are served from web/ regardless of WEB_DIR, so the
+        # authenticity page works even when the React dist is the active root.
+        if path in VERIFY_ASSETS:
+            rel = "verify.html" if path == "/verify" else path.lstrip("/")
+            vpath = (VERIFY_WEB_DIR / rel).resolve()
+            if VERIFY_WEB_DIR.resolve() not in vpath.parents:
+                raise ValueError("invalid verify asset path")
+            if not vpath.exists() or not vpath.is_file():
+                raise FileNotFoundError(str(vpath))
+            body = vpath.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("content-type", mimetypes.guess_type(vpath.name)[0] or "application/octet-stream")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path in ("", "/"):
             file_path = WEB_DIR / "index.html"
         else:
@@ -1003,10 +1177,14 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18081)
     parser.add_argument("--enable-config-write", action="store_true", help="enable POST /api/config writes to local provider and secret files")
+    parser.add_argument("--enable-live-verify", action="store_true", help="allow POST /api/authenticity/verify to make REAL live calls (cost + R-001 ban risk); dry-run always works without it")
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.config_write_enabled = bool(args.enable_config_write)  # type: ignore[attr-defined]
+    server.authenticity_live_enabled = bool(args.enable_live_verify)  # type: ignore[attr-defined]
     print(f"serving http://{args.host}:{args.port}")
+    if args.enable_live_verify:
+        print("⚠ live 真伪检测已启用 — 会对填入的网关发起真实请求（消耗额度，有触发风控风险，请用可弃用 key）")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
