@@ -639,6 +639,52 @@ def _invoke_verify_core(model, baseline, baseline_id, baselines_dir, *,
     }
 
 
+def authenticity_meta() -> dict:
+    """Read-only metadata for the verify page: available baselines + the
+    suspect_model config (REDACTED — never the key) so the UI can prefill and
+    offer a baseline dropdown instead of free-text. Pure filesystem reads."""
+    baselines_dir = eval_cli.resolve_path(eval_cli.DEFAULT_BASELINES_DIR)
+    baselines: list[dict] = []
+    if baselines_dir.exists():
+        for d in sorted(baselines_dir.iterdir()):
+            # skip transient/internal dirs (_verify, _CALIB, _judge_calibration…)
+            if not d.is_dir() or d.name.startswith("_"):
+                continue
+            bfile = d / "baseline.json"
+            if not bfile.is_file():
+                continue
+            entry = {"id": d.name, "has_capability": (d / "capability_anchor.json").is_file()}
+            try:
+                doc = read_json(bfile)
+                src = doc.get("source") or {}
+                entry["model"] = src.get("model")
+                entry["host"] = src.get("base_url_host")
+                entry["live"] = doc.get("evidence_status") == "live_observed"
+            except Exception:
+                pass
+            baselines.append(entry)
+    # suspect_model prefill (redacted; key is referenced by env name only)
+    suspect = None
+    if PROVIDERS_LOCAL.exists():
+        try:
+            load_local_env()
+            data = read_json(PROVIDERS_LOCAL)
+            item = data.get("suspect_model")
+            if isinstance(item, dict):
+                suspect = {
+                    "base_url": item.get("base_url"),
+                    "model": item.get("model"),
+                    "protocol": item.get("protocol"),
+                    "auth_type": item.get("auth_type") or "x-api-key",
+                    "api_key_env": item.get("api_key_env"),
+                    "api_key_present": bool(os.environ.get(str(item.get("api_key_env") or ""))),
+                }
+        except Exception:
+            pass
+    return {"baselines": baselines, "suspect_model": suspect,
+            "default_baseline": DEFAULT_BASELINE_ID}
+
+
 def model_ids_from_payload(data) -> list[str]:
     if isinstance(data, dict):
         raw = data.get("data") or data.get("models") or data.get("items") or []
@@ -846,6 +892,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(probe_config_role(role, include_reasoning=include_reasoning))
             elif path == "/api/config":
                 self.send_json(sanitized_config())
+            elif path == "/api/authenticity/meta":
+                self.send_json(authenticity_meta())
             elif path == "/api/leaderboard":
                 qs = parse_qs(parsed.query)
                 raw_limit = (qs.get("limit") or ["50"])[0]

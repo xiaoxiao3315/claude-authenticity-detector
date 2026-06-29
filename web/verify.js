@@ -10,6 +10,107 @@ riskAck.addEventListener("change", () => {
   liveBtn.disabled = !riskAck.checked;
 });
 
+// ---------- 表单状态持久化（localStorage，绝不存 api_key）----------
+const PERSIST_KEY = "verify_form_v1";
+const PERSIST_FIELDS = ["baseUrl", "model", "protocol", "authType", "baselineId"];
+
+function saveForm() {
+  const state = {};
+  for (const id of PERSIST_FIELDS) state[id] = $(id).value;
+  state.withCapability = $("withCapability").checked;
+  state.withVariance = $("withVariance").checked;
+  try { localStorage.setItem(PERSIST_KEY, JSON.stringify(state)); } catch (e) {}
+}
+
+function restoreForm() {
+  let state;
+  try { state = JSON.parse(localStorage.getItem(PERSIST_KEY) || "{}"); } catch (e) { return; }
+  for (const id of PERSIST_FIELDS) {
+    if (state[id] != null && $(id)) $(id).value = state[id];
+  }
+  if (state.withCapability) $("withCapability").checked = true;
+  if (state.withVariance) $("withVariance").checked = true;
+}
+
+// ---------- 加载本地元数据：基线下拉 + 配置预填 ----------
+let META = null;
+async function loadMeta() {
+  try {
+    const resp = await fetch("/api/authenticity/meta");
+    if (!resp.ok) return;
+    META = await resp.json();
+  } catch (e) { return; }
+  // 填基线下拉
+  const sel = $("baselineId");
+  if (sel && META.baselines && META.baselines.length) {
+    sel.innerHTML = "";
+    for (const b of META.baselines) {
+      const opt = document.createElement("option");
+      opt.value = b.id;
+      const tags = [b.model, b.has_capability ? "含能力基准" : null, b.live ? null : "非live"]
+        .filter(Boolean).join(" · ");
+      opt.textContent = tags ? `${b.id}（${tags}）` : b.id;
+      sel.appendChild(opt);
+    }
+    if (META.default_baseline) sel.value = META.default_baseline;
+  } else if (sel) {
+    // no baselines on disk — keep a usable default + warn
+    const opt = document.createElement("option");
+    opt.value = META && META.default_baseline ? META.default_baseline : "OFFICIAL-CLAUDE-OPUS46";
+    opt.textContent = opt.value + "（本地未找到基线，需先建立）";
+    sel.appendChild(opt);
+  }
+  restoreForm();  // restore AFTER options exist so the saved baseline can be selected
+  checkCombo();
+}
+
+function prefillSuspect() {
+  const s = META && META.suspect_model;
+  if (!s) { alert("本地配置里没有 suspect_model，可在 configs/providers.local.json 配置"); return; }
+  if (s.base_url) $("baseUrl").value = s.base_url;
+  if (s.model) $("model").value = s.model;
+  if (s.protocol) $("protocol").value = s.protocol;
+  if (s.auth_type) $("authType").value = s.auth_type;
+  const kh = $("keyHint");
+  if (kh) {
+    kh.hidden = false;
+    kh.textContent = s.api_key_present
+      ? `配置里 ${s.api_key_env} 已设置（live 时服务端会用它，无需在此粘贴）`
+      : `配置里 ${s.api_key_env} 未设置（live 需在此粘贴可弃用 key）`;
+  }
+  saveForm(); checkCombo();
+}
+$("prefillBtn").addEventListener("click", prefillSuspect);
+loadMeta();
+
+// save form on any change (api_key intentionally NOT persisted)
+for (const id of [...PERSIST_FIELDS, "withCapability", "withVariance"]) {
+  const el = $(id);
+  if (el) el.addEventListener("change", saveForm);
+}
+
+
+// ---------- 协议/认证组合即时校验（填反在 live 才报错太晚）----------
+function checkCombo() {
+  const proto = $("protocol").value;
+  const auth = $("authType").value;
+  const hint = $("comboHint");
+  if (!hint) return true;
+  // anthropic_messages 惯例配 x-api-key；openai_chat 惯例配 bearer
+  let msg = "";
+  if (proto === "anthropic_messages" && auth !== "x-api-key") {
+    msg = "提示：anthropic_messages 协议通常配 x-api-key 认证";
+  } else if (proto === "openai_chat" && auth !== "bearer") {
+    msg = "提示：openai_chat 协议通常配 bearer 认证";
+  }
+  hint.textContent = msg;
+  hint.hidden = !msg;
+  return true; // 只提示不阻断（网关可能就是非常规组合）
+}
+$("protocol").addEventListener("change", checkCombo);
+$("authType").addEventListener("change", checkCombo);
+checkCombo();
+
 function collectPayload(live) {
   return {
     base_url: $("baseUrl").value.trim(),
@@ -107,8 +208,20 @@ function group(title, rows, cls) {
     if (r.text) {
       row.textContent = "✗ " + r.text;
     } else {
-      row.innerHTML = `<span class="ev-check">${r.label}</span>` +
-        `<span class="ev-cmp">基线 <code>${r.base}</code> → 实测 <code>${r.obs}</code>${r.extra ? " · " + r.extra : ""}</span>`;
+      // Build with textContent, NOT innerHTML: e.observed can echo a user-supplied
+      // model name (the model_id check), so string-interpolating it into innerHTML
+      // would be an XSS hole. Construct nodes and set text instead.
+      const chk = document.createElement("span");
+      chk.className = "ev-check";
+      chk.textContent = r.label;
+      const cmp = document.createElement("span");
+      cmp.className = "ev-cmp";
+      cmp.append("基线 ");
+      const b = document.createElement("code"); b.textContent = r.base; cmp.append(b);
+      cmp.append(" → 实测 ");
+      const o = document.createElement("code"); o.textContent = r.obs; cmp.append(o);
+      if (r.extra) cmp.append(" · " + r.extra);
+      row.append(chk, cmp);
     }
     box.appendChild(row);
   }
@@ -124,6 +237,7 @@ async function runVerify(live) {
   }
   showState("loading");
   setProgress(live ? "准备中…" : "dry-run 验证中…", null);
+  if (live) startTimer();
   dryRunBtn.disabled = true;
   liveBtn.disabled = true;
   try {
@@ -143,6 +257,7 @@ async function runVerify(live) {
   } catch (err) {
     renderError(0, { error: "请求失败：" + err });
   } finally {
+    stopTimer();
     dryRunBtn.disabled = false;
     liveBtn.disabled = !riskAck.checked;
   }
@@ -152,6 +267,23 @@ function setProgress(label, frac) {
   $("loadingText").textContent = label;
   const bar = $("loadingBar");
   if (bar) bar.style.width = frac == null ? "" : Math.round(frac * 100) + "%";
+}
+
+// elapsed-time ticker during a live run (so a multi-second probe isn't a guess)
+let _timerId = null, _t0 = 0;
+function startTimer() {
+  _t0 = Date.now();
+  const el = $("loadingTimer");
+  if (!el) return;
+  const tick = () => {
+    const s = Math.round((Date.now() - _t0) / 1000);
+    el.textContent = `已用 ${s}s`;
+  };
+  tick();
+  _timerId = setInterval(tick, 1000);
+}
+function stopTimer() {
+  if (_timerId) { clearInterval(_timerId); _timerId = null; }
 }
 
 function renderError(status, data) {
@@ -204,6 +336,8 @@ function parseSSE(chunk) {
 
 dryRunBtn.addEventListener("click", () => runVerify(false));
 liveBtn.addEventListener("click", () => runVerify(true));
+// Enter in the form submits the SAFE path (dry-run), never an accidental live call.
+$("verifyForm").addEventListener("submit", (e) => { e.preventDefault(); runVerify(false); });
 
 // ---------- anime.js 开场序列（失败则静态，绝不空白） ----------
 (async () => {

@@ -78,6 +78,17 @@ def _post(base, body):
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def test_meta_lists_baselines(dry_server):
+    # GET /api/authenticity/meta should list the tmp baseline the fixture built,
+    # and never leak a key value.
+    with urllib.request.urlopen(f"{dry_server}/api/authenticity/meta", timeout=10) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    ids = [b["id"] for b in body["baselines"]]
+    assert BASELINE in ids, ids
+    assert body["default_baseline"] == BASELINE
+    assert "sk-" not in json.dumps(body, ensure_ascii=False)  # no key value leaks
+
+
 # baseline_id that ships with the repo (live_observed, real official opus-4-6).
 BASELINE = "OFFICIAL-CLAUDE-OPUS46"
 SUSPECT = {"base_url": "https://gw.example.com", "model": "claude-opus-4-6",

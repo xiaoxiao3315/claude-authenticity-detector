@@ -60,14 +60,17 @@
             </select>
           </label>
         </div>
+        <p class="combo-hint" id="comboHint" hidden></p>
         <label class="field">
           <span class="field-label">基线 baseline_id</span>
-          <input type="text" id="baselineId" value="OFFICIAL-CLAUDE-OPUS46" />
+          <select id="baselineId"></select>
         </label>
         <label class="field">
           <span class="field-label">API Key<span class="opt">live 检测才需要</span></span>
           <input type="password" id="apiKey" placeholder="用可弃用的 key，绝不存盘" autocomplete="off" />
+          <span class="key-hint" id="keyHint" hidden></span>
         </label>
+        <button type="button" class="prefill-btn" id="prefillBtn">↪ 从本地配置带入 suspect_model</button>
         <label class="check-cap">
           <input type="checkbox" id="withCapability" />
           <span>含能力探针（检测偷偷降级，需基线已建能力基准）</span>
@@ -122,6 +125,7 @@
         <span class="spinner"></span>
         <p id="loadingText">检测中…</p>
         <div class="loading-meter"><div class="loading-bar" id="loadingBar"></div></div>
+        <p class="loading-timer" id="loadingTimer"></p>
       </div>
     </section>
   </main>
