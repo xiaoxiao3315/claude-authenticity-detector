@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude 真伪检测</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./verify.css" />
+  <script type="importmap">
+  { "imports": { "animejs": "./vendor/anime.esm.js" } }
+  </script>
+</head>
+<body>
+  <!-- 氛围极光背景 -->
+  <div class="ambient" aria-hidden="true">
+    <span class="ambient-aurora a1"></span>
+    <span class="ambient-aurora a2"></span>
+    <span class="ambient-aurora a3"></span>
+  </div>
+
+  <header class="topbar reveal">
+    <div class="brand">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <span class="brand-name">Claude 真伪检测</span>
+      <span class="brand-sub">AUTHENTICITY</span>
+    </div>
+    <a class="topbar-link" href="./index.html">← 控制台</a>
+  </header>
+
+  <main class="wrap">
+    <!-- 左：检测表单 -->
+    <section class="glass card form-card reveal" aria-label="检测配置">
+      <h2 class="card-title">检测一个网关是否真·官方 Claude</h2>
+      <p class="card-sub">填入要检测的网关，对比可信官方基线，判定：真官方 / 疑似降级 / 疑似套壳 / 证据不足。</p>
+
+      <form id="verifyForm" autocomplete="off">
+        <label class="field">
+          <span class="field-label">网关地址 base_url</span>
+          <input type="text" id="baseUrl" placeholder="https://your-gateway.com" required />
+        </label>
+        <label class="field">
+          <span class="field-label">模型 model</span>
+          <input type="text" id="model" placeholder="claude-opus-4-6" required />
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span class="field-label">协议 protocol</span>
+            <select id="protocol">
+              <option value="anthropic_messages">anthropic_messages</option>
+              <option value="openai_chat">openai_chat</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">认证 auth_type</span>
+            <select id="authType">
+              <option value="x-api-key">x-api-key</option>
+              <option value="bearer">bearer</option>
+            </select>
+          </label>
+        </div>
+        <label class="field">
+          <span class="field-label">基线 baseline_id</span>
+          <input type="text" id="baselineId" value="OFFICIAL-CLAUDE-OPUS46" />
+        </label>
+        <label class="field">
+          <span class="field-label">API Key<span class="opt">live 检测才需要</span></span>
+          <input type="password" id="apiKey" placeholder="用可弃用的 key，绝不存盘" autocomplete="off" />
+        </label>
+        <label class="check-cap">
+          <input type="checkbox" id="withCapability" />
+          <span>含能力探针（检测偷偷降级，需基线已建能力基准）</span>
+        </label>
+
+        <!-- 风险确认框 -->
+        <div class="risk-box" id="riskBox">
+          <div class="risk-head">⚠ live 检测有封号风险（R-001 实发）</div>
+          <p class="risk-text">
+            live 会用你的 key 对网关发起真实探针请求。2026-06-28 曾因此把一个 Claude 账户跑封。
+            请务必使用<strong>可弃用的 key</strong>、非主力账户。请求间隔已强制 ≥2 秒、不跑大请求探针。
+          </p>
+          <label class="risk-ack">
+            <input type="checkbox" id="riskAck" />
+            <span>我已知风险，使用的是可弃用 key</span>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button type="button" class="btn btn-ghost" id="dryRunBtn">dry-run 验证配置</button>
+          <button type="button" class="btn btn-live" id="liveBtn" disabled>live 真实检测</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- 右：结果 -->
+    <section class="glass card result-card reveal" id="resultCard" aria-label="检测结果">
+      <div class="result-empty" id="resultEmpty">
+        <span class="result-empty-icon">🔍</span>
+        <p>填好左侧配置，先跑 dry-run 验证，再做 live 检测。</p>
+      </div>
+      <div class="result-body" id="resultBody" hidden>
+        <div class="verdict-banner" id="verdictBanner">
+          <span class="verdict-icon" id="verdictIcon">❔</span>
+          <div>
+            <div class="verdict-title" id="verdictTitle">证据不足</div>
+            <div class="verdict-conf" id="verdictConf">置信度 —</div>
+          </div>
+        </div>
+        <div class="conf-meter"><div class="conf-fill" id="confFill"></div></div>
+        <pre class="report-text" id="reportText"></pre>
+      </div>
+      <div class="result-loading" id="resultLoading" hidden>
+        <span class="spinner"></span>
+        <p id="loadingText">检测中…</p>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="./verify.js"></script>
+</body>
+</html>

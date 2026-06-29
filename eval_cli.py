@@ -1893,33 +1893,46 @@ def capability_probe(args: argparse.Namespace) -> int:
     return 0
 
 
-def verify_endpoint(args: argparse.Namespace) -> int:
-    """One-shot: compare a suspect provider against a trusted baseline, print a report.
+def verify_core(
+    model: ModelConfig,
+    baseline: dict[str, Any],
+    *,
+    role: str,
+    baselines_dir: Path,
+    baseline_id: str,
+    live: bool,
+    samples_per_probe: int = 5,
+    request_delay: float = 0.0,
+    retries: int = 1,
+    retry_backoff: float = 0.5,
+    with_sse: bool = False,
+    with_error_envelope: bool = False,
+    with_needle: bool = False,
+    needle_tokens: int = 120000,
+    with_capability: bool = False,
+    capability_items: Path | None = None,
+    providers_path: Path | None = None,
+) -> dict[str, Any]:
+    """Pure verification core, no argparse/print/stdout — returns the verdict dict.
 
-    Loads the named baseline, collects the suspect's fingerprint, renders a
-    human-readable verdict. --live actually probes the suspect (cost).
+    Shared by the CLI (`verify_endpoint`) and the web endpoint
+    (`api_server.run_web_verify`) so both paths run identical detection logic.
+    Collects the suspect's fingerprint, folds in behavior signals when `live`,
+    and returns `compare_to_baseline(...)`.
+
+    The SSE / error-envelope / needle sub-probes reconstruct an argparse
+    Namespace and re-read the providers file, so they need `providers_path` +
+    `role`; the web path keeps them off (only tokenizer + capability), so those
+    args may be None there.
     """
-    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
-    baseline = load_baseline(baselines_dir, args.baseline_id)
-    if baseline is None:
-        raise ValueError(f"baseline not found: {args.baseline_id} (build one first with `baseline --live`)")
-    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
-    role = str(args.provider or "tested_model")
-    live = bool(getattr(args, "live", False))
-    if live:
-        load_local_env()
-    models = apply_model_overrides(load_two_model_config(models_path), args)
-    if role not in models:
-        raise ValueError(f"--provider '{role}' not found in providers config (available: {', '.join(sorted(models))})")
-    model = models[role]
     out_dir = baselines_dir / "_verify" / role
     events_file = out_dir / "verify_events.jsonl"
     samples = _collect_baseline_samples(
-        model, samples_per_probe=max(1, int(getattr(args, "samples", 3) or 3)),
+        model, samples_per_probe=max(1, int(samples_per_probe or 5)),
         live=live, events_file=events_file,
-        request_delay=float(getattr(args, "request_delay", 0.0) or 0.0),
-        retries=int(getattr(args, "retries", 1) or 1),
-        retry_backoff=float(getattr(args, "retry_backoff", 0.5) or 0.5),
+        request_delay=float(request_delay or 0.0),
+        retries=int(retries or 1),
+        retry_backoff=float(retry_backoff or 0.5),
     )
     observed = build_baseline_from_samples(
         samples,
@@ -1972,9 +1985,9 @@ def verify_endpoint(args: argparse.Namespace) -> int:
                 "suspected_tokenizer": None if score in (10.0, None) else "unknown",
             }
         # SSE event-order probe
-        if getattr(args, "with_sse", False):
+        if with_sse:
             try:
-                sse_args = argparse.Namespace(providers=args.providers, provider=role, live=True)
+                sse_args = argparse.Namespace(providers=providers_path, provider=role, live=True)
                 # reuse the classifier by collecting one stream inline
                 import io, contextlib
                 buf = io.StringIO()
@@ -1987,9 +2000,9 @@ def verify_endpoint(args: argparse.Namespace) -> int:
                 # Record it so compare_to_baseline counts it as an incomplete check.
                 behavior["sse"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
         # error-envelope probe (#2): malformed request -> classify error dialect
-        if getattr(args, "with_error_envelope", False):
+        if with_error_envelope:
             try:
-                ee_args = argparse.Namespace(providers=args.providers, provider=role, live=True)
+                ee_args = argparse.Namespace(providers=providers_path, provider=role, live=True)
                 import io, contextlib
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
@@ -2005,12 +2018,12 @@ def verify_endpoint(args: argparse.Namespace) -> int:
             except Exception as exc:
                 behavior["error_envelope"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
         # needle long-context probe (#1): ~120K context, recall + silent-truncation
-        if getattr(args, "with_needle", False):
+        if with_needle:
             try:
-                nd_args = argparse.Namespace(providers=args.providers, provider=role, live=True,
-                                             target_tokens=int(getattr(args, "needle_tokens", 120000) or 120000),
-                                             seed=7, baseline_id=args.baseline_id,
-                                             baselines_dir=getattr(args, "baselines_dir", None), timeout=300.0)
+                nd_args = argparse.Namespace(providers=providers_path, provider=role, live=True,
+                                             target_tokens=int(needle_tokens or 120000),
+                                             seed=7, baseline_id=baseline_id,
+                                             baselines_dir=baselines_dir, timeout=300.0)
                 import io, contextlib
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
@@ -2022,22 +2035,22 @@ def verify_endpoint(args: argparse.Namespace) -> int:
         # capability-anchor probe: the dedicated silent-DOWNGRADE detector.
         # Runs the hard anchors against the suspect, compares pass-rate to the
         # baseline's stored capability_anchor.json (built earlier via capability-probe).
-        if getattr(args, "with_capability", False):
+        if with_capability:
             try:
-                cap_items_path = resolve_path(getattr(args, "capability_items", None)
+                cap_items_path = resolve_path(capability_items
                                               or (ROOT / "judge_golden" / "capability_anchors_v1.json"))
                 cap_items_doc = read_json(cap_items_path)
                 cap_items = _as_list(cap_items_doc.get("items") if isinstance(cap_items_doc, dict) else cap_items_doc)
-                base_cap_path = baselines_dir / str(args.baseline_id).replace("/", "_").replace("\\", "_") / "capability_anchor.json"
+                base_cap_path = baselines_dir / str(baseline_id).replace("/", "_").replace("\\", "_") / "capability_anchor.json"
                 base_rate = None
                 if base_cap_path.exists():
                     base_rate = numeric(read_json(base_cap_path).get("capability_anchor_pass_rate"))
                 cap_results = _run_capability_items(
                     cap_items, model, live=True,
                     events_file=out_dir / "capability_events.jsonl",
-                    request_delay=float(getattr(args, "request_delay", 0.0) or 0.0),
-                    retries=int(getattr(args, "retries", 1) or 1),
-                    retry_backoff=float(getattr(args, "retry_backoff", 0.5) or 0.5),
+                    request_delay=float(request_delay or 0.0),
+                    retries=int(retries or 1),
+                    retry_backoff=float(retry_backoff or 0.5),
                     max_tokens=256, timeout=120.0,
                 )
                 cap_agg = aggregate_capability(cap_results)
@@ -2050,11 +2063,52 @@ def verify_endpoint(args: argparse.Namespace) -> int:
             except Exception as exc:
                 behavior["capability"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
 
-    verdict = compare_to_baseline(observed, baseline, behavior_signals=behavior or None)
+    return compare_to_baseline(observed, baseline, behavior_signals=behavior or None)
+
+
+def verify_endpoint(args: argparse.Namespace) -> int:
+    """One-shot: compare a suspect provider against a trusted baseline, print a report.
+
+    Loads the named baseline, collects the suspect's fingerprint, renders a
+    human-readable verdict. --live actually probes the suspect (cost).
+    Thin wrapper over `verify_core` (the shared, argparse-free detection core).
+    """
+    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+    baseline = load_baseline(baselines_dir, args.baseline_id)
+    if baseline is None:
+        raise ValueError(f"baseline not found: {args.baseline_id} (build one first with `baseline --live`)")
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    role = str(args.provider or "tested_model")
+    live = bool(getattr(args, "live", False))
+    if live:
+        load_local_env()
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    if role not in models:
+        raise ValueError(f"--provider '{role}' not found in providers config (available: {', '.join(sorted(models))})")
+    model = models[role]
+    verdict = verify_core(
+        model, baseline,
+        role=role,
+        baselines_dir=baselines_dir,
+        baseline_id=str(args.baseline_id),
+        live=live,
+        samples_per_probe=int(getattr(args, "samples", 5) or 5),
+        request_delay=float(getattr(args, "request_delay", 0.0) or 0.0),
+        retries=int(getattr(args, "retries", 1) or 1),
+        retry_backoff=float(getattr(args, "retry_backoff", 0.5) or 0.5),
+        with_sse=bool(getattr(args, "with_sse", False)),
+        with_error_envelope=bool(getattr(args, "with_error_envelope", False)),
+        with_needle=bool(getattr(args, "with_needle", False)),
+        needle_tokens=int(getattr(args, "needle_tokens", 120000) or 120000),
+        with_capability=bool(getattr(args, "with_capability", False)),
+        capability_items=getattr(args, "capability_items", None),
+        providers_path=args.providers,
+    )
     print(render_verdict_report(verdict, baseline=baseline))
     if getattr(args, "json", False):
         print(json.dumps(verdict, ensure_ascii=False, indent=2))
     return 0
+
 
 
 # Fake-1M needle probe. The huge prompt is assembled at run time from a seed
