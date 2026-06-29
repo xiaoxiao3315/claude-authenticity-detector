@@ -675,6 +675,29 @@ def compare_to_baseline(
         evidence.append({"check": "capability_anchor", "observed": cap.get("observed"),
                          "result": cap.get("detail"), "advisory": True})
 
+    # consistency-variance: the LOW-FREQUENCY swap detector. One deterministic
+    # anchor repeated N times; statistically-significant failures or answer
+    # non-determinism on a temp-0 anchor => a fraction of requests is being
+    # routed to a weaker model. score 0 convicts downgrade (like capability);
+    # score 5 is a soft REVIEW corroborator.
+    var = sig.get("variance")
+    if not _probe_failed("variance", var):
+      if isinstance(var, dict) and var.get("score") is not None and not var.get("advisory"):
+        behavior_checked += 1
+        if var.get("score") == 0.0:
+            capability_downgrade = True  # treated as a downgrade conviction
+            reasons.append(f"consistency_variance_swap:p={var.get('p_value')},fails={var.get('failures')}/{var.get('answered')}")
+        elif var.get("score") == 5.0:
+            capability_borderline = True
+            reasons.append("consistency_variance_borderline")
+        elif var.get("score") == 10.0:
+            behavior_votes += 1
+        evidence.append({"check": "consistency_variance", "baseline": "deterministic@temp0",
+                         "observed": var.get("observed_pass_rate"), "result": var.get("detail")})
+      elif isinstance(var, dict):
+        evidence.append({"check": "consistency_variance", "observed": var.get("observed_pass_rate"),
+                         "result": var.get("detail"), "advisory": True})
+
     # A borderline capability gap is a soft signal: it lowers confidence and, with
     # one more soft miss, routes to REVIEW — but never convicts downgrade alone.
     if capability_borderline:
@@ -911,6 +934,80 @@ def score_capability_vs_baseline(
             "detail": f"pass-rate {observed_pass_rate} tracks baseline {baseline_pass_rate}"}
 
 
+def _binom_tail_at_least(k: int, n: int, p: float) -> float:
+    """P(X >= k) for X ~ Binomial(n, p). Used to test whether observed failures
+    on a repeated deterministic anchor are too many to be sampling noise."""
+    if n <= 0 or k <= 0:
+        return 1.0
+    if p <= 0.0:
+        return 0.0 if k > 0 else 1.0
+    if p >= 1.0:
+        return 1.0
+    # exact sum of binomial pmf from k..n
+    from math import comb
+    total = 0.0
+    for i in range(k, n + 1):
+        total += comb(n, i) * (p ** i) * ((1.0 - p) ** (n - i))
+    return min(1.0, total)
+
+
+def score_consistency_variance(
+    repeats: list[dict[str, Any]],
+    *,
+    baseline_pass_rate: float = 1.0,
+    min_repeats: int = 8,
+    p_value_convict: float = 0.01,
+    p_value_review: float = 0.10,
+    max_distinct_answers: int = 1,
+) -> dict[str, Any]:
+    """Detect LOW-FREQUENCY swapping by repeating ONE deterministic anchor N times.
+
+    A genuine same-tier model at temperature 0 is near-deterministic: it should
+    pass every repeat and return the same normalized answer each time. If an
+    upstream silently swaps a FRACTION of requests to a weaker model (e.g. 10%
+    routed to haiku), single-shot capability probing misses it — but repeating
+    one hard, single-answer anchor surfaces it as occasional wrong/varying
+    answers. We test the failure count against a binomial null (the model SHOULD
+    pass at `baseline_pass_rate`, ~1.0) and also flag answer non-determinism.
+
+    repeats: [{passed: bool, answer_norm: str|None, ok: bool}]. ok=False
+    (429/transport) is EXCLUDED — a rate-limit is not a wrong answer.
+
+    Returns a graded result for compare_to_baseline's behavior layer:
+      score 0   = statistically-significant failures (p < p_value_convict) -> swap
+      score 5   = borderline (p < p_value_review, or answers vary) -> REVIEW
+      score 10  = consistent, deterministic (tracks baseline)
+      score None = too few answered repeats -> advisory
+    """
+    answered = [r for r in repeats if r.get("ok", True)]
+    n = len(answered)
+    if n < min_repeats:
+        return {"score": None, "advisory": True, "answered": n,
+                "detail": f"only {n} answered repeats (< {min_repeats}); advisory"}
+    failures = sum(1 for r in answered if not r.get("passed"))
+    distinct = {str(r.get("answer_norm")) for r in answered if r.get("answer_norm") is not None}
+    n_distinct = len(distinct)
+    # binomial null: a same-tier model passes at baseline_pass_rate, so failures
+    # follow Binomial(n, 1 - baseline_pass_rate). Too many failures => swap.
+    p_fail_null = max(0.0, min(1.0, 1.0 - baseline_pass_rate))
+    pval = _binom_tail_at_least(failures, n, p_fail_null) if p_fail_null > 0 else (
+        0.0 if failures > 0 else 1.0)
+    observed_pass_rate = round((n - failures) / n, 4)
+    base = {"answered": n, "failures": failures, "p_value": round(pval, 5),
+            "distinct_answers": n_distinct, "observed_pass_rate": observed_pass_rate}
+    if pval < p_value_convict:
+        return {**base, "score": 0.0, "suspected_swap": True,
+                "detail": f"{failures}/{n} repeats failed a deterministic anchor "
+                          f"(p={pval:.4f} < {p_value_convict}); low-frequency swap suspected"}
+    if pval < p_value_review or n_distinct > max_distinct_answers:
+        why = (f"borderline failure rate (p={pval:.4f})" if pval < p_value_review
+               else f"{n_distinct} distinct answers on a temp-0 anchor (expected {max_distinct_answers})")
+        return {**base, "score": 5.0, "borderline": True,
+                "detail": f"{why}; review (corroborating, not a stand-alone conviction)"}
+    return {**base, "score": 10.0,
+            "detail": f"{n - failures}/{n} consistent, deterministic; tracks baseline"}
+
+
 def score_needle_recall(canary_code: str | None, response_text: str) -> dict[str, Any]:
     """Score a needle probe: did the response echo the planted AUTH_CANARY code?"""
     if not canary_code:
@@ -1138,7 +1235,8 @@ def render_verdict_report(verdict: dict[str, Any], *, baseline: dict[str, Any] |
     if chain:
         # #5: group evidence by strength so users see what's definitive vs advisory.
         STRONG = {"stop_reason_enum", "usage_naming_dialect", "model_id",
-                  "sse_event_order", "error_envelope", "needle_fake_1m", "request_failure_rate"}
+                  "sse_event_order", "error_envelope", "needle_fake_1m", "request_failure_rate",
+                  "capability_anchor", "consistency_variance"}
         # crashed-probe rows are shown in the dedicated block above, not here.
         chain = [e for e in chain if not e.get("probe_error")]
         strong = [e for e in chain if e.get("check") in STRONG and not e.get("advisory")]
@@ -1357,6 +1455,35 @@ def _self_test() -> None:
     rep = render_verdict_report(wrapper, baseline=baseline)
     assert "套壳" in rep and "Claude 真伪检测报告" in rep, rep
     assert "真·官方" in render_verdict_report(good, baseline=baseline)
+
+    # 9c. consistency-variance: the low-frequency swap detector.
+    # all-pass deterministic -> match vote (10)
+    allpass = score_consistency_variance([{"passed": True, "answer_norm": "42", "ok": True}] * 12)
+    assert allpass["score"] == 10.0, allpass
+    # a 10%-swap signature: several failures on a should-be-deterministic anchor -> convict
+    swap = score_consistency_variance(
+        [{"passed": True, "answer_norm": "42", "ok": True}] * 12 +
+        [{"passed": False, "answer_norm": "41", "ok": True}] * 4)
+    assert swap["score"] == 0.0 and swap.get("suspected_swap") is True, swap
+    # answer non-determinism on temp-0 (all "passed" but varying answers) -> borderline review
+    vary = score_consistency_variance(
+        [{"passed": True, "answer_norm": "42", "ok": True}] * 10 +
+        [{"passed": True, "answer_norm": "forty-two", "ok": True}] * 2)
+    assert vary["score"] == 5.0 and vary.get("borderline") is True, vary
+    # too few answered (429s excluded) -> advisory
+    thin_v = score_consistency_variance(
+        [{"passed": True, "answer_norm": "42", "ok": True}] * 3 +
+        [{"passed": None, "answer_norm": None, "ok": False}] * 10)
+    assert thin_v["score"] is None and thin_v.get("advisory") is True, thin_v
+    # binomial tail sanity: many failures under a ~0 null prob is highly significant
+    assert _binom_tail_at_least(4, 16, 0.0) == 0.0
+    assert _binom_tail_at_least(0, 16, 0.0) == 1.0
+    # variance score 0 folds into compare_to_baseline as a downgrade conviction
+    var_dg = compare_to_baseline(
+        build_baseline_from_samples(_fake_official_samples(), source, baseline_id="o", live=True),
+        baseline,
+        behavior_signals={"variance": swap})
+    assert var_dg["verdict"] == VERDICT_DOWNGRADE, var_dg
 
     # 10. error envelope dialect (top-level type:error is the discriminator,
     #     NOT error.type — both Anthropic & OpenAI use invalid_request_error)

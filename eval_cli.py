@@ -61,6 +61,7 @@ from baseline_registry import (
     render_verdict_report,
     score_capability_item,
     score_capability_vs_baseline,
+    score_consistency_variance,
     score_needle_recall,
     write_baseline,
     write_baseline_version,
@@ -1847,6 +1848,48 @@ def _run_capability_items(
     return results
 
 
+def _run_variance_probe(
+    item: dict[str, Any], model: ModelConfig, *,
+    live: bool, events_file: Path, repeats: int, request_delay: float,
+    retries: int, retry_backoff: float, max_tokens: int, timeout: float,
+    progress: Any = None,
+) -> list[dict[str, Any]]:
+    """Repeat ONE deterministic anchor `repeats` times at temp=0 to surface
+    low-frequency swapping (a fraction of requests routed to a weaker model shows
+    up as occasional wrong/varying answers). Returns per-repeat
+    [{passed, answer_norm, ok}] for score_consistency_variance.
+
+    `progress`, when given, is called per repeat for live SSE updates.
+    """
+    out: list[dict[str, Any]] = []
+    client_timeout = httpx.Timeout(float(timeout or 120.0))
+    prompt = str(item.get("prompt") or "")
+    with httpx.Client(timeout=client_timeout, follow_redirects=True) as client:
+        for i in range(max(1, repeats)):
+            if live and request_delay and i > 0:
+                time.sleep(request_delay)
+            if progress is not None:
+                progress({"stage": "variance", "done": i, "total": repeats,
+                          "label": f"一致性复检 {i + 1}/{repeats}"})
+            completion = call_model_with_retries(
+                client=client, model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens, temperature=0, live=live,
+                events_file=events_file, retries=retries, retry_backoff=retry_backoff,
+            )
+            if not completion.metrics.ok:
+                out.append({"passed": None, "answer_norm": None, "ok": False})
+                continue
+            graded = score_capability_item(item, completion.text)
+            # normalized answer for determinism check: collapse whitespace + lowercase
+            answer_norm = " ".join((completion.text or "").split()).lower()[:120]
+            out.append({"passed": bool(graded["passed"]), "answer_norm": answer_norm, "ok": True})
+    if progress is not None:
+        progress({"stage": "variance", "done": repeats, "total": repeats,
+                  "label": f"一致性复检完成 {repeats}/{repeats}"})
+    return out
+
+
 def capability_probe(args: argparse.Namespace) -> int:
     """Probe a provider's capability pass-rate on hard anchors (downgrade detector).
 
@@ -1923,6 +1966,8 @@ def verify_core(
     needle_tokens: int = 120000,
     with_capability: bool = False,
     capability_items: Path | None = None,
+    with_variance: bool = False,
+    variance_repeats: int = 12,
     providers_path: Path | None = None,
     progress: Any = None,
 ) -> dict[str, Any]:
@@ -2086,6 +2131,30 @@ def verify_core(
             except Exception as exc:
                 behavior["capability"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
 
+        # consistency-variance probe: repeat ONE deterministic anchor N times to
+        # catch low-frequency swapping (a fraction routed to a weaker model).
+        if with_variance:
+            try:
+                var_items_path = resolve_path(capability_items
+                                              or (ROOT / "judge_golden" / "capability_anchors_v1.json"))
+                var_doc = read_json(var_items_path)
+                var_items = _as_list(var_doc.get("items") if isinstance(var_doc, dict) else var_doc)
+                if not var_items:
+                    raise ValueError("no anchor items for variance probe")
+                anchor = var_items[0]  # first anchor is a stable single-answer item
+                reps = _run_variance_probe(
+                    anchor, model, live=True,
+                    events_file=out_dir / "variance_events.jsonl",
+                    repeats=int(variance_repeats or 12),
+                    request_delay=float(request_delay or 0.0),
+                    retries=int(retries or 1),
+                    retry_backoff=float(retry_backoff or 0.5),
+                    max_tokens=256, timeout=120.0, progress=progress,
+                )
+                behavior["variance"] = score_consistency_variance(reps)
+            except Exception as exc:
+                behavior["variance"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
+
     _emit({"stage": "judging", "label": "综合判定中…"})
     return compare_to_baseline(observed, baseline, behavior_signals=behavior or None)
 
@@ -2126,6 +2195,8 @@ def verify_endpoint(args: argparse.Namespace) -> int:
         needle_tokens=int(getattr(args, "needle_tokens", 120000) or 120000),
         with_capability=bool(getattr(args, "with_capability", False)),
         capability_items=getattr(args, "capability_items", None),
+        with_variance=bool(getattr(args, "with_variance", False)),
+        variance_repeats=int(getattr(args, "variance_repeats", 12) or 12),
         providers_path=args.providers,
     )
     print(render_verdict_report(verdict, baseline=baseline))
@@ -2871,6 +2942,8 @@ def main() -> int:
     verify_parser.add_argument("--with-needle", action="store_true", help="also run the long-context needle probe (~120K request, slow/expensive)")
     verify_parser.add_argument("--needle-tokens", type=int, default=120000, help="needle target prompt size in tokens")
     verify_parser.add_argument("--with-capability", action="store_true", help="also run the capability-anchor probe (silent-downgrade detector; needs a baseline capability_anchor.json)")
+    verify_parser.add_argument("--with-variance", action="store_true", help="also run the consistency-variance probe (repeat one anchor N times; low-frequency-swap detector)")
+    verify_parser.add_argument("--variance-repeats", type=int, default=12, help="repeats for the variance probe (default 12)")
     verify_parser.add_argument("--capability-items", type=Path, help="capability anchor item set (default judge_golden/capability_anchors_v1.json)")
     verify_parser.add_argument("--request-delay", type=float, default=0.0, help="seconds to wait between probe requests (avoid upstream rate limits)")
     verify_parser.add_argument("--retries", type=int, default=1, help="retries per request on transient failure (429/5xx)")

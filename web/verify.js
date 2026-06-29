@@ -19,6 +19,7 @@ function collectPayload(live) {
     baseline_id: $("baselineId").value.trim() || "OFFICIAL-CLAUDE-OPUS46",
     api_key: $("apiKey").value,
     with_capability: $("withCapability").checked,
+    with_variance: $("withVariance").checked,
     live: live,
     risk_ack: riskAck.checked,
   };
@@ -42,6 +43,7 @@ function showState(state) {
 const STRONG_CHECKS = new Set([
   "stop_reason_enum", "usage_naming_dialect", "model_id",
   "sse_event_order", "error_envelope", "needle_fake_1m", "request_failure_rate",
+  "capability_anchor", "consistency_variance",
 ]);
 
 function renderVerdict(data) {

@@ -559,6 +559,7 @@ def run_web_verify(payload: dict, *, live: bool, progress=None) -> dict:
     baseline_id = str(payload.get("baseline_id") or DEFAULT_BASELINE_ID).strip()
     api_key = str(payload.get("api_key") or "")
     with_capability = bool(payload.get("with_capability"))
+    with_variance = bool(payload.get("with_variance"))
     if not base_url or not model_name:
         raise ValueError("base_url 和 model 是必填项")
     if protocol not in ALLOWED_PROTOCOLS:
@@ -589,12 +590,13 @@ def run_web_verify(payload: dict, *, live: bool, progress=None) -> dict:
     )
     return _invoke_verify_core(model, baseline, baseline_id, baselines_dir,
                               live=live, api_key=api_key, req_delay=req_delay,
-                              with_capability=with_capability, progress=progress)
+                              with_capability=with_capability, with_variance=with_variance,
+                              progress=progress)
 
 
 def _invoke_verify_core(model, baseline, baseline_id, baselines_dir, *,
                         live: bool, api_key: str, req_delay: float,
-                        with_capability: bool, progress=None) -> dict:
+                        with_capability: bool, with_variance: bool = False, progress=None) -> dict:
     """Bind the key into os.environ for the call only, run verify_core, clean up."""
     prior = os.environ.get(WEB_VERIFY_KEY_ENV)
     if live and api_key:
@@ -615,6 +617,8 @@ def _invoke_verify_core(model, baseline, baseline_id, baselines_dir, *,
             with_needle=False,         # R-001: huge request, most dangerous
             with_capability=with_capability,
             providers_path=None,
+            with_variance=with_variance,
+            variance_repeats=12,
             progress=progress,
         )
     finally:
