@@ -29,6 +29,21 @@ def _make_server(tmp_path, monkeypatch, *, live_enabled: bool):
     monkeypatch.setattr(S, "RUNS_DIR", runs)
     monkeypatch.setattr(S, "CAMPAIGNS_DIR", campaigns)
 
+    # The real OFFICIAL-CLAUDE-OPUS46 baseline lives under the gitignored
+    # baselines/ dir, so it is ABSENT in a clean CI checkout. Build a minimal
+    # live_observed baseline in tmp and point the verify path at it, so these
+    # tests don't depend on local-only data.
+    import baseline_registry as BR
+    bdir = tmp_path / "baselines"
+    (bdir / BASELINE).mkdir(parents=True)
+    src = {"provider_id": "off", "provider_label": "official",
+           "base_url_host": "drhknode.airouting.com", "model": "claude-opus-4-6",
+           "protocol": "anthropic_messages"}
+    doc = BR.build_baseline_from_samples(BR._fake_official_samples(), src,
+                                         baseline_id=BASELINE, live=True)
+    BR.write_json(bdir / BASELINE / "baseline.json", doc)
+    monkeypatch.setattr(S.eval_cli, "DEFAULT_BASELINES_DIR", bdir)
+
     httpd = HTTPServer(("127.0.0.1", 0), S.Handler)
     httpd.config_write_enabled = False
     httpd.authenticity_live_enabled = live_enabled
@@ -115,6 +130,9 @@ def test_request_delay_floored(monkeypatch):
 
     monkeypatch.setattr(S.eval_cli, "verify_core", fake_verify_core)
     monkeypatch.setattr(S.eval_cli, "render_verdict_report", lambda v, **k: "report")
+    # baseline lives under gitignored baselines/ (absent in CI) — stub the load so
+    # this unit test depends only on run_web_verify's own delay-floor logic.
+    monkeypatch.setattr(S.eval_cli, "load_baseline", lambda *a, **k: {"baseline_id": BASELINE, "evidence_status": "live_observed"})
     S.run_web_verify({**SUSPECT, "request_delay": 0.1, "api_key": "sk-x"}, live=True)
     assert captured["request_delay"] >= S.WEB_VERIFY_MIN_DELAY
     # the dangerous probes must be OFF on the web path
