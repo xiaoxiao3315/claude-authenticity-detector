@@ -62,6 +62,7 @@ from baseline_registry import (
     score_capability_item,
     score_capability_vs_baseline,
     score_consistency_variance,
+    score_identity_coherence,
     score_needle_recall,
     write_baseline,
     write_baseline_version,
@@ -1487,6 +1488,12 @@ def _raw_protocol_observation(completion: Completion, model: ModelConfig) -> dic
     has_anthropic_headers = any(
         key.startswith("anthropic-") for key in headers
     )
+    # Envelope identity facts (for the identity-coherence probe): the upstream
+    # `model` field and the response `id` are emitted by the serving infra, not
+    # the narrated text, so they are forge-resistant. openai_chat puts the id at
+    # the top level too; both dialects expose `model`.
+    returned_model_field = data.get("model")
+    response_id = data.get("id")
     return {
         "raw_stop_reason": raw_stop,
         "raw_usage_keys": raw_usage_keys,
@@ -1494,6 +1501,8 @@ def _raw_protocol_observation(completion: Completion, model: ModelConfig) -> dic
         "output_tokens": usage.get("output_tokens", usage.get("completion_tokens")),
         "has_anthropic_request_id": has_anthropic_request_id,
         "has_anthropic_headers": has_anthropic_headers,
+        "returned_model_field": returned_model_field,
+        "response_id": response_id,
     }
 
 
@@ -1909,6 +1918,55 @@ def _run_variance_probe(
     return out
 
 
+# A neutral identity question. We do NOT grade the answer text for correctness
+# (a wrapper can recite "I am Claude Opus 4.8"); we only need a live request so we
+# can read the ENVELOPE (returned model field + response id) and cross-check it
+# against the narration. Asked plainly so a genuine model answers naturally.
+IDENTITY_PROBE_PROMPT = (
+    "请直接回答你的精确模型标识符（如 claude-opus-4-8 这种完整版本号），只回标识符本身。"
+)
+
+
+def _run_identity_probe(
+    model: ModelConfig, *, live: bool, events_file: Path,
+    expected_model_id: str | None, request_delay: float, retries: int,
+    retry_backoff: float, timeout: float = 60.0, progress: Any = None,
+) -> dict[str, Any]:
+    """One live request whose ENVELOPE (returned model field + response id) is
+    cross-checked against the model's self-narrated identity.
+
+    The narration is forgeable; the envelope is not. score_identity_coherence
+    flags the mismatch. Returns the scored dict (compare_to_baseline contract) or
+    a probe_error dict so a crash is surfaced as an incomplete check, never a
+    silent clean pass.
+    """
+    if progress is not None:
+        progress({"stage": "identity", "done": 0, "total": 1, "label": "身份一致性探针…"})
+    client_timeout = httpx.Timeout(float(timeout or 60.0))
+    if live and request_delay:
+        time.sleep(request_delay)
+    with httpx.Client(timeout=client_timeout, follow_redirects=True) as client:
+        completion = call_model_with_retries(
+            client=client, model=model,
+            messages=[{"role": "user", "content": IDENTITY_PROBE_PROMPT}],
+            max_tokens=64, temperature=0, live=live,
+            events_file=events_file, retries=retries, retry_backoff=retry_backoff,
+        )
+    if not completion.metrics.ok:
+        return {"probe_error": redact_text(completion.metrics.error, max_chars=200)}
+    obs = _raw_protocol_observation(completion, model)
+    narrated = " ".join((completion.text or "").split())[:120] or None
+    scored = score_identity_coherence(
+        narrated_model_id=narrated,
+        returned_model_field=obs.get("returned_model_field"),
+        response_id=obs.get("response_id"),
+        expected_model_id=expected_model_id,
+    )
+    if progress is not None:
+        progress({"stage": "identity", "done": 1, "total": 1, "label": "身份一致性探针完成"})
+    return scored
+
+
 def capability_probe(args: argparse.Namespace) -> int:
     """Probe a provider's capability pass-rate on hard anchors (downgrade detector).
 
@@ -1987,6 +2045,7 @@ def verify_core(
     capability_items: Path | None = None,
     with_variance: bool = False,
     variance_repeats: int = 12,
+    with_identity: bool = False,
     providers_path: Path | None = None,
     progress: Any = None,
 ) -> dict[str, Any]:
@@ -2174,6 +2233,25 @@ def verify_core(
             except Exception as exc:
                 behavior["variance"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
 
+        # identity-coherence probe: cross-check the suspect's self-narrated model
+        # id against the forge-resistant envelope (returned model field + response
+        # id prefix). Cheap (one request), so it runs whenever live identity is
+        # requested. expected_model_id = the trusted baseline's served model.
+        if with_identity:
+            try:
+                expected_model_id = (baseline.get("source") or {}).get("model")
+                behavior["identity"] = _run_identity_probe(
+                    model, live=True,
+                    events_file=out_dir / "identity_events.jsonl",
+                    expected_model_id=expected_model_id,
+                    request_delay=float(request_delay or 0.0),
+                    retries=int(retries or 1),
+                    retry_backoff=float(retry_backoff or 0.5),
+                    progress=progress,
+                )
+            except Exception as exc:
+                behavior["identity"] = {"probe_error": f"{type(exc).__name__}: {exc}"}
+
     _emit({"stage": "judging", "label": "综合判定中…"})
     return compare_to_baseline(observed, baseline, behavior_signals=behavior or None)
 
@@ -2216,6 +2294,7 @@ def verify_endpoint(args: argparse.Namespace) -> int:
         capability_items=getattr(args, "capability_items", None),
         with_variance=bool(getattr(args, "with_variance", False)),
         variance_repeats=int(getattr(args, "variance_repeats", 12) or 12),
+        with_identity=bool(getattr(args, "with_identity", False)),
         providers_path=args.providers,
     )
     print(render_verdict_report(verdict, baseline=baseline))
@@ -2963,6 +3042,7 @@ def main() -> int:
     verify_parser.add_argument("--with-capability", action="store_true", help="also run the capability-anchor probe (silent-downgrade detector; needs a baseline capability_anchor.json)")
     verify_parser.add_argument("--with-variance", action="store_true", help="also run the consistency-variance probe (repeat one anchor N times; low-frequency-swap detector)")
     verify_parser.add_argument("--variance-repeats", type=int, default=12, help="repeats for the variance probe (default 12)")
+    verify_parser.add_argument("--with-identity", action="store_true", help="also run the identity-coherence probe (cross-check self-narrated model id vs envelope: returned model field + response id prefix; one cheap live request)")
     verify_parser.add_argument("--capability-items", type=Path, help="capability anchor item set (default judge_golden/capability_anchors_v1.json)")
     verify_parser.add_argument("--request-delay", type=float, default=0.0, help="seconds to wait between probe requests (avoid upstream rate limits)")
     verify_parser.add_argument("--retries", type=int, default=1, help="retries per request on transient failure (429/5xx)")

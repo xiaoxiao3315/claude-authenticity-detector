@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import eval_cli as E  # noqa: E402
+import baseline_registry as B  # noqa: E402
 
 
 def _providers_file(tmp_path: Path) -> Path:
@@ -55,8 +56,9 @@ def _baseline(tmp_path: Path, baseline_id="OFFICIAL-X") -> Path:
 
 def _anthropic_response() -> httpx.Response:
     return httpx.Response(200, json={
+        "id": "msg_01GenuineAbc",
         "model": "claude-opus-4-6",
-        "content": [{"type": "text", "text": "ok"}],
+        "content": [{"type": "text", "text": "claude-opus-4-6"}],
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 4150, "output_tokens": 3,
                   "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
@@ -287,5 +289,90 @@ def test_verify_endpoint_with_sse_and_error_envelope(tmp_path, capsys, mock_comb
     captured = capsys.readouterr().out
     # the verdict report rendered, behavior signals folded in
     assert any(tag in captured for tag in ("真", "降级", "套壳", "证据不足", "官方"))
+
+
+# ---------------------------------------------------------------------------
+# _run_identity_probe — envelope cross-check (producer side)
+# ---------------------------------------------------------------------------
+def _model(**kw):
+    base = dict(provider_id="tested", base_url="https://gw.x/v1", model="claude-opus-4-6",
+                api_key_env="TESTED_KEY", protocol="anthropic_messages", auth_type="x-api-key")
+    base.update(kw)
+    return E.ModelConfig(**base)
+
+
+def _patch_client(monkeypatch, handler):
+    real_client = httpx.Client
+
+    class _Factory:
+        def __init__(self, *a, **k):
+            self._c = real_client(transport=httpx.MockTransport(handler))
+        def __enter__(self):
+            return self._c
+        def __exit__(self, *a):
+            self._c.close()
+
+    monkeypatch.setattr(E.httpx, "Client", _Factory)
+    monkeypatch.setenv("TESTED_KEY", "sk-test-123")
+
+
+def test_run_identity_probe_genuine(tmp_path, monkeypatch):
+    # genuine: returned model matches expected, msg_ id family -> coherent (10)
+    _patch_client(monkeypatch, lambda req: _anthropic_response())
+    out = E._run_identity_probe(
+        _model(), live=True, events_file=tmp_path / "id.jsonl",
+        expected_model_id="claude-opus-4-6", request_delay=0.0,
+        retries=0, retry_backoff=0.0)
+    assert out["score"] == 10.0
+    assert out["observed"]["response_id_family"] == "anthropic_native"
+
+
+def test_run_identity_probe_wrapper(tmp_path, monkeypatch):
+    # wrapper: narrates nothing useful, envelope returns a foreign model + gen- id
+    def handler(req):
+        return httpx.Response(200, json={
+            "id": "gen-xyz789",
+            "model": "xiaomi/mimo-v2.5",
+            "content": [{"type": "text", "text": "claude-opus-4-6"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 3},
+        })
+    _patch_client(monkeypatch, handler)
+    out = E._run_identity_probe(
+        _model(), live=True, events_file=tmp_path / "id.jsonl",
+        expected_model_id="claude-opus-4-6", request_delay=0.0,
+        retries=0, retry_backoff=0.0)
+    assert out["score"] == 0.0 and out.get("suspected_wrapper") is True
+
+
+def test_run_identity_probe_failed_call_is_probe_error(tmp_path, monkeypatch):
+    _patch_client(monkeypatch, lambda req: httpx.Response(500, json={"error": "boom"}))
+    out = E._run_identity_probe(
+        _model(), live=True, events_file=tmp_path / "id.jsonl",
+        expected_model_id="claude-opus-4-6", request_delay=0.0,
+        retries=0, retry_backoff=0.0)
+    assert "probe_error" in out
+
+
+def test_verify_endpoint_with_identity_live(tmp_path, capsys, mock_anthropic_client):
+    # Build a PROPER live baseline (evidence_status=live_observed) so the
+    # comparison reaches the behavior layer instead of short-circuiting on
+    # "baseline_not_live" — that is what lets the identity signal be folded in.
+    src = {"provider_id": "off", "provider_label": "official", "base_url_host": "gw.x",
+           "model": "claude-opus-4-6", "protocol": "anthropic_messages", "key_fingerprint": None}
+    doc = E.build_baseline_from_samples(B._fake_official_samples(), src,
+                                        baseline_id="OFFICIAL-X", live=True)
+    bdir = tmp_path / "baselines" / "OFFICIAL-X"
+    bdir.mkdir(parents=True)
+    (bdir / "baseline.json").write_text(json.dumps(doc), encoding="utf-8")
+    args = _ns(providers=str(_providers_file(tmp_path)), baseline_id="OFFICIAL-X",
+               baselines_dir=str(tmp_path / "baselines"), live=True, samples=2,
+               with_sse=False, with_error_envelope=False, with_needle=False,
+               with_capability=False, with_identity=True, json=True)
+    rc = E.verify_endpoint(args)
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "identity_coherence" in captured
+
 
 

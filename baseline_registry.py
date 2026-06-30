@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import statistics
 import tempfile
 from collections import Counter
@@ -698,6 +699,32 @@ def compare_to_baseline(
         evidence.append({"check": "consistency_variance", "observed": var.get("observed_pass_rate"),
                          "result": var.get("detail"), "advisory": True})
 
+    # identity-coherence: cross-check the self-narrated model id against the
+    # forge-resistant envelope (returned `model` field + response id prefix). A
+    # narration that disagrees with the envelope (says opus-4-8 but the id prefix
+    # is `gen-`/`chatcmpl-`, or the returned model field is some other model — the
+    # thinkai case) is a STRONG wrapper signal. score 0 hard-fails; score 5 is a
+    # soft REVIEW corroborator; score 10 is a positive vote.
+    ident = sig.get("identity")
+    if not _probe_failed("identity", ident):
+      if isinstance(ident, dict) and ident.get("score") is not None and not ident.get("advisory"):
+        behavior_checked += 1
+        if ident.get("score") == 0.0:
+            hard_fail = True  # envelope contradicts narration -> wrapper
+            reasons.append(f"identity_incoherent:{ident.get('detail')}")
+        elif ident.get("score") == 5.0:
+            behavior_soft_misses += 1
+            reasons.append(f"identity_envelope_weak:{ident.get('detail')}")
+        elif ident.get("score") == 10.0:
+            behavior_votes += 1
+        evidence.append({"check": "identity_coherence",
+                         "observed": (ident.get("observed") or {}),
+                         "result": ident.get("detail")})
+      elif isinstance(ident, dict):
+        evidence.append({"check": "identity_coherence",
+                         "observed": (ident.get("observed") or {}),
+                         "result": ident.get("detail"), "advisory": True})
+
     # A borderline capability gap is a soft signal: it lowers confidence and, with
     # one more soft miss, routes to REVIEW — but never convicts downgrade alone.
     if capability_borderline:
@@ -1074,6 +1101,122 @@ def score_needle_recall(canary_code: str | None, response_text: str) -> dict[str
         "format_ok": hit,
         "details": "needle recalled" if hit else "needle missed (corroborating only)",
     }
+
+
+def classify_response_id(response_id: str | None) -> str:
+    """Classify the supply-chain family from a chat-completion response id prefix.
+
+    The response id is emitted by the *infrastructure* that actually served the
+    call, not by the narrated answer text — so it cannot be forged by a system
+    prompt the way "I am Claude Opus 4.8" can. Empirically (see ATLAS memory,
+    2026-06-29 20-gateway sweep) the prefix is the single strongest supply-chain
+    fingerprint:
+      - msg_bdrk_*           -> real Claude via AWS Bedrock relay
+      - msg_01* / msg_<uuid> -> official-shaped Anthropic id
+      - chatcmpl-*           -> served through an OpenAI-compatible layer
+      - gen-*                -> OpenRouter-class aggregator
+      - bare hex / other     -> rewritten / unknown (most suspicious)
+    """
+    rid = (response_id or "").strip()
+    if not rid:
+        return "absent"
+    low = rid.lower()
+    if low.startswith("msg_bdrk_"):
+        return "anthropic_bedrock"
+    if low.startswith("msg_"):
+        return "anthropic_native"
+    if low.startswith("chatcmpl-") or low.startswith("chatcmpl_"):
+        return "openai_compat"
+    if low.startswith("gen-") or low.startswith("gen_"):
+        return "openrouter"
+    if re.fullmatch(r"[0-9a-f]{16,}", low):
+        return "bare_hex"
+    return "other"
+
+
+# id families that are consistent with a genuine Anthropic-served Claude.
+_CLAUDE_ID_FAMILIES = {"anthropic_native", "anthropic_bedrock"}
+# id families that prove the call went through a non-Anthropic relay/aggregator
+# that rewrote the envelope — a strong wrapper signal.
+_WRAPPER_ID_FAMILIES = {"openai_compat", "openrouter"}
+
+
+def score_identity_coherence(
+    *,
+    narrated_model_id: str | None,
+    returned_model_field: str | None,
+    response_id: str | None,
+    expected_model_id: str | None,
+) -> dict[str, Any]:
+    """Cross-check a model's *self-narrated* identity against *envelope* facts.
+
+    The premise: asking "which model are you?" is worthless on its own — a wrapper
+    just prints whatever its system prompt says. What a wrapper CANNOT cheaply fake
+    is the envelope the serving infrastructure emits: the API `model` field on the
+    response and the response `id` prefix. So we do not score "did it say opus-4-8";
+    we score whether the NARRATION agrees with the ENVELOPE. A mismatch (narrates
+    opus-4-8, but the upstream `model` field is something else, or the id prefix is
+    an OpenAI/OpenRouter relay) is the forge-resistant tell.
+
+    Scoring (feeds compare_to_baseline's behavior layer, same 0/5/10/None contract):
+      score 0   = hard incoherence: envelope contradicts the narration
+                  (returned model != expected/narrated, or wrapper-class id prefix).
+      score 5   = soft: narration looks fine but envelope is weak/ambiguous
+                  (e.g. id family "other"/"bare_hex", or returned field absent).
+      score 10  = coherent: narration, returned model field, and a Claude-family
+                  id prefix all line up.
+      score None = insufficient: we have no envelope facts to judge against.
+    """
+    norm = lambda s: (s or "").strip().lower()
+    narrated = norm(narrated_model_id)
+    returned = norm(returned_model_field)
+    expected = norm(expected_model_id)
+    id_family = classify_response_id(response_id)
+
+    observed = {
+        "narrated_model_id": narrated_model_id,
+        "returned_model_field": returned_model_field,
+        "response_id_family": id_family,
+        "expected_model_id": expected_model_id,
+    }
+
+    # No envelope at all -> cannot judge coherence (don't punish; just abstain).
+    if not returned and id_family == "absent":
+        return {"score": None, "detail": "no envelope facts (returned model + id both absent)",
+                "observed": observed, "advisory": True}
+
+    hard_reasons: list[str] = []
+
+    # 1. id prefix from a non-Anthropic relay that rewrote the envelope.
+    if id_family in _WRAPPER_ID_FAMILIES:
+        hard_reasons.append(f"response_id_family:{id_family}")
+
+    # 2. returned `model` field disagrees with what the endpoint claims to serve.
+    #    Compare against expected (the trusted baseline's model) when we have it,
+    #    else against the narration. Substring-tolerant: gateways append dates /
+    #    "-20251101" suffixes, so a genuine match need only be a containment.
+    ref = expected or narrated
+    if returned and ref:
+        if not (returned in ref or ref in returned):
+            hard_reasons.append(f"returned_model_mismatch:{returned_model_field}!={ref}")
+
+    if hard_reasons:
+        return {"score": 0.0, "suspected_wrapper": True, "detail": "; ".join(hard_reasons),
+                "observed": observed}
+
+    # Soft band: nothing contradicts, but the envelope is not strongly Claude-shaped.
+    soft_reasons: list[str] = []
+    if id_family in ("other", "bare_hex"):
+        soft_reasons.append(f"weak_id_family:{id_family}")
+    if not returned:
+        soft_reasons.append("returned_model_field_absent")
+
+    if soft_reasons:
+        return {"score": 5.0, "borderline": True, "detail": "; ".join(soft_reasons),
+                "observed": observed}
+
+    return {"score": 10.0, "detail": "narration agrees with envelope (model field + Claude-family id)",
+            "observed": observed}
 
 
 def evaluate_silent_truncation(
@@ -1662,6 +1805,42 @@ def _self_test() -> None:
         "capability": {"score": 10.0, "gap": 0.02, "observed": 0.93, "baseline": 0.95},
     })
     assert cap_ok["verdict"] == VERDICT_MATCHES, cap_ok
+
+    # identity-coherence: narration vs envelope cross-check.
+    # coherent: narrated opus, returned field matches, anthropic id family -> 10
+    id_ok = score_identity_coherence(
+        narrated_model_id="claude-opus-4-8", returned_model_field="claude-opus-4-8",
+        response_id="msg_01ABC", expected_model_id="claude-opus-4-8")
+    assert id_ok["score"] == 10.0, id_ok
+    # bedrock relay id is still genuine Claude
+    assert classify_response_id("msg_bdrk_xyz") == "anthropic_bedrock"
+    assert classify_response_id("chatcmpl-9xY") == "openai_compat"
+    assert classify_response_id("gen-abc123") == "openrouter"
+    # hard incoherence: narrates opus but envelope returns a different model -> 0
+    id_swap = score_identity_coherence(
+        narrated_model_id="claude-opus-4-8", returned_model_field="xiaomi/mimo-v2.5",
+        response_id="gen-abc", expected_model_id="claude-opus-4-8")
+    assert id_swap["score"] == 0.0 and id_swap.get("suspected_wrapper"), id_swap
+    # openai-compat id alone hard-fails even if model field looks ok
+    id_chatcmpl = score_identity_coherence(
+        narrated_model_id="claude-opus-4-8", returned_model_field="claude-opus-4-8",
+        response_id="chatcmpl-123", expected_model_id="claude-opus-4-8")
+    assert id_chatcmpl["score"] == 0.0, id_chatcmpl
+    # weak/ambiguous envelope -> soft 5
+    id_soft = score_identity_coherence(
+        narrated_model_id="claude-opus-4-8", returned_model_field="claude-opus-4-8",
+        response_id="deadbeefdeadbeef", expected_model_id="claude-opus-4-8")
+    assert id_soft["score"] == 5.0, id_soft
+    # no envelope at all -> insufficient (abstain, advisory)
+    id_none = score_identity_coherence(
+        narrated_model_id="claude-opus-4-8", returned_model_field=None,
+        response_id=None, expected_model_id="claude-opus-4-8")
+    assert id_none["score"] is None and id_none.get("advisory"), id_none
+    # tolerant match: gateway appends a date suffix to the model field
+    id_suffix = score_identity_coherence(
+        narrated_model_id="claude-opus-4-8", returned_model_field="claude-opus-4-8-20251101",
+        response_id="msg_01ZZ", expected_model_id="claude-opus-4-8")
+    assert id_suffix["score"] == 10.0, id_suffix
 
     print("baseline_registry self-test ok")
 
