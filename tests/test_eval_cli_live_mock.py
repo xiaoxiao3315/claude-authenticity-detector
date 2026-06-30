@@ -354,6 +354,27 @@ def test_run_identity_probe_failed_call_is_probe_error(tmp_path, monkeypatch):
     assert "probe_error" in out
 
 
+def test_run_identity_probe_recovers_after_transient_failure(tmp_path, monkeypatch):
+    # First attempt fails (transient 502), second succeeds. The outer attempts
+    # loop must recover the envelope rather than waste the whole signal — the
+    # relaybases/aiproxy regression from the 2026-06-30 sweep.
+    calls = {"n": 0}
+
+    def handler(req):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(502, text="<html>bad gateway</html>")
+        return _anthropic_response()
+
+    _patch_client(monkeypatch, handler)
+    out = E._run_identity_probe(
+        _model(), live=True, events_file=tmp_path / "id.jsonl",
+        expected_model_id="claude-opus-4-6", request_delay=0.0,
+        retries=0, retry_backoff=0.0, attempts=3)
+    assert out.get("score") == 10.0
+    assert calls["n"] >= 2  # it retried past the first failure
+
+
 def test_verify_endpoint_with_identity_live(tmp_path, capsys, mock_anthropic_client):
     # Build a PROPER live baseline (evidence_status=live_observed) so the
     # comparison reaches the behavior layer instead of short-circuiting on

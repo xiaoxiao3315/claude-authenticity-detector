@@ -1930,7 +1930,8 @@ IDENTITY_PROBE_PROMPT = (
 def _run_identity_probe(
     model: ModelConfig, *, live: bool, events_file: Path,
     expected_model_id: str | None, request_delay: float, retries: int,
-    retry_backoff: float, timeout: float = 60.0, progress: Any = None,
+    retry_backoff: float, timeout: float = 60.0, attempts: int = 3,
+    progress: Any = None,
 ) -> dict[str, Any]:
     """One live request whose ENVELOPE (returned model field + response id) is
     cross-checked against the model's self-narrated identity.
@@ -1939,32 +1940,41 @@ def _run_identity_probe(
     flags the mismatch. Returns the scored dict (compare_to_baseline contract) or
     a probe_error dict so a crash is surfaced as an incomplete check, never a
     silent clean pass.
+
+    The envelope can be read from ANY successful response, so on a transient
+    failure we retry the whole probe up to `attempts` times (outer loop, on top of
+    call_model_with_retries' inner retries). Otherwise one unlucky timeout on the
+    single probe call would waste the entire signal — exactly what happened to
+    relaybases/aiproxy on 2026-06-30, dropping them to an incomplete 0.5 verdict.
     """
     if progress is not None:
         progress({"stage": "identity", "done": 0, "total": 1, "label": "身份一致性探针…"})
     client_timeout = httpx.Timeout(float(timeout or 60.0))
-    if live and request_delay:
-        time.sleep(request_delay)
+    last_err = "no attempt made"
     with httpx.Client(timeout=client_timeout, follow_redirects=True) as client:
-        completion = call_model_with_retries(
-            client=client, model=model,
-            messages=[{"role": "user", "content": IDENTITY_PROBE_PROMPT}],
-            max_tokens=64, temperature=0, live=live,
-            events_file=events_file, retries=retries, retry_backoff=retry_backoff,
-        )
-    if not completion.metrics.ok:
-        return {"probe_error": redact_text(completion.metrics.error, max_chars=200)}
-    obs = _raw_protocol_observation(completion, model)
-    narrated = " ".join((completion.text or "").split())[:120] or None
-    scored = score_identity_coherence(
-        narrated_model_id=narrated,
-        returned_model_field=obs.get("returned_model_field"),
-        response_id=obs.get("response_id"),
-        expected_model_id=expected_model_id,
-    )
-    if progress is not None:
-        progress({"stage": "identity", "done": 1, "total": 1, "label": "身份一致性探针完成"})
-    return scored
+        for attempt in range(max(1, attempts)):
+            if live and request_delay and attempt > 0:
+                time.sleep(request_delay)
+            completion = call_model_with_retries(
+                client=client, model=model,
+                messages=[{"role": "user", "content": IDENTITY_PROBE_PROMPT}],
+                max_tokens=64, temperature=0, live=live,
+                events_file=events_file, retries=retries, retry_backoff=retry_backoff,
+            )
+            if completion.metrics.ok:
+                obs = _raw_protocol_observation(completion, model)
+                narrated = " ".join((completion.text or "").split())[:120] or None
+                scored = score_identity_coherence(
+                    narrated_model_id=narrated,
+                    returned_model_field=obs.get("returned_model_field"),
+                    response_id=obs.get("response_id"),
+                    expected_model_id=expected_model_id,
+                )
+                if progress is not None:
+                    progress({"stage": "identity", "done": 1, "total": 1, "label": "身份一致性探针完成"})
+                return scored
+            last_err = redact_text(completion.metrics.error, max_chars=200) or "request failed"
+    return {"probe_error": last_err}
 
 
 def capability_probe(args: argparse.Namespace) -> int:
