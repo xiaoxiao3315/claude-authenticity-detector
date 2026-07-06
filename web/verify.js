@@ -19,6 +19,7 @@ function saveForm() {
   for (const id of PERSIST_FIELDS) state[id] = $(id).value;
   state.withCapability = $("withCapability").checked;
   state.withVariance = $("withVariance").checked;
+  state.withIdentity = $("withIdentity").checked;
   try { localStorage.setItem(PERSIST_KEY, JSON.stringify(state)); } catch (e) {}
 }
 
@@ -30,6 +31,7 @@ function restoreForm() {
   }
   if (state.withCapability) $("withCapability").checked = true;
   if (state.withVariance) $("withVariance").checked = true;
+  if (state.withIdentity != null) $("withIdentity").checked = !!state.withIdentity;
 }
 
 // ---------- 加载本地元数据：基线下拉 + 配置预填 ----------
@@ -84,7 +86,7 @@ $("prefillBtn").addEventListener("click", prefillSuspect);
 loadMeta();
 
 // save form on any change (api_key intentionally NOT persisted)
-for (const id of [...PERSIST_FIELDS, "withCapability", "withVariance"]) {
+for (const id of [...PERSIST_FIELDS, "withCapability", "withVariance", "withIdentity"]) {
   const el = $(id);
   if (el) el.addEventListener("change", saveForm);
 }
@@ -121,6 +123,7 @@ function collectPayload(live) {
     api_key: $("apiKey").value,
     with_capability: $("withCapability").checked,
     with_variance: $("withVariance").checked,
+    with_identity: $("withIdentity").checked,
     live: live,
     risk_ack: riskAck.checked,
   };

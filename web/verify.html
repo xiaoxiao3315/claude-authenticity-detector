@@ -76,6 +76,10 @@
           <span>含能力探针（检测偷偷降级，需基线已建能力基准）</span>
         </label>
         <label class="check-cap">
+          <input type="checkbox" id="withIdentity" checked />
+          <span>含身份一致性探针（自报身份 vs 信封交叉验证；1 次便宜请求，默认开启）</span>
+        </label>
+        <label class="check-cap">
           <input type="checkbox" id="withVariance" />
           <span>含一致性复检（同题重复 12 次，抓低频偷换；live 会多花十几次调用）</span>
         </label>
