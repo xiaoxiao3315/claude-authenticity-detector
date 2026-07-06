@@ -4,38 +4,36 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Claude 真伪检测</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="./verify.css" />
   <script type="importmap">
   { "imports": { "animejs": "./vendor/anime.esm.js" } }
   </script>
 </head>
 <body>
-  <!-- 氛围极光背景 -->
-  <div class="ambient" aria-hidden="true">
-    <span class="ambient-aurora a1"></span>
-    <span class="ambient-aurora a2"></span>
-    <span class="ambient-aurora a3"></span>
-  </div>
-
   <header class="topbar reveal">
     <div class="brand">
       <span class="brand-dot" aria-hidden="true"></span>
       <span class="brand-name">Claude 真伪检测</span>
       <span class="brand-sub">AUTHENTICITY</span>
     </div>
-    <a class="topbar-link" href="./index.html">← 控制台</a>
+    <div class="topbar-right">
+      <span class="topbar-note">仅本机 127.0.0.1 · key 不落盘</span>
+      <a class="topbar-link" href="./index.html">← 控制台</a>
+    </div>
   </header>
 
   <main class="wrap">
-    <!-- 左：检测表单 -->
-    <section class="glass card form-card reveal" aria-label="检测配置">
-      <h2 class="card-title">检测一个网关是否真·官方 Claude</h2>
-      <p class="card-sub">填入要检测的网关，对比可信官方基线，判定：真官方 / 疑似降级 / 疑似套壳 / 证据不足。</p>
+    <!-- 左：三步工作流 -->
+    <form id="verifyForm" class="flow" autocomplete="off" aria-label="检测配置">
 
-      <form id="verifyForm" autocomplete="off">
+      <section class="card step-card reveal">
+        <div class="step-head">
+          <span class="step-num">1</span>
+          <div>
+            <h2 class="step-title">目标网关</h2>
+            <p class="step-sub">要验证的第三方网关和它声称提供的模型</p>
+          </div>
+        </div>
         <label class="field">
           <span class="field-label">网关地址 base_url</span>
           <input type="text" id="baseUrl" placeholder="https://your-gateway.com" required />
@@ -61,30 +59,51 @@
           </label>
         </div>
         <p class="combo-hint" id="comboHint" hidden></p>
+        <button type="button" class="prefill-btn" id="prefillBtn">↪ 从本地配置带入 suspect_model</button>
+      </section>
+
+      <section class="card step-card reveal">
+        <div class="step-head">
+          <span class="step-num">2</span>
+          <div>
+            <h2 class="step-title">基线与探针</h2>
+            <p class="step-sub">对照哪个可信官方基线，加跑哪些探针</p>
+          </div>
+        </div>
         <label class="field">
           <span class="field-label">基线 baseline_id</span>
           <select id="baselineId"></select>
         </label>
+        <div class="probe-group">
+          <label class="check-cap">
+            <input type="checkbox" id="withIdentity" checked />
+            <span><strong>身份一致性</strong><em>自报身份 vs 信封交叉验证；1 次便宜请求</em></span>
+          </label>
+          <label class="check-cap">
+            <input type="checkbox" id="withCapability" />
+            <span><strong>能力锚点</strong><em>检测偷偷降级；需基线已建能力基准</em></span>
+          </label>
+          <label class="check-cap">
+            <input type="checkbox" id="withVariance" />
+            <span><strong>一致性复检</strong><em>同题重复 12 次抓低频偷换；live 多花十几次调用</em></span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card step-card reveal">
+        <div class="step-head">
+          <span class="step-num">3</span>
+          <div>
+            <h2 class="step-title">授权并执行</h2>
+            <p class="step-sub">先 dry-run 验证配置；live 才需要 key</p>
+          </div>
+        </div>
         <label class="field">
           <span class="field-label">API Key<span class="opt">live 检测才需要</span></span>
           <input type="password" id="apiKey" placeholder="用可弃用的 key，绝不存盘" autocomplete="off" />
           <span class="key-hint" id="keyHint" hidden></span>
         </label>
-        <button type="button" class="prefill-btn" id="prefillBtn">↪ 从本地配置带入 suspect_model</button>
-        <label class="check-cap">
-          <input type="checkbox" id="withCapability" />
-          <span>含能力探针（检测偷偷降级，需基线已建能力基准）</span>
-        </label>
-        <label class="check-cap">
-          <input type="checkbox" id="withIdentity" checked />
-          <span>含身份一致性探针（自报身份 vs 信封交叉验证；1 次便宜请求，默认开启）</span>
-        </label>
-        <label class="check-cap">
-          <input type="checkbox" id="withVariance" />
-          <span>含一致性复检（同题重复 12 次，抓低频偷换；live 会多花十几次调用）</span>
-        </label>
 
-        <!-- 风险确认框 -->
         <div class="risk-box" id="riskBox">
           <div class="risk-head">⚠ live 检测有封号风险（R-001 实发）</div>
           <p class="risk-text">
@@ -101,14 +120,15 @@
           <button type="button" class="btn btn-ghost" id="dryRunBtn">dry-run 验证配置</button>
           <button type="button" class="btn btn-live" id="liveBtn" disabled>live 真实检测</button>
         </div>
-      </form>
-    </section>
+      </section>
+    </form>
 
-    <!-- 右：结果 -->
-    <section class="glass card result-card reveal" id="resultCard" aria-label="检测结果">
+    <!-- 右：结果面板（吸顶） -->
+    <section class="card result-card reveal" id="resultCard" aria-label="检测结果">
+      <div class="result-head">检测结果</div>
       <div class="result-empty" id="resultEmpty">
         <span class="result-empty-icon">🔍</span>
-        <p>填好左侧配置，先跑 dry-run 验证，再做 live 检测。</p>
+        <p>按左侧 1 → 2 → 3 配置，先跑 dry-run 验证，再做 live 检测。</p>
       </div>
       <div class="result-body" id="resultBody" hidden>
         <div class="verdict-banner" id="verdictBanner">

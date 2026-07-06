@@ -164,6 +164,7 @@ function renderVerdict(data) {
   renderEvidence(v);
   $("reportText").textContent = data.report_text || "(无报告文本)";
   showState("body");
+  animateResult();
 }
 
 function renderEvidence(v) {
@@ -342,10 +343,12 @@ liveBtn.addEventListener("click", () => runVerify(true));
 // Enter in the form submits the SAFE path (dry-run), never an accidental live call.
 $("verifyForm").addEventListener("submit", (e) => { e.preventDefault(); runVerify(false); });
 
-// ---------- anime.js 开场序列（失败则静态，绝不空白） ----------
+// ---------- anime.js 动效（失败则静态，绝不空白） ----------
+let _animate = null, _stagger = null;
 (async () => {
   try {
     const { animate, stagger } = await import("animejs");
+    _animate = animate; _stagger = stagger;
     animate(".reveal", {
       opacity: [0, 1],
       translateY: [16, 0],
@@ -357,4 +360,19 @@ $("verifyForm").addEventListener("submit", (e) => { e.preventDefault(); runVerif
     // anime 未加载 → reveal 默认已可见，无需处理
   }
 })();
+
+// 判决揭晓动效：横幅弹出 + 证据组逐条浮现（anime 缺失时静态展示）
+function animateResult() {
+  if (!_animate) return;
+  try {
+    _animate("#verdictBanner", {
+      opacity: [0, 1], scale: [0.94, 1],
+      duration: 420, ease: "out(3)",
+    });
+    _animate(".evidence-group", {
+      opacity: [0, 1], translateY: [12, 0],
+      duration: 400, delay: _stagger(80, { start: 140 }), ease: "out(3)",
+    });
+  } catch (e) { /* 动效失败不影响内容 */ }
+}
 
