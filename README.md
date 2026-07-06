@@ -56,9 +56,21 @@ Black-box detection of four ways a gateway can fake "official Claude":
 
 最终给四类结论之一：**✅真·官方 / ⚠️疑似降级 / ❌疑似套壳 / ❔证据不足**，附分级证据链（强证据 / 佐证 / 仅参考）。
 
-### 自助三步走（脱离记 CLI）
+### 最短路径：`quickcheck` 一条命令
 
-完整使用手册见 **[`docs/真伪检测使用手册.md`](docs/真伪检测使用手册.md)**。最短路径：
+```powershell
+# key 只进环境变量（不进命令行、不进配置文件）
+$env:SUSPECT_MODEL_API_KEY = "<可弃用的key>"
+python .\eval_cli.py quickcheck https://要测的网关/v1 claude-opus-4-6 --live
+```
+
+它自动完成：探测 protocol×auth 组合 → 运行时构造 suspect（不写 providers.local.json）→
+对基线跑全套探针（协议/SSE/错误体/身份一致性/能力锚点）→ 输出中文判定。
+只有一个基线时连 `--baseline-id` 都不用给。加 `--full` 追加 needle 假1M探针（慢/贵）。
+
+### 脚本三步走（等价的老流程）
+
+完整使用手册见 **[`docs/真伪检测使用手册.md`](docs/真伪检测使用手册.md)**：
 
 ```powershell
 # 1. 填要测的网关：configs/providers.local.json 的 suspect_model

@@ -397,3 +397,47 @@ def test_verify_endpoint_with_identity_live(tmp_path, capsys, mock_anthropic_cli
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# quickcheck --live: auto protocol/auth detection + one-shot verify
+# ---------------------------------------------------------------------------
+def test_quickcheck_live_genuine(tmp_path, capsys, mock_anthropic_client):
+    baselines_dir = _baseline(tmp_path)
+    args = argparse.Namespace(
+        base_url="https://gw.x/v1", model="claude-opus-4-6",
+        key_env="TESTED_KEY", baseline_id="OFFICIAL-X",
+        baselines_dir=str(baselines_dir), samples=2, request_delay=0.0,
+        live=True, full=False, json=False)
+    rc = E.quickcheck(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # auto-detection must land on the anthropic dialect (fake gateway is genuine)
+    assert "anthropic_messages" in out
+    # and the Chinese verdict report must render
+    assert any(tag in out for tag in ("真", "降级", "套壳", "证据不足", "官方"))
+
+
+def test_quickcheck_key_env_guard(tmp_path, mock_anthropic_client, monkeypatch):
+    # --live with an empty key env var must refuse BEFORE any network call
+    monkeypatch.delenv("GHOST_KEY", raising=False)
+    baselines_dir = _baseline(tmp_path)
+    args = argparse.Namespace(
+        base_url="https://gw.x/v1", model="claude-opus-4-6",
+        key_env="GHOST_KEY", baseline_id="OFFICIAL-X",
+        baselines_dir=str(baselines_dir), samples=2, request_delay=0.0,
+        live=True, full=False, json=False)
+    with pytest.raises(ValueError, match="GHOST_KEY"):
+        E.quickcheck(args)
+
+
+def test_quickcheck_auto_selects_sole_baseline(tmp_path, capsys, mock_anthropic_client):
+    baselines_dir = _baseline(tmp_path)  # exactly one baseline: OFFICIAL-X
+    args = argparse.Namespace(
+        base_url="https://gw.x/v1", model="claude-opus-4-6",
+        key_env="TESTED_KEY", baseline_id=None,
+        baselines_dir=str(baselines_dir), samples=2, request_delay=0.0,
+        live=False, full=False, json=False)
+    rc = E.quickcheck(args)
+    assert rc == 0
+    assert "OFFICIAL-X" in capsys.readouterr().out

@@ -2313,6 +2313,102 @@ def verify_endpoint(args: argparse.Namespace) -> int:
     return 0
 
 
+def quickcheck(args: argparse.Namespace) -> int:
+    """One-command gateway check: auto-probe protocol/auth, then verify.
+
+    Collapses the 5-step manual flow (edit providers.local.json, edit
+    local_secrets.env, remember the baseline id, dry-run, --live) into:
+
+        eval_cli.py quickcheck <base_url> <model> --key-env MY_KEY --live
+
+    - protocol x auth is auto-detected with probe_single_call (anthropic
+      dialect tried first); nothing is written to providers.local.json —
+      the suspect ModelConfig lives only for this run.
+    - the baseline id may be omitted when exactly one baseline exists.
+    - the key is taken ONLY from an environment variable name (--key-env);
+      a literal key on the command line would leak into shell history.
+    """
+    baselines_dir = resolve_path(getattr(args, "baselines_dir", None) or DEFAULT_BASELINES_DIR)
+    baseline_id = getattr(args, "baseline_id", None)
+    if not baseline_id:
+        candidates = sorted(
+            p.name for p in baselines_dir.iterdir()
+            if not p.name.startswith("_") and (p / "baseline.json").exists()
+        ) if baselines_dir.exists() else []
+        if len(candidates) == 1:
+            baseline_id = candidates[0]
+            print(f"[quickcheck] 使用唯一可用基线: {baseline_id}")
+        elif not candidates:
+            raise ValueError("no baseline found — build one first with `baseline --live`")
+        else:
+            raise ValueError(f"multiple baselines found, pick one with --baseline-id: {', '.join(candidates)}")
+    baseline = load_baseline(baselines_dir, baseline_id)
+    if baseline is None:
+        raise ValueError(f"baseline not found: {baseline_id}")
+
+    live = bool(getattr(args, "live", False))
+    key_env = str(args.key_env)
+    if live:
+        load_local_env()
+        if not os.environ.get(key_env):
+            raise ValueError(
+                f"environment variable '{key_env}' is empty — set the suspect key there first "
+                f"(never pass the key itself on the command line)")
+
+    protocol, auth_type = "anthropic_messages", "x-api-key"
+    if live:
+        print(f"[quickcheck] 自动探测 protocol/auth 组合(目标 {base_url_host(args.base_url)})…")
+        probe_base = ModelConfig(
+            provider_id="quickcheck_suspect", base_url=str(args.base_url), model=str(args.model),
+            api_key_env=key_env, protocol=protocol, auth_type=auth_type)
+        combos = [("anthropic_messages", "x-api-key"), ("anthropic_messages", "bearer"),
+                  ("openai_chat", "bearer"), ("openai_chat", "x-api-key")]
+        found: tuple[str, str] | None = None
+        failures: list[str] = []
+        client_timeout = httpx.Timeout(20.0, connect=8.0, read=20.0, write=8.0, pool=5.0)
+        with httpx.Client(timeout=client_timeout, follow_redirects=True) as client:
+            for proto, at in combos:
+                result = probe_single_call(
+                    client, probe_base, model_name=str(args.model),
+                    protocol=proto, auth_type=at, timeout_label="20s")
+                if result.get("ok"):
+                    found = (proto, at)
+                    break
+                failures.append(f"{proto}+{at}: {result.get('error') or result.get('status')}")
+        if found is None:
+            print("[quickcheck] ❌ 四种 protocol/auth 组合全部失败,无法连通该网关:")
+            for line in failures:
+                print(f"  - {line}")
+            return 2
+        protocol, auth_type = found
+        print(f"[quickcheck] ✅ 连通: {protocol} + {auth_type}")
+
+    suspect = ModelConfig(
+        provider_id="quickcheck_suspect", base_url=str(args.base_url), model=str(args.model),
+        api_key_env=key_env, protocol=protocol, auth_type=auth_type)
+    verdict = verify_core(
+        suspect, baseline,
+        role="quickcheck_suspect",
+        baselines_dir=baselines_dir,
+        baseline_id=str(baseline_id),
+        live=live,
+        samples_per_probe=int(getattr(args, "samples", 3) or 3),
+        request_delay=float(getattr(args, "request_delay", 0.5) or 0.0),
+        retries=2,
+        retry_backoff=1.0,
+        with_sse=live,
+        with_error_envelope=live,
+        with_needle=bool(getattr(args, "full", False)),
+        with_capability=live and (baselines_dir / str(baseline_id) / "capability_anchor.json").exists(),
+        with_variance=False,
+        with_identity=live,
+        providers_path=None,
+    )
+    print(render_verdict_report(verdict, baseline=baseline))
+    if getattr(args, "json", False):
+        print(json.dumps(verdict, ensure_ascii=False, indent=2))
+    return 0
+
 
 # Fake-1M needle probe. The huge prompt is assembled at run time from a seed
 # (NEVER stored in the 495KB task file).
@@ -3058,6 +3154,23 @@ def main() -> int:
     verify_parser.add_argument("--retries", type=int, default=1, help="retries per request on transient failure (429/5xx)")
     verify_parser.add_argument("--retry-backoff", type=float, default=0.5, help="base backoff seconds between retries")
     verify_parser.set_defaults(func=verify_endpoint)
+
+    quickcheck_parser = sub.add_parser(
+        "quickcheck",
+        help="one-command gateway check: auto-detect protocol/auth, verify against a baseline "
+             "(no providers.local.json editing needed)")
+    quickcheck_parser.add_argument("base_url", help="suspect gateway base URL, e.g. https://gw.example.com/v1")
+    quickcheck_parser.add_argument("model", help="model id the gateway claims to serve, e.g. claude-opus-4-6")
+    quickcheck_parser.add_argument("--key-env", default="SUSPECT_MODEL_API_KEY",
+                                   help="ENV VAR NAME holding the suspect key (never the key itself; default SUSPECT_MODEL_API_KEY)")
+    quickcheck_parser.add_argument("--baseline-id", help="trusted baseline (auto-selected when exactly one exists)")
+    quickcheck_parser.add_argument("--baselines-dir", type=Path)
+    quickcheck_parser.add_argument("--samples", type=int, default=3, help="samples per probe (default 3, cheaper than verify-endpoint's 5)")
+    quickcheck_parser.add_argument("--request-delay", type=float, default=0.5, help="seconds between probe requests (default 0.5)")
+    quickcheck_parser.add_argument("--live", action="store_true", help="REAL API calls to the suspect (cost); without it only baseline/config wiring is checked")
+    quickcheck_parser.add_argument("--full", action="store_true", help="also run the long-context needle probe (slow/expensive)")
+    quickcheck_parser.add_argument("--json", action="store_true", help="also print raw JSON verdict")
+    quickcheck_parser.set_defaults(func=quickcheck)
 
     capability_parser = sub.add_parser("capability-probe", help="probe a provider's capability pass-rate on hard anchors (silent-downgrade detector); writes capability_anchor.json")
     capability_parser.add_argument("--items", type=Path, default=ROOT / "judge_golden" / "capability_anchors_v1.json", help="capability anchor item set")
