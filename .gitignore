@@ -1,0 +1,39 @@
+local_secrets.env
+.env
+.env.*
+*.local.env
+providers.local.json
+providers.test.local.json
+configs/providers.local.json
+configs/*.local.json
+
+# Runtime artifacts
+runs/
+campaigns/
+archives/
+imports/
+baselines/
+*.log
+*.tmp
+_shot*.png
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+
+# Accidental Windows test output
+%SystemDrive%/
+
+# Atlas cross-session memory note (not project source)
+ATLAS_PROJECT_MEMORY.md
+
+# Local handoff notes (personal context, not project source)
+HANDOFF_TO_GPT.md

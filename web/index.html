@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>模型验收看板</title>
+  <link rel="stylesheet" href="/web/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <aside class="rail">
+      <div class="brand">
+        <span class="mark"></span>
+        <div>
+          <h1>评测任务</h1>
+          <p>Headless 模型验收看板</p>
+        </div>
+      </div>
+      <button id="refreshJobs" class="tool-button">刷新状态</button>
+      <div id="jobList" class="job-list"></div>
+    </aside>
+
+    <section class="stage">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">当前任务</p>
+          <h2 id="jobTitle">未加载任务</h2>
+        </div>
+        <div class="actions">
+          <button id="openLatest" class="tool-button">打开最新任务</button>
+          <a id="downloadPack" class="tool-button link-disabled" href="#">下载验收包</a>
+          <span id="downloadPackStatus" class="muted">-</span>
+        </div>
+      </header>
+
+      <section class="progress-band">
+        <div>
+          <span class="label">状态</span>
+          <strong id="jobStatus">-</strong>
+        </div>
+        <div>
+          <span class="label">进度</span>
+          <strong id="jobProgress">0 / 0</strong>
+        </div>
+        <div>
+          <span class="label">结论</span>
+          <strong id="jobDecision">-</strong>
+        </div>
+      </section>
+
+      <section class="panel leaderboard-panel">
+        <div class="panel-head">
+          <div>
+            <h3>模型排行</h3>
+            <span class="muted">按 campaign 聚合多轮真实任务，避免单次网络错误误导结论</span>
+          </div>
+          <span id="leaderboardStatus" class="muted">-</span>
+        </div>
+        <div class="table-wrap">
+          <table class="leaderboard-table">
+            <thead>
+              <tr>
+                <th>排名</th>
+                <th>被测模型</th>
+                <th>验收模型</th>
+                <th>轮数</th>
+                <th>总题数</th>
+                <th>模型成功率</th>
+                <th>网关成功率</th>
+                <th>平均质量</th>
+                <th>协议</th>
+                <th>模型名</th>
+                <th>P50 / P95</th>
+                <th>身份/质量迹象</th>
+                <th>网关稳定性</th>
+                <th>综合结论</th>
+                <th>最后测试</th>
+              </tr>
+            </thead>
+            <tbody id="leaderboardBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel campaign-detail-panel">
+        <div class="panel-head">
+          <div>
+            <h3>Campaign 详情</h3>
+            <span class="muted">点击排行中的 campaign 查看多轮趋势、错误和证据</span>
+          </div>
+          <div class="actions">
+            <span id="campaignDetailStatus" class="muted">未选择</span>
+            <a id="campaignDownloadPack" class="tool-button link-disabled" href="#">下载 Campaign 包</a>
+            <span id="campaignDownloadPackStatus" class="muted">-</span>
+          </div>
+        </div>
+        <div id="campaignDetail" class="campaign-detail">
+          <div class="empty-note">暂无 campaign 详情</div>
+        </div>
+      </section>
+
+      <section class="visual-stack">
+        <section class="metric-board" id="metricBoard"></section>
+        <section class="panel insight-panel">
+          <div class="panel-head">
+            <h3>验收原因</h3>
+            <span id="gateStatus" class="muted">-</span>
+          </div>
+          <div id="gateReasons" class="reason-list"></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <h3>题目得分分布</h3>
+            <span id="scoreProfileStatus" class="muted">-</span>
+          </div>
+          <div id="scoreBars" class="score-bars"></div>
+        </section>
+      </section>
+
+      <section class="results-grid">
+        <div class="panel wide">
+          <div class="panel-head">
+            <h3>结果明细</h3>
+            <span id="resultCount" class="muted">0 题</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>题目</th>
+                  <th>被测模型</th>
+                  <th>验收模型</th>
+                  <th>得分</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="resultsBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h3>模型配置</h3>
+            <span id="configStatus" class="muted">-</span>
+          </div>
+          <form id="configForm" class="config-form">
+            <label>被测模型 Base URL<input name="tested_base_url"></label>
+            <label>被测模型名称<input name="tested_model" list="testedModelOptions"></label>
+            <datalist id="testedModelOptions"></datalist>
+            <label>被测协议类型<select name="tested_protocol"><option>openai_chat</option><option>anthropic_messages</option></select></label>
+            <label>被测鉴权方式<select name="tested_auth_type"><option>bearer</option><option>x-api-key</option></select></label>
+            <label>被测推理强度<select name="tested_reasoning_effort"><option value="">默认</option><option value="none">none / 快速</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh / 最高</option></select></label>
+            <label>被测 API Key<input name="tested_api_key" type="password" autocomplete="off" placeholder="留空则不修改"></label>
+            <label>验收模型 Base URL<input name="judge_base_url"></label>
+            <label>验收模型名称<input name="judge_model" list="judgeModelOptions"></label>
+            <datalist id="judgeModelOptions"></datalist>
+            <label>验收协议类型<select name="judge_protocol"><option>openai_chat</option><option>anthropic_messages</option></select></label>
+            <label>验收鉴权方式<select name="judge_auth_type"><option>bearer</option><option>x-api-key</option></select></label>
+            <label>验收推理强度<select name="judge_reasoning_effort"><option value="">默认</option><option value="none">none / 快速</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh / 最高</option></select></label>
+            <label>验收 API Key<input name="judge_api_key" type="password" autocomplete="off" placeholder="留空则不修改"></label>
+            <div class="config-actions">
+              <button id="probeTested" class="tool-button" type="button">检测被测 Key</button>
+              <button id="probeJudge" class="tool-button" type="button">检测验收 Key</button>
+            </div>
+            <div id="probeOutput" class="probe-output muted">尚未检测模型</div>
+            <button class="tool-button primary" type="submit">保存配置</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="panel-head">
+          <h3>事件日志</h3>
+          <span id="eventCount" class="muted">0 条事件</span>
+        </div>
+        <pre id="eventLog"></pre>
+      </section>
+    </section>
+  </main>
+  <script src="/web/app.js?v=probe-config-1"></script>
+</body>
+</html>

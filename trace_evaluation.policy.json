@@ -1,0 +1,13 @@
+{
+  "policy_version": "trace_eval_policy_v1",
+  "policies": [
+    {
+      "policy_id": "trace_health_v1",
+      "description": "Offline trace health checks for run_records and SSE event logs.",
+      "thresholds": {
+        "first_content_token_ms_warn": 15000,
+        "thinking_delta_count_warn": 100
+      }
+    }
+  ]
+}

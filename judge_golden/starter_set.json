@@ -1,0 +1,85 @@
+{
+  "schema_version": "judge_golden_set_v1",
+  "description": "Starter judge calibration golden-set. Replace/extend with real authored cases.",
+  "cases": [
+    {
+      "id": "golden_json_exact_pass",
+      "task": {
+        "id": "g_json_1",
+        "category": "json_stability",
+        "difficulty": "easy",
+        "scoring_type": "json_exact",
+        "prompt": "只输出一个 JSON object: {\"status\": \"ok\", \"count\": 3}，不要任何解释。",
+        "expected_json": {
+          "status": "ok",
+          "count": 3
+        }
+      },
+      "candidate_answer": "{\"status\": \"ok\", \"count\": 3}",
+      "expected_decision": "GO",
+      "expected_score_band": [
+        8,
+        10
+      ],
+      "rationale": "Exact JSON match, no extra text — a clear pass."
+    },
+    {
+      "id": "golden_json_wrong_value",
+      "task": {
+        "id": "g_json_2",
+        "category": "json_stability",
+        "difficulty": "easy",
+        "scoring_type": "json_exact",
+        "prompt": "只输出一个 JSON object: {\"status\": \"ok\", \"count\": 3}，不要任何解释。",
+        "expected_json": {
+          "status": "ok",
+          "count": 3
+        }
+      },
+      "candidate_answer": "{\"status\": \"ok\", \"count\": 99}",
+      "expected_decision": "NO-GO",
+      "expected_score_band": [
+        0,
+        3
+      ],
+      "rationale": "Wrong value (count 99 vs 3) — must be blocked."
+    },
+    {
+      "id": "golden_json_with_markdown",
+      "task": {
+        "id": "g_json_3",
+        "category": "json_stability",
+        "difficulty": "easy",
+        "scoring_type": "json_exact",
+        "prompt": "只输出一个 JSON object，不要 Markdown: {\"ok\": true}",
+        "expected_json": {
+          "ok": true
+        }
+      },
+      "candidate_answer": "```json\n{\"ok\": true}\n```",
+      "expected_decision": "REVIEW",
+      "expected_score_band": [
+        4,
+        7
+      ],
+      "rationale": "Correct content but wrapped in markdown despite explicit instruction — borderline."
+    },
+    {
+      "id": "golden_partial_answer",
+      "task": {
+        "id": "g_qa_1",
+        "category": "reasoning",
+        "difficulty": "medium",
+        "scoring_type": "judge",
+        "prompt": "列出 HTTP 429 状态码的含义，以及客户端应如何正确处理（至少两点）。"
+      },
+      "candidate_answer": "429 表示请求过多。",
+      "expected_decision": "NO-GO",
+      "expected_score_band": [
+        0,
+        4
+      ],
+      "rationale": "Missing the required handling steps — incomplete."
+    }
+  ]
+}

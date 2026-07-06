@@ -1,0 +1,78 @@
+{
+  "version": "enterprise_modes_v1",
+  "default_mode": "mode_10",
+  "score_formula_version": "score_formula_v1",
+  "modes": {
+    "mode_10": {
+      "label": "10 / Quick Smoke",
+      "target_count": 10,
+      "description": "日常快速巡检 provider 是否异常，优先固定核心锚点题。",
+      "recommended_frequency": "daily or before provider switch",
+      "max_concurrency": 1,
+      "estimated_budget_level": "low",
+      "execution_type": "sync",
+      "dimension_quotas": {
+        "API 行为与 Provider 可信度": 1,
+        "JSON / 结构化输出稳定性": 1,
+        "代码审查": 1,
+        "Bug 定位": 1,
+        "反幻觉 / 不确定性处理": 1,
+        "成本、延迟、质量取舍判断": 1
+      }
+    },
+    "mode_100": {
+      "label": "100 / Small Selection",
+      "target_count": 100,
+      "description": "小型模型选型。当前题库不足 100 时自动跑全部 eligible 题。",
+      "recommended_frequency": "weekly",
+      "max_concurrency": 2,
+      "estimated_budget_level": "medium",
+      "execution_type": "sync_or_job",
+      "dimension_quotas": {}
+    },
+    "mode_1000": {
+      "label": "1000 / Standard Benchmark",
+      "target_count": 1000,
+      "description": "正式跑分。当前单机版生成任务与索引，后续接后台 worker。",
+      "recommended_frequency": "release comparison",
+      "max_concurrency": 4,
+      "estimated_budget_level": "high",
+      "execution_type": "background_job",
+      "dimension_quotas": {}
+    },
+    "mode_10000": {
+      "label": "10000 / Deep Benchmark",
+      "target_count": 10000,
+      "description": "深度稳定性与长尾问题分析。第一版只模拟任务选择和分页索引，不建议网页同步执行。",
+      "recommended_frequency": "monthly or major provider procurement",
+      "max_concurrency": 8,
+      "estimated_budget_level": "very_high",
+      "execution_type": "background_job",
+      "dimension_quotas": {}
+    },
+    "mode_100000": {
+      "label": "100000 / Stress Benchmark",
+      "target_count": 100000,
+      "description": "压力级跑分，需要后续分布式 worker、预算阈值和结果仓库。",
+      "recommended_frequency": "rare stress run",
+      "max_concurrency": 16,
+      "estimated_budget_level": "extreme",
+      "execution_type": "background_job",
+      "dimension_quotas": {}
+    }
+  },
+  "dimension_weights": {
+    "API 行为与 Provider 可信度": 1.2,
+    "JSON / 结构化输出稳定性": 1.1,
+    "代码审查": 1.1,
+    "代码生成": 1.0,
+    "补丁修复 / 最小改动": 1.1,
+    "Bug 定位": 1.1,
+    "中文需求拆解": 0.9,
+    "长上下文总结": 0.9,
+    "技术方案设计": 1.0,
+    "Agent / 工具使用规划": 0.9,
+    "反幻觉 / 不确定性处理": 1.1,
+    "成本、延迟、质量取舍判断": 1.0
+  }
+}

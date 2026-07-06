@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.eval-automation/run_record.schema.json",
+  "title": "LLM Eval Run Record v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_id",
+    "run",
+    "task",
+    "provider",
+    "request",
+    "response",
+    "telemetry",
+    "usage",
+    "scoring",
+    "trace",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "run_record_v1"
+    },
+    "record_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "run": {
+      "type": "object",
+      "required": [
+        "run_id",
+        "timestamp",
+        "benchmark_mode",
+        "formula_version",
+        "runner",
+        "status"
+      ],
+      "properties": {
+        "run_id": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "benchmark_mode": { "type": "string" },
+        "formula_version": { "type": "string" },
+        "runner": { "type": "string", "enum": ["cli", "web", "historical", "byo_import"] },
+        "status": { "type": "string", "enum": ["completed", "failed", "stopped", "partial"] }
+      }
+    },
+    "task": {
+      "type": "object",
+      "required": [
+        "id",
+        "category",
+        "enterprise_dimension",
+        "difficulty",
+        "scoring_type",
+        "risk_tags",
+        "point_value",
+        "scoring_confidence"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "category": { "type": ["string", "null"] },
+        "enterprise_dimension": { "type": ["string", "null"] },
+        "difficulty": { "type": ["string", "null"] },
+        "scoring_type": { "type": ["string", "null"] },
+        "risk_tags": { "type": "array" },
+        "point_value": { "type": ["number", "integer", "null"] },
+        "scoring_confidence": { "type": ["number", "integer", "null"] }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "required": [
+        "id",
+        "api_style",
+        "base_url_host",
+        "model_requested",
+        "model_returned"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "api_style": { "enum": ["anthropic_messages", "openai_chat"] },
+          "base_url_host": { "type": ["string", "null"] },
+          "auth_env_name": { "type": ["string", "null"] },
+          "model_requested": { "type": ["string", "null"] },
+          "model_returned": { "type": ["string", "null"] },
+          "provider_channel": { "type": ["string", "null"] },
+          "provider_display_name": { "type": ["string", "null"] },
+          "claimed_model": { "type": ["string", "null"] },
+          "baseline_model": { "type": ["string", "null"] },
+          "leaderboard_group": { "type": ["string", "null"] }
+        }
+      },
+    "request": {
+      "type": "object",
+      "required": [
+        "request_hash",
+        "max_tokens",
+        "temperature",
+        "system_present",
+        "messages_count"
+      ],
+      "properties": {
+        "request_hash": { "type": "string" },
+        "max_tokens": { "type": ["integer", "null"] },
+        "temperature": { "type": ["number", "integer", "null"] },
+        "system_present": { "type": "boolean" },
+        "messages_count": { "type": "integer" },
+        "prompt_hash": { "type": ["string", "null"] }
+      }
+    },
+    "response": {
+      "type": "object",
+      "required": [
+        "response_file",
+        "events_file",
+        "content_chars",
+        "normalized_text_hash"
+      ],
+      "properties": {
+        "response_file": { "type": "string" },
+        "events_file": { "type": "string" },
+        "content_chars": { "type": ["integer", "number", "null"] },
+        "normalized_text_hash": { "type": "string" }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "required": [
+        "ok",
+        "error",
+        "first_event_ms",
+        "first_content_token_ms",
+        "total_ms",
+        "event_count",
+        "content_event_count",
+        "stop_reason"
+      ],
+      "properties": {
+        "ok": { "type": ["boolean", "null"] },
+        "error": { "type": ["string", "null"] },
+        "first_event_ms": { "type": ["number", "integer", "null"] },
+        "first_content_token_ms": { "type": ["number", "integer", "null"] },
+        "total_ms": { "type": ["number", "integer", "null"] },
+        "event_count": { "type": ["integer", "number", "null"] },
+        "content_event_count": { "type": ["integer", "number", "null"] },
+        "stop_reason": { "type": ["string", "null"] },
+        "attempts": { "type": ["integer", "number", "null"] },
+        "retry_count": { "type": ["integer", "number", "null"] }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens"
+      ],
+      "properties": {
+        "input_tokens": { "type": ["integer", "number", "null"] },
+        "output_tokens": { "type": ["integer", "number", "null"] },
+        "cache_creation_input_tokens": { "type": ["integer", "number", "null"] },
+        "cache_read_input_tokens": { "type": ["integer", "number", "null"] }
+      }
+    },
+    "scoring": {
+      "type": "object",
+      "required": [
+        "rule_score",
+        "judge_score",
+        "final_score",
+        "judge_provider",
+        "judge_model_requested",
+        "judge_model_returned"
+      ],
+      "properties": {
+        "rule_score": { "type": ["object", "null"] },
+        "judge_score": { "type": ["object", "null"] },
+        "final_score": { "type": ["object", "null"] },
+        "judge_provider": { "type": ["string", "null"] },
+        "judge_model_requested": { "type": ["string", "null"] },
+        "judge_model_returned": { "type": ["string", "null"] }
+      }
+    },
+    "trace": {
+      "type": "object",
+      "required": ["tool_calls", "raw_event_types"],
+      "properties": {
+        "tool_calls": { "type": "array" },
+        "raw_event_types": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "required": ["response_file", "events_file"],
+      "properties": {
+        "response_file": { "type": "string" },
+        "events_file": { "type": "string" }
+      }
+    }
+  },
+  "additionalProperties": true
+}

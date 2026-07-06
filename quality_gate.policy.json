@@ -1,0 +1,25 @@
+{
+  "policy_version": "quality_gate_policy_v1",
+  "policies": [
+    {
+      "policy_id": "provider_release_v1",
+      "description": "Default provider-level release gate for benchmark, rescore, and compatibility evidence.",
+      "decision_order": ["NO-GO", "REVIEW", "GO"],
+      "thresholds": {
+        "success_rate_no_go": 0.95,
+        "success_rate_review": 0.98,
+        "json_failure_rate_no_go": 0.05,
+        "gate_score_no_go": 600,
+        "gate_score_review": 750,
+        "judge_failure_rate_review": 0.05,
+        "max_tokens_rate_review": 0.1,
+        "p95_first_content_token_ms_review": 15000,
+        "evidence_max_age_days": 14,
+        "rescore_required_coverage": 1.0,
+        "trace_fail_rate_review": 0,
+        "trace_warn_rate_review": 0,
+        "silent_truncation_no_go": 0
+      }
+    }
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "schema_version": "capability_anchors_v1",
+  "description": "Harder, multi-step anchors designed to WIDEN the opus-vs-haiku capability gap (the v1 set scored haiku 0.95, too close to opus 1.0 to detect a downgrade — see baselines/_CALIB). Each is objectively gradable (exact/regex), single-interpretation, temperature 0, and answer is hand-verified. The difficulty is in chained steps where a weaker model drops an intermediate result.",
+  "items": [
+    {
+      "id": "hard_arith_long_chain",
+      "prompt": "按顺序计算：先算 (37 * 24)，再加 (53 * 19)，再减去 (128 * 6)，最后乘以 3。只输出最终整数，不要解释。",
+      "check": "regex",
+      "pattern": "\\b3381\\b",
+      "rationale": "37*24=888; 53*19=1007; 128*6=768; 888+1007-768=1127; 1127*3=3381 (verified)."
+    },
+    {
+      "id": "hard_nested_code_trace",
+      "prompt": "下面 Python 代码输出什么？只输出最终打印的整数，不要解释。\n\ndef f(n):\n    t = 0\n    for i in range(1, n + 1):\n        if i % 2 == 0:\n            t += i * i\n        else:\n            t += i\n    return t\nprint(f(6))",
+      "check": "regex",
+      "pattern": "\\b65\\b",
+      "rationale": "i=1:+1=1; i=2:+4=5; i=3:+3=8; i=4:+16=24; i=5:+5=29; i=6:+36=65."
+    },
+    {
+      "id": "hard_multi_constraint_logic",
+      "prompt": "五个人 A、B、C、D、E 排成一排。A 在 B 左边某处，C 紧挨在 B 右边，D 在最左端，E 在最右端。只输出从左到右的顺序，五个字母连写无空格无逗号（例如 DABCE）。",
+      "check": "exact",
+      "expected_any": ["DABCE"],
+      "rationale": "D leftmost, E rightmost. Middle three A,B,C with C right-adjacent to B and A left of B => A,B,C. So D A B C E."
+    },
+    {
+      "id": "hard_base_mixed",
+      "prompt": "把十六进制 0x3C 转成十进制，再加上二进制 1011 的十进制值，最后把结果转回十六进制。只输出十六进制结果（带 0x 前缀，字母小写）。",
+      "check": "regex",
+      "pattern": "0x47\\b",
+      "rationale": "0x3C=60; 1011b=11; 60+11=71=0x47 (verified)."
+    },
+    {
+      "id": "hard_percent_chain",
+      "prompt": "一件商品原价 500 元。第一次涨价 20%，第二次在新价基础上降价 15%，第三次再涨价 10%。只输出最终价格（保留两位小数，只输出数字，例如 561.00）。",
+      "check": "regex",
+      "pattern": "\\b561\\.0?0?\\b|\\b561\\b",
+      "rationale": "500*1.2=600; 600*0.85=510; 510*1.1=561.00."
+    },
+    {
+      "id": "hard_modular_chain",
+      "prompt": "计算 (7^4) 除以 13 的余数。只输出一个整数。",
+      "check": "regex",
+      "pattern": "\\b9\\b",
+      "rationale": "7^4=2401; 2401 mod 13 = 9 (13*184=2392, 2401-2392=9)."
+    },
+    {
+      "id": "hard_word_problem",
+      "prompt": "一个水箱有 3 个进水管，单独注满分别需要 6、8、12 小时。三管齐开，注满水箱需要多少小时？只输出最简分数或整数（例如 8/3）。",
+      "check": "regex",
+      "pattern": "8/3|2\\.66|2\\.67",
+      "rationale": "rate=1/6+1/8+1/12=4/24+3/24+2/24=9/24=3/8; time=8/3 hours."
+    },
+    {
+      "id": "hard_string_algo",
+      "prompt": "字符串 'mississippi' 中，出现次数最多的字母出现了几次？只输出一个整数。",
+      "check": "regex",
+      "pattern": "\\b4\\b",
+      "rationale": "i appears 4 times (m1 i4 s4 p2) — both i and s are 4; max count is 4."
+    },
+    {
+      "id": "hard_nested_logic",
+      "prompt": "如果 A 为真则 B 为假；B 为假则 C 为真；已知 A 为真。C 是真还是假？只输出：真 或 假。",
+      "check": "exact",
+      "expected_any": ["真"],
+      "rationale": "A true -> B false -> C true."
+    },
+    {
+      "id": "hard_combinatorics",
+      "prompt": "从 5 个不同的人中选出 3 人组成一个委员会（不分职位），有多少种选法？只输出一个整数。",
+      "check": "regex",
+      "pattern": "\\b10\\b",
+      "rationale": "C(5,3)=10."
+    }
+  ]
+}

@@ -1,0 +1,137 @@
+{
+  "suite_version": "compatibility_suite_v1",
+  "default_max_tokens": 512,
+  "default_temperature": 0,
+  "cases": [
+    {
+      "id": "messages_basic",
+      "category": "messages",
+      "description": "Basic Claude-compatible /v1/messages streaming request returns displayable text.",
+      "request": {
+        "prompt": "Reply with exactly this text: compatibility-basic-ok"
+      },
+      "expected_substring": "compatibility-basic-ok"
+    },
+    {
+      "id": "messages_system_content",
+      "category": "messages",
+      "description": "System prompt plus structured text content is accepted without gateway breakage.",
+      "request": {
+        "system": "You are a compatibility probe. Follow the user request exactly.",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Reply with exactly this text: system-content-ok"
+              }
+            ]
+          }
+        ]
+      },
+      "expected_substring": "system-content-ok"
+    },
+    {
+      "id": "usage_integrity",
+      "category": "usage",
+      "description": "Usage fields exist and a longer prompt reports more input tokens than a shorter prompt.",
+      "request": {
+        "prompt": "Reply with exactly this text: usage-short-ok"
+      },
+      "secondary_request": {
+        "prompt": "Reply with exactly this text: usage-long-ok. Context: alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega. Repeat no context back."
+      }
+    },
+    {
+      "id": "sse_health",
+      "category": "sse",
+      "description": "Streaming events expose start, text delta, usage delta, and stop events with latency evidence.",
+      "request": {
+        "prompt": "Write one concise sentence of at least twelve words about streaming compatibility. Do not use markdown."
+      }
+    },
+    {
+      "id": "json_schema",
+      "category": "json",
+      "description": "Strict JSON output is parseable without markdown wrapping and preserves field types.",
+      "request": {
+        "prompt": "Return exactly this JSON object and no other text: {\"status\":\"ok\",\"count\":3,\"items\":[\"alpha\",\"beta\"]}"
+      },
+      "expected_json": {
+        "status": "ok",
+        "count": 3,
+        "items": ["alpha", "beta"]
+      }
+    },
+    {
+      "id": "cache_control_probe",
+      "category": "cache",
+      "description": "Cache-control content blocks are accepted and cache usage fields are reported when supported.",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Compatibility cache probe shared prefix. Reply with exactly this text: cache-probe-ok",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "secondary_request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Compatibility cache probe shared prefix. Reply with exactly this text: cache-probe-ok",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "tool_call_probe",
+      "category": "tool_call",
+      "description": "Tool schema is accepted and the stream exposes a tool_use trajectory.",
+      "request": {
+        "prompt": "Use the tool named report_compatibility_status with status set to ok and reason set to tool-call-probe.",
+        "tools": [
+          {
+            "name": "report_compatibility_status",
+            "description": "Report a compatibility probe status.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": ["ok", "warn", "fail"]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": ["status", "reason"]
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "tool",
+          "name": "report_compatibility_status"
+        },
+        "max_tokens": 256
+      }
+    }
+  ]
+}
