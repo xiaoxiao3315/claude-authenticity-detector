@@ -1,14 +1,44 @@
-# eval_automation_v0_2
+# Claude Authenticity Detector
 
-Backend-only core for local LLM evaluation **and Claude authenticity detection**.
+**Black-box verification that an LLM gateway is really serving official Claude —
+not a wrapper, a silently downgraded model, or a relay rewriting responses.**
 
-This folder keeps the evaluation kernel (benchmark execution, `run_record_v1`,
-compatibility checks, offline re-score, trace evaluation, quality gate, redacted
-audit export) **and a Claude official-authenticity detector** that answers one
-question: *is the model behind a gateway really official Claude, or has it been
-swapped / wrapped / downgraded / faking its context window?*
+Cheap third-party "Claude" gateways are everywhere. Asking the model *"who are
+you?"* proves nothing — wrappers answer from a script. This tool instead reads
+the **response envelope**: infrastructure-stamped signals (response-id prefix
+families, usage-field dialect, stop-reason enums, tokenizer billing deltas,
+capability anchors, cross-call variance) that are hard for a middleman to forge.
+Five probe families vote into one of four verdicts — **matches official /
+suspected downgrade / suspected wrapper / insufficient evidence** — each backed
+by a tiered evidence chain (convicting / corroborating / advisory).
 
-It intentionally excludes the old web console, historical runs, local secrets,
+Battle-tested against real-world gateways: caught a live wrapper returning a
+different vendor's model under a Claude label, and a random-routing relay whose
+backend changed between calls. ~740 pytest cases, 22 module self-tests, strict
+mypy, CI included.
+
+```mermaid
+flowchart LR
+    subgraph Probes["5 probe families"]
+        P1["protocol fingerprint<br/>(id prefix / usage dialect / stop_reason)"]
+        P2["tokenizer delta"]
+        P3["identity coherence<br/>(narration vs envelope)"]
+        P4["capability anchors<br/>(catches downgrade)"]
+        P5["variance sampling<br/>(catches random routing)"]
+    end
+    B["trusted official baseline<br/>(versioned, drift-diffed)"]
+    P1 & P2 & P3 & P4 & P5 --> C["compare_to_baseline()"]
+    B --> C
+    C --> V["verdict + tiered evidence chain<br/>✅ official · ⚠️ downgrade · ❌ wrapper · ❔ insufficient"]
+```
+
+> Black-box honesty: the tool proves an endpoint *behaves* like official Claude
+> under these probes; absolute upstream identity still requires official
+> accounts/contracts/logs. Verdicts are always shipped with their evidence.
+
+Also ships the underlying evaluation kernel: campaign runner, baseline
+registry, quality gate, trace evaluation, and redacted audit export. It
+intentionally excludes the old web console, historical runs, local secrets,
 campaigns, archives, screenshots, and generated logs.
 
 ---
