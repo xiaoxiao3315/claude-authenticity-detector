@@ -37,3 +37,8 @@ ATLAS_PROJECT_MEMORY.md
 
 # Local handoff notes (personal context, not project source)
 HANDOFF_TO_GPT.md
+
+# Local benchmark run artifacts (contain real endpoints/usage — never commit)
+bench_*.jsonl
+bench_gateway_events.jsonl
+benchmarks/access_*.json
