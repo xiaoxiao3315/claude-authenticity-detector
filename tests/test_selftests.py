@@ -37,6 +37,8 @@ IMPORTABLE_SELFTESTS = {
     "redaction": "_self_test",
     "authenticity": "_self_test",
     "job_runtime": "_self_test",
+    "bench_access_report": "self_test",
+    "bench_gateway": "self_test",
     "quality_gate": "self_test",
     "compatibility": "self_test",
     "trace_evaluation": "run_self_test",
