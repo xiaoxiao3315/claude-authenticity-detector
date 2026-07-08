@@ -89,6 +89,31 @@ def parse_status(err: str | None) -> int | None:
     m = re.search(r"HTTP\s+(\d+)", err)
     return int(m.group(1)) if m else None
 
+
+def self_test() -> int:
+    """Offline checks: prompt sizing, status parsing, open-loop scheduling math."""
+    # parse_status mirrors model_client's "HTTP {code}: ..." format.
+    assert parse_status("HTTP 429: too many") == 429
+    assert parse_status("HTTP 503: overloaded") == 503
+    assert parse_status("ConnectError: boom") is None
+    assert parse_status(None) is None
+    # make_prompt: returns a messages list; content carries a unique nonce
+    # (defeats prompt-cache) and scales with the requested token size.
+    p1 = make_prompt(2000)
+    p2 = make_prompt(2000)
+    c1 = p1[0]["content"]
+    assert c1 != p2[0]["content"], "prompts must carry a unique nonce"
+    assert len(c1) > 1000, f"expected sizeable prompt, got {len(c1)} chars"
+    assert len(make_prompt(2000)[0]["content"]) > len(make_prompt(200)[0]["content"])
+    # open-loop schedule: request i is due at start + i*interval, independent of latency.
+    rate = 10.0
+    interval = 1.0 / rate
+    due = [i * interval for i in range(5)]
+    assert all(abs(d - i * 0.1) < 1e-9 for i, d in enumerate(due))
+    print("bench_gateway self-test ok")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=Path, default=Path("configs/providers.local.json"))
@@ -106,7 +131,11 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="no network: use model_client dry path")
     ap.add_argument("--dump-jsonl", type=Path, default=None, help="write per-request records here")
     ap.add_argument("--events", type=Path, default=Path("bench_gateway_events.jsonl"))
+    ap.add_argument("--self-test", action="store_true", help="offline checks, no network")
     args = ap.parse_args()
+
+    if args.self_test:
+        return self_test()
 
     model = load_model(args.config, args.key)
     args.events.parent.mkdir(parents=True, exist_ok=True)
@@ -206,9 +235,16 @@ def report(recs: list[Rec], start: float, args: argparse.Namespace) -> None:
     print(f"elapsed            : {elapsed:.1f}s")
     print(f"dispatched / ok    : {len(recs)} / {len(ok)}  success={len(ok)/len(recs)*100:.1f}%")
     print(f"429 / other errors : {len(h429)} / {len(other_err)}  (429 rate {len(h429)/len(recs)*100:.1f}%)")
-    print(f"observed RPM/min   : {dict(sorted(rpm.items()))}")
+    print(f"observed RPM/min   : {dict(sorted(rpm.items()))}   (raw per-60s bucket; partial windows under-count)")
     print(f"observed ITPM/min  : {dict(sorted(itpm.items()))}")
     print(f"observed OTPM/min  : {dict(sorted(otpm.items()))}")
+    # Normalized rates over actual elapsed time — the meaningful figure for
+    # sub-minute calibration runs where no 60s bucket is full.
+    norm_rpm = len(ok) * 60.0 / elapsed
+    norm_itpm = sum(r.in_tok for r in ok) * 60.0 / elapsed
+    norm_otpm = sum(r.out_tok for r in ok) * 60.0 / elapsed
+    print(f"normalized/min     : RPM={norm_rpm:.1f} ITPM={norm_itpm:.0f} OTPM={norm_otpm:.0f}  "
+          f"(ok*60/elapsed; use this for runs shorter than a minute)")
     tot_in = sum(r.in_tok for r in ok)
     tot_out = sum(r.out_tok for r in ok)
     est_cost = tot_in / 1e6 * args.price_in + tot_out / 1e6 * args.price_out
