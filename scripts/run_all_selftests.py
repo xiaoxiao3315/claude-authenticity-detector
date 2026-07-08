@@ -30,6 +30,8 @@ SELFTEST_FLAG_MODULES = [
     "audit_export",
     "authenticity",
     "baseline_registry",
+    "bench_access_report",
+    "bench_gateway",
     "benchmarking",
     "campaigns",
     "cli_io",

@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import json
 import statistics
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -27,6 +28,15 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+# Windows consoles default to cp1252 and crash (UnicodeEncodeError) on the
+# non-ASCII glyphs in reports/self-test. Force UTF-8 stdout/stderr so this
+# Windows-first tool runs on a stock console without PYTHONUTF8=1.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 from eval_cli import load_model_config
 from local_env import load_local_env
@@ -221,31 +231,52 @@ async def run_tier(cfg: ModelConfig, tier: Tier, max_tokens: int, timeout: float
         return list(await asyncio.gather(*(one(i) for i in range(1, tier.samples + 1))))
 
 
-async def run_rpm_probe(cfg: ModelConfig, workers: int, window_s: float, timeout: float) -> dict[str, Any]:
-    """Saturation probe: short requests from N workers for a fixed window."""
-    prompt = "Reply with the single word: ok"
-    deadline = time.perf_counter() + window_s
-    ok_count = 0
-    err_count = 0
-    tokens_total = 0
-    limits = httpx.Limits(max_connections=workers + 2)
+async def run_rpm_probe(cfg: ModelConfig, target_rpm: float, window_s: float, timeout: float,
+                        input_tokens: int = 2000, max_tokens: int = 200,
+                        max_inflight: int = 400) -> dict[str, Any]:
+    """Open-loop saturation probe: dispatch at a FIXED rate (target_rpm) regardless
+    of in-flight latency, for a fixed window, then measure achieved RPM/TPM.
+
+    Unlike a closed-loop N-worker loop (whose ceiling is workers/latency and thus
+    can never reach a high cap), this fires requests on a schedule so the gateway —
+    not the probe — is the bottleneck. Payload is sized realistically (default
+    ~2k input) so TPM reflects real token throughput rather than an 8-token floor.
+    """
+    prompt = build_prompt(input_tokens)
+    interval = 60.0 / target_rpm if target_rpm > 0 else 0.0
+    limits = httpx.Limits(max_connections=max_inflight + 5)
+    sem = asyncio.Semaphore(max_inflight)
+    results: list[dict[str, Any]] = []
+    start = time.perf_counter()
+    deadline = start + window_s
 
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
-        async def worker() -> None:
-            nonlocal ok_count, err_count, tokens_total
-            while time.perf_counter() < deadline:
-                r = await stream_once(client, cfg, prompt, 8)
-                if r["ok"]:
-                    ok_count += 1
-                    tokens_total += (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0)
-                else:
-                    err_count += 1
+        tasks: list[asyncio.Task] = []
 
-        await asyncio.gather(*(worker() for _ in range(workers)))
+        async def fire() -> None:
+            async with sem:
+                r = await stream_once(client, cfg, prompt, max_tokens)
+            r["done_at"] = time.perf_counter() - start
+            results.append(r)
 
-    rpm = ok_count * 60.0 / window_s
+        i = 0
+        while time.perf_counter() < deadline:
+            tasks.append(asyncio.create_task(fire()))
+            i += 1
+            target_next = start + i * interval
+            sleep_for = target_next - time.perf_counter()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    ok = [r for r in results if r.get("ok")]
+    tokens_total = sum((r.get("input_tokens") or 0) + (r.get("output_tokens") or 0) for r in ok)
+    dispatched = len(results)
+    rpm = len(ok) * 60.0 / window_s
     tpm = tokens_total * 60.0 / window_s
-    return {"workers": workers, "window_s": window_s, "ok": ok_count, "errors": err_count,
+    return {"target_rpm": target_rpm, "window_s": window_s, "dispatched": dispatched,
+            "ok": len(ok), "errors": dispatched - len(ok),
             "rpm_measured": round(rpm, 1), "tpm_measured": round(tpm, 1)}
 
 
@@ -398,6 +429,9 @@ def render_markdown(cfg: ModelConfig, result: dict[str, Any], rpm: dict[str, Any
         f"\n## Access Assessment Report — {cfg.provider_id} ({cfg.model})",
         f"\n**Grade {result['grade']}** · V_TOTAL **{result['v_total']}**/100 · coverage {result['coverage']} · "
         f"verdict **{result['verdict']}**\n",
+        "> V_TOTAL/grade are an UNOFFICIAL reconstruction (perfect=100, baseline=60, equal weights); "
+        "comparable across runs of this tool only, NOT aligned to any external platform's score. "
+        "The authoritative output is the per-item measured-vs-baseline pass/fail below and any VETO flags.\n",
         "| item | measured | baseline(pass) | perfect | score | pass |",
         "|---|---|---|---|---|---|",
     ]
@@ -407,8 +441,8 @@ def render_markdown(cfg: ModelConfig, result: dict[str, Any], rpm: dict[str, Any
         if i.get("note"):
             lines.append(f"|   ↳ {i['note']} | | | | | |")
     if rpm is not None:
-        lines.append(f"\nRPM probe: {rpm['ok']} ok / {rpm['errors']} errors in {rpm['window_s']}s "
-                     f"with {rpm['workers']} workers")
+        lines.append(f"\nRPM probe (open-loop): dispatched {rpm['dispatched']}, {rpm['ok']} ok / "
+                     f"{rpm['errors']} errors in {rpm['window_s']}s at target {rpm['target_rpm']}/min")
     if result["veto"]:
         lines.append("\n**VETO / authenticity flags:**")
         lines.extend(f"- {n}" for n in result["veto"])
@@ -442,8 +476,9 @@ def self_test() -> int:
          "output_tokens": 150, "envelope": {"id_prefix": "msg_01abd", "model": "claude-opus-4-6"}},
         {"ok": False, "error": "http 500", "total_s": 1.0},
     ]}
-    res = evaluate(cfg, fake_runs, {"rpm_measured": 56.1, "tpm_measured": 42.9, "workers": 5,
-                                    "window_s": 20, "ok": 19, "errors": 0}, DEFAULT_TIERS)
+    probe_fake = {"rpm_measured": 56.1, "tpm_measured": 42.9, "target_rpm": 600.0,
+                  "window_s": 20, "dispatched": 200, "ok": 19, "errors": 181}
+    res = evaluate(cfg, fake_runs, probe_fake, DEFAULT_TIERS)
     assert res["verdict"] == "REJECTED"  # error + RPM below cap
     assert res["grade"] in "ABCD" and 0 <= res["v_total"] <= 100
     assert not res["veto"]
@@ -477,8 +512,7 @@ def self_test() -> int:
     # error breakdown surfaces the 503 type
     big_err = [i for i in res3["items"] if i["item"].startswith("errors large")][0]
     assert big_err.get("error_breakdown", {}).get("overloaded_error") == 2, big_err
-    print(render_markdown(cfg, res, {"rpm_measured": 56.1, "tpm_measured": 42.9, "workers": 5,
-                                     "window_s": 20, "ok": 19, "errors": 0}))
+    print(render_markdown(cfg, res, probe_fake))
     print("\nself-test PASS")
     return 0
 
@@ -492,8 +526,12 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=300)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--skip-rpm", action="store_true", help="skip the RPM/TPM saturation probe")
-    parser.add_argument("--rpm-workers", type=int, default=10)
+    parser.add_argument("--rpm-target", type=float, default=600.0,
+                        help="open-loop dispatch rate for the RPM/TPM probe (default: the 600 cap)")
     parser.add_argument("--rpm-window", type=float, default=30.0)
+    parser.add_argument("--rpm-input-tokens", type=int, default=2000,
+                        help="input size per RPM-probe request (realistic sizing for TPM)")
+    parser.add_argument("--rpm-max-inflight", type=int, default=400)
     parser.add_argument("--price-in", type=float, default=0.0, help="$ per 1M input tokens (for cost cap)")
     parser.add_argument("--price-out", type=float, default=0.0, help="$ per 1M output tokens (for cost cap)")
     parser.add_argument("--max-cost-usd", type=float, default=0.0, help="0 = no cap; else abort new dispatch past this")
@@ -534,8 +572,11 @@ def main() -> int:
 
     rpm = None
     if not args.skip_rpm:
-        print(f"RPM probe: {args.rpm_workers} workers for {args.rpm_window}s")
-        rpm = asyncio.run(run_rpm_probe(cfg, args.rpm_workers, args.rpm_window, args.timeout))
+        print(f"RPM probe (open-loop): dispatching {args.rpm_target}/min for {args.rpm_window}s, "
+              f"~{args.rpm_input_tokens}tok each")
+        rpm = asyncio.run(run_rpm_probe(cfg, args.rpm_target, args.rpm_window, args.timeout,
+                                        input_tokens=args.rpm_input_tokens,
+                                        max_inflight=args.rpm_max_inflight))
 
     result = evaluate(cfg, tier_runs, rpm, tiers)
 
