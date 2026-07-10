@@ -122,6 +122,23 @@ def response_request_id(headers: Any) -> str | None:
     return None
 
 
+# Models that REJECT the `temperature` parameter (HTTP 400 invalid_request_error
+# "temperature is deprecated for this model"). Confirmed live against
+# api.anthropic.com on 2026-07-09 for claude-opus-4-8. Matched as a substring so
+# dated snapshot names (e.g. claude-opus-4-8-20260xx) also match. We drop the
+# parameter at the single egress point (call_model) so no caller has to know
+# which models accept it — otherwise every temperature=0 call site would 400
+# against these models.
+TEMPERATURE_UNSUPPORTED_MODEL_SUBSTRINGS = (
+    "claude-opus-4-8",
+)
+
+
+def model_supports_temperature(model_name: str) -> bool:
+    name = (model_name or "").lower()
+    return not any(sub in name for sub in TEMPERATURE_UNSUPPORTED_MODEL_SUBSTRINGS)
+
+
 def apply_extra_body(payload: dict[str, Any], model: ModelConfig) -> None:
     for key, value in model.extra_body.items():
         if key in payload:
@@ -186,7 +203,7 @@ def call_model(
         url = f"{model.base_url}/v1/chat/completions"
         headers = {**auth_headers(model, secret), "content-type": "application/json"}
         payload = {"model": model.model, "messages": messages, "max_tokens": max_tokens}
-        if temperature is not None:
+        if temperature is not None and model_supports_temperature(model.model):
             payload["temperature"] = temperature
         apply_extra_body(payload, model)
     elif model.protocol == "anthropic_messages":
@@ -201,7 +218,7 @@ def call_model(
         payload = {"model": model.model, "messages": user_messages, "max_tokens": max_tokens}
         if system_messages:
             payload["system"] = "\n\n".join(system_messages)
-        if temperature is not None:
+        if temperature is not None and model_supports_temperature(model.model):
             payload["temperature"] = temperature
         apply_extra_body(payload, model)
     else:
