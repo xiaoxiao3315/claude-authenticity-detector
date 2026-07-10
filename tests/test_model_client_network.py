@@ -159,6 +159,80 @@ def test_anthropic_request_shape_splits_system(events_file):
     assert out.metrics.cache_read_input_tokens == 1
 
 
+def test_temperature_omitted_for_deprecating_model(events_file):
+    # claude-opus-4-8 rejects `temperature` (HTTP 400 confirmed live 2026-07-09),
+    # so call_model must drop it at the egress point even though the caller
+    # passed temperature=0.0. Covers both protocol dialects.
+    for maker in (_openai_model, _anthropic_model):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = __import__("json").loads(request.content)
+            return httpx.Response(200, json={
+                "model": "claude-opus-4-8",
+                "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+                "content": [{"type": "text", "text": "x"}],
+                "stop_reason": "end_turn",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "input_tokens": 1, "output_tokens": 1},
+            })
+
+        out = _call(maker(model="claude-opus-4-8"), _client(handler), events_file, temperature=0.0)
+        assert "temperature" not in seen["body"], seen["body"]
+        assert out.metrics.ok
+
+
+def test_temperature_kept_for_supporting_model(events_file):
+    # A model that still accepts temperature must keep it (regression guard so the
+    # deprecation gate does not strip temperature from everything).
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = __import__("json").loads(request.content)
+        return httpx.Response(200, json={
+            "model": "gpt-x",
+            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    _call(_openai_model(model="gpt-5.5"), _client(handler), events_file, temperature=0.0)
+    assert seen["body"]["temperature"] == 0.0
+
+
+def test_model_supports_temperature_predicate():
+    assert M.model_supports_temperature("claude-opus-4-6") is True
+    assert M.model_supports_temperature("gpt-5.5") is True
+    assert M.model_supports_temperature("claude-opus-4-8") is False
+    assert M.model_supports_temperature("claude-opus-4-8-20260115") is False
+
+
+def test_secret_override_used_without_env(monkeypatch):
+    # A per-instance secret_override must be used directly, without touching
+    # os.environ — this is what makes concurrent web requests key-isolated.
+    monkeypatch.setattr(M, "load_local_env", lambda: None)
+    monkeypatch.delenv("TESTED_MODEL_API_KEY", raising=False)
+    model = _openai_model(secret_override="sk-request-scoped")
+    assert M.auth_value(model) == "sk-request-scoped"
+    # env var is absent, yet no RuntimeError: proves it never read os.environ
+
+
+def test_secret_override_is_isolated_between_instances(monkeypatch):
+    # Two models with different overrides don't interfere (no shared global).
+    monkeypatch.setattr(M, "load_local_env", lambda: None)
+    monkeypatch.delenv("TESTED_MODEL_API_KEY", raising=False)
+    a = _openai_model(secret_override="sk-key-A")
+    b = _openai_model(secret_override="sk-key-B")
+    assert M.auth_value(a) == "sk-key-A"
+    assert M.auth_value(b) == "sk-key-B"
+
+
+def test_env_used_when_no_secret_override(monkeypatch):
+    # Without an override, auth_value still falls back to the env var (CLI path).
+    monkeypatch.setattr(M, "load_local_env", lambda: None)
+    monkeypatch.setenv("TESTED_MODEL_API_KEY", "sk-from-env")
+    assert M.auth_value(_openai_model()) == "sk-from-env"
+
+
 def test_unsupported_protocol_raises(events_file):
     def handler(request):  # never called
         raise AssertionError("should not reach network")

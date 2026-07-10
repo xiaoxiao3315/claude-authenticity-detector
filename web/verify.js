@@ -131,7 +131,8 @@ function collectPayload(live) {
 
 // 4 类判定 → 图标 / 文案 / 配色 class
 const VERDICT_MAP = {
-  matches_official:    { icon: "✅", label: "真·官方 Claude", cls: "v-ok" },
+  consistent_with_baseline: { icon: "✅", label: "与官方 baseline 一致", cls: "v-ok" },
+  matches_official:    { icon: "✅", label: "与官方 baseline 一致", cls: "v-ok" },
   suspected_downgrade: { icon: "⚠️", label: "疑似降级",       cls: "v-warn" },
   suspected_wrapper:   { icon: "❌", label: "疑似套壳",       cls: "v-bad" },
   insufficient_evidence: { icon: "❔", label: "证据不足",     cls: "v-unknown" },
