@@ -588,6 +588,11 @@ def run_web_verify(payload: dict, *, live: bool, progress=None) -> dict:
         auth_type=auth_type,
         provider_channel="gateway",
         provider_display_name="web_suspect",
+        # Bind the request's key onto this request-scoped ModelConfig instead of a
+        # process-global env var. ThreadingHTTPServer serves each request on its
+        # own thread; a shared os.environ slot would let concurrent checks clobber
+        # each other's key. This instance is local to this request/thread.
+        secret_override=(api_key if (live and api_key) else None),
     )
     return _invoke_verify_core(model, baseline, baseline_id, baselines_dir,
                               live=live, api_key=api_key, req_delay=req_delay,
@@ -600,37 +605,29 @@ def _invoke_verify_core(model, baseline, baseline_id, baselines_dir, *,
                         live: bool, api_key: str, req_delay: float,
                         with_capability: bool, with_variance: bool = False,
                         with_identity: bool = False, progress=None) -> dict:
-    """Bind the key into os.environ for the call only, run verify_core, clean up."""
-    prior = os.environ.get(WEB_VERIFY_KEY_ENV)
-    if live and api_key:
-        os.environ[WEB_VERIFY_KEY_ENV] = api_key
-    try:
-        verdict = eval_cli.verify_core(
-            model, baseline,
-            role="web_suspect",
-            baselines_dir=baselines_dir,
-            baseline_id=baseline_id,
-            live=live,
-            samples_per_probe=5,
-            request_delay=req_delay,
-            retries=1,
-            retry_backoff=2.0,
-            with_sse=False,            # R-001: extra live request, keep web minimal
-            with_error_envelope=False, # R-001: malformed requests look like an attack
-            with_needle=False,         # R-001: huge request, most dangerous
-            with_capability=with_capability,
-            providers_path=None,
-            with_variance=with_variance,
-            with_identity=with_identity,
-            variance_repeats=12,
-            progress=progress,
-        )
-    finally:
-        # never leave the key in the environment
-        if prior is None:
-            os.environ.pop(WEB_VERIFY_KEY_ENV, None)
-        else:
-            os.environ[WEB_VERIFY_KEY_ENV] = prior
+    """Run verify_core. The request key rides on model.secret_override (bound by
+    the caller), so there is no shared os.environ mutation and no cross-request
+    key-isolation race between concurrent threads."""
+    verdict = eval_cli.verify_core(
+        model, baseline,
+        role="web_suspect",
+        baselines_dir=baselines_dir,
+        baseline_id=baseline_id,
+        live=live,
+        samples_per_probe=5,
+        request_delay=req_delay,
+        retries=1,
+        retry_backoff=2.0,
+        with_sse=False,            # R-001: extra live request, keep web minimal
+        with_error_envelope=False, # R-001: malformed requests look like an attack
+        with_needle=False,         # R-001: huge request, most dangerous
+        with_capability=with_capability,
+        providers_path=None,
+        with_variance=with_variance,
+        with_identity=with_identity,
+        variance_repeats=12,
+        progress=progress,
+    )
 
     report_text = eval_cli.render_verdict_report(verdict, baseline=baseline)
     safe_verdict = redact_value(verdict)

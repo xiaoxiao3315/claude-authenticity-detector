@@ -59,6 +59,12 @@ class ModelConfig:
     provider_channel: str = "gateway"
     provider_display_name: str | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
+    # Per-instance secret. When set, auth_value() uses it directly instead of
+    # reading os.environ[api_key_env]. Lets concurrent callers (e.g. the threaded
+    # web server) bind a request-scoped key onto their own ModelConfig without
+    # mutating a shared process-global env var. Never serialized (see to_dict /
+    # config dumps, which only ever emit api_key_env, never the secret).
+    secret_override: str | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -90,6 +96,10 @@ class Completion:
 
 
 def auth_value(model: ModelConfig) -> str:
+    # Request-scoped secret takes precedence: no shared os.environ mutation, so
+    # concurrent callers can't clobber each other's key (web key-isolation race).
+    if model.secret_override:
+        return model.secret_override
     load_local_env()
     value = os.environ.get(model.api_key_env)
     if not value:
