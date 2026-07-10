@@ -308,3 +308,48 @@ def test_assemble_needle_prompt_scales_with_target():
     big, _ = E._assemble_needle_prompt(5000, seed=1)
     assert len(big) > len(small)
 
+
+# ---------------------------------------------------------------------------
+# resolve_probe_model — the quickcheck/in-process probe wiring fix
+# ---------------------------------------------------------------------------
+import argparse  # noqa: E402
+import json  # noqa: E402
+from model_client import ModelConfig  # noqa: E402
+
+
+def _probe_model():
+    return ModelConfig(
+        provider_id="quickcheck_suspect", base_url="https://gw.example",
+        model="claude-opus-4-6", api_key_env="X_KEY",
+        protocol="anthropic_messages", auth_type="x-api-key")
+
+
+def test_resolve_probe_model_uses_injected_model():
+    # In-process path (verify_core/quickcheck): the built model rides on _model.
+    # No providers file, and the role is quickcheck_suspect (not tested_model),
+    # which used to raise ValueError -> probe_error. Now it resolves cleanly.
+    m = _probe_model()
+    args = argparse.Namespace(providers=None, provider="quickcheck_suspect",
+                              live=True, _model=m)
+    assert E.resolve_probe_model(args) is m
+
+
+def test_resolve_probe_model_file_path_without_injection(tmp_path):
+    # CLI path (no _model): loads role from the providers file. A file with only
+    # tested_model/judge_model and an unknown role must still reject as before.
+    pf = tmp_path / "providers.json"
+    pf.write_text(json.dumps({
+        "tested_model": {"provider_id": "tested_model", "base_url": "https://x",
+                         "model": "m", "api_key_env": "K", "protocol": "openai_chat",
+                         "auth_type": "bearer"},
+        "judge_model": {"provider_id": "judge_model", "base_url": "https://x",
+                        "model": "m", "api_key_env": "K", "protocol": "openai_chat",
+                        "auth_type": "bearer"},
+    }), encoding="utf-8")
+    args = argparse.Namespace(providers=str(pf), provider="quickcheck_suspect", live=False)
+    with pytest.raises(ValueError):
+        E.resolve_probe_model(args)
+    # and the valid role resolves
+    ok = argparse.Namespace(providers=str(pf), provider="tested_model", live=False)
+    assert E.resolve_probe_model(ok).provider_id == "tested_model"
+

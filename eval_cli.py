@@ -200,6 +200,28 @@ def load_two_model_config(path: Path) -> dict[str, ModelConfig]:
     return models
 
 
+def resolve_probe_model(args: argparse.Namespace) -> ModelConfig:
+    """Resolve the suspect model for a sub-probe (needle / error_envelope / sse).
+
+    Two entry paths share these probes:
+    - CLI: `--providers <file> --provider <role>` -> load role from the file.
+    - In-process (verify_core / quickcheck): the caller already holds a built
+      ModelConfig and attaches it as `args._model`. Use it directly so the
+      probes work even when there is no providers file or the role isn't one of
+      tested_model/judge_model (which is exactly the quickcheck case that used
+      to fail with probe_error).
+    """
+    injected = getattr(args, "_model", None)
+    if injected is not None:
+        return injected
+    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
+    role = str(args.provider or "tested_model")
+    models = apply_model_overrides(load_two_model_config(models_path), args)
+    if role not in models:
+        raise ValueError("--provider must be tested_model or judge_model")
+    return models[role]
+
+
 def _optional_arg(args: argparse.Namespace, name: str) -> str | None:
     value = getattr(args, name, None)
     if value is None:
@@ -2142,7 +2164,7 @@ def verify_core(
         # SSE event-order probe
         if with_sse:
             try:
-                sse_args = argparse.Namespace(providers=providers_path, provider=role, live=True)
+                sse_args = argparse.Namespace(providers=providers_path, provider=role, live=True, _model=model)
                 # reuse the classifier by collecting one stream inline
                 import io, contextlib
                 buf = io.StringIO()
@@ -2157,7 +2179,7 @@ def verify_core(
         # error-envelope probe (#2): malformed request -> classify error dialect
         if with_error_envelope:
             try:
-                ee_args = argparse.Namespace(providers=providers_path, provider=role, live=True)
+                ee_args = argparse.Namespace(providers=providers_path, provider=role, live=True, _model=model)
                 import io, contextlib
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
@@ -2178,7 +2200,8 @@ def verify_core(
                 nd_args = argparse.Namespace(providers=providers_path, provider=role, live=True,
                                              target_tokens=int(needle_tokens or 120000),
                                              seed=7, baseline_id=baseline_id,
-                                             baselines_dir=baselines_dir, timeout=300.0)
+                                             baselines_dir=baselines_dir, timeout=300.0,
+                                             _model=model)
                 import io, contextlib
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
@@ -2457,12 +2480,8 @@ def needle(args: argparse.Namespace) -> int:
     live = bool(getattr(args, "live", False))
     if live:
         load_local_env()
-    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
-    role = str(args.provider or "tested_model")
-    models = apply_model_overrides(load_two_model_config(models_path), args)
-    if role not in models:
-        raise ValueError("--provider must be tested_model or judge_model")
-    model = models[role]
+    model = resolve_probe_model(args)
+    role = str(getattr(args, "provider", None) or model.provider_id or "tested_model")
 
     prompt, canary = _assemble_needle_prompt(target_tokens, seed)
     sent_chars = len(prompt)
@@ -2566,12 +2585,7 @@ def error_envelope(args: argparse.Namespace) -> int:
     live = bool(getattr(args, "live", False))
     if live:
         load_local_env()
-    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
-    role = str(args.provider or "tested_model")
-    models = apply_model_overrides(load_two_model_config(models_path), args)
-    if role not in models:
-        raise ValueError("--provider must be tested_model or judge_model")
-    model = models[role]
+    model = resolve_probe_model(args)
 
     variants = {
         "missing_max_tokens": {"model": model.model, "messages": [{"role": "user", "content": "hi"}]},
@@ -2614,12 +2628,7 @@ def sse_fingerprint(args: argparse.Namespace) -> int:
     live = bool(getattr(args, "live", False))
     if live:
         load_local_env()
-    models_path = resolve_path(args.providers or DEFAULT_PROVIDERS)
-    role = str(args.provider or "tested_model")
-    models = apply_model_overrides(load_two_model_config(models_path), args)
-    if role not in models:
-        raise ValueError("--provider must be tested_model or judge_model")
-    model = models[role]
+    model = resolve_probe_model(args)
     if not live:
         print(json.dumps({"probe": "sse_event_order", "evidence_status": "dry_run_reference_only",
                           "note": "dry-run: no stream opened. Use --live to probe."}, ensure_ascii=False, indent=2))
