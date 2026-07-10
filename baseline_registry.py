@@ -49,7 +49,7 @@ ANTHROPIC_USAGE_KEYS = {
 OPENAI_USAGE_KEYS = {"prompt_tokens", "completion_tokens", "total_tokens"}
 
 # Verdict labels (mirrors the authenticity 4-class scheme).
-VERDICT_MATCHES = "matches_official"
+VERDICT_MATCHES = "consistent_with_baseline"
 VERDICT_DOWNGRADE = "suspected_downgrade"
 VERDICT_WRAPPER = "suspected_wrapper"
 VERDICT_INSUFFICIENT = "insufficient_evidence"
@@ -1407,7 +1407,7 @@ def classify_sse_event_order(event_types: list[str]) -> dict[str, Any]:
 
 
 VERDICT_LABELS_ZH = {
-    VERDICT_MATCHES: "✅ 真·官方 Claude",
+    VERDICT_MATCHES: "✅ 与官方 baseline 一致",
     VERDICT_DOWNGRADE: "⚠️ 疑似降级（可能换了更小/更弱的模型）",
     VERDICT_WRAPPER: "❌ 疑似套壳（可能是别家模型伪装）",
     VERDICT_INSUFFICIENT: "❔ 证据不足（无法判定，需更多 live 采集）",
@@ -1663,7 +1663,7 @@ def _self_test() -> None:
     # 9. human-readable report renders for every verdict
     rep = render_verdict_report(wrapper, baseline=baseline)
     assert "套壳" in rep and "Claude 真伪检测报告" in rep, rep
-    assert "真·官方" in render_verdict_report(good, baseline=baseline)
+    assert "与官方 baseline 一致" in render_verdict_report(good, baseline=baseline)
 
     # 9c. consistency-variance: the low-frequency swap detector.
     # all-pass deterministic -> match vote (10)

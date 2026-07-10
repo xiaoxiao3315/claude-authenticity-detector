@@ -541,7 +541,7 @@ def load_authenticity_evidence(run_dir: Path, provider_id: str | None = None) ->
     may persist the compare_to_baseline result to
     `<run_dir>/authenticity/<provider_id>.json` or `authenticity/verdict.json`.
     The file shape is the compare_to_baseline output (carries a `verdict` key:
-    matches_official / suspected_wrapper / suspected_downgrade / insufficient_evidence).
+    consistent_with_baseline / suspected_wrapper / suspected_downgrade / insufficient_evidence).
     Absent file -> {"found": False, "verdict": None}, so the gate rule is a no-op
     on runs that never produced a comparison. A PRESENT-but-corrupt artifact
     (unreadable / not an object / missing verdict) -> insufficient_evidence, so a
@@ -803,14 +803,14 @@ def evaluate_policy(
     if authenticity_verdict in {"suspected_wrapper", "suspected_downgrade"}:
         blockers.append(issue(
             "authenticity_verdict_blocks", "baseline_comparison", "authenticity_verdict",
-            authenticity_verdict, "matches_official",
+            authenticity_verdict, "consistent_with_baseline",
             "baseline comparison flagged the endpoint as a wrapper or downgrade"))
     elif authenticity_verdict == "insufficient_evidence":
         review_items.append(issue(
             "authenticity_insufficient_requires_review", "baseline_comparison",
-            "authenticity_verdict", authenticity_verdict, "matches_official",
+            "authenticity_verdict", authenticity_verdict, "consistent_with_baseline",
             "baseline comparison could not confirm authenticity (insufficient evidence)"))
-    elif authenticity_verdict in {"matches_official", "official_claude"}:
+    elif authenticity_verdict in {"consistent_with_baseline", "matches_official", "official_claude"}:
         passed_rules.append("authenticity_ok")
 
     success_rate = metrics.get("success_rate")
